@@ -29,6 +29,11 @@ Include the context needed to resume safely:
 
 Before finalizing a specification, remove placeholders and resolve contradictions or ambiguous requirements.
 
+## Read design context before executing plans
+
+Before implementing from a plan, read the complete design specification referenced by that plan. Use the design to
+understand scope, safety constraints, and accepted decisions; do not rely on the plan alone when it summarizes them.
+
 ## Keep planning terminology out of product surfaces
 
 Production code, test names, user-facing documentation, command output, and APIs must remain independent of internal

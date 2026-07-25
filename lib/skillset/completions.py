@@ -3,7 +3,7 @@
 import sys
 
 
-COMMANDS = "init create use rename remove list codex claude current show doctor skills completions"
+COMMANDS = "init create use rename remove list codex claude augment current show doctor skills completions"
 
 BASH = rf"""_skillset_names() {{
     local output line
@@ -90,10 +90,13 @@ _skillset_completion() {{
             candidates=''
             if (( ! after_terminator )); then candidates='-h --help -v --verbose'; fi
             ;;
-        codex|claude)
+        codex|claude|augment)
             candidates=''
             if (( COMP_CWORD == 2 )); then
-                if (( ! after_terminator )); then candidates='-h --help enable disable list'; fi
+                if (( ! after_terminator )); then
+                    candidates='-h --help enable disable list'
+                    if [[ "$subcommand" == augment ]]; then candidates+=' skills'; fi
+                fi
             else
                 case "${{COMP_WORDS[2]}}" in
                     enable|disable)
@@ -106,6 +109,15 @@ _skillset_completion() {{
                         ;;
                     list)
                         if (( ! after_terminator )); then candidates='-h --help -v --verbose -g --global -l --local'; fi
+                        ;;
+                    skills)
+                        if [[ "$subcommand" == augment ]]; then
+                            if (( COMP_CWORD == 3 )); then
+                                if (( ! after_terminator )); then candidates='-h --help list'; fi
+                            elif [[ "${{COMP_WORDS[3]}}" == list ]]; then
+                                if (( ! after_terminator )); then candidates='-h --help -v --verbose -g --global -l --local'; fi
+                            fi
+                        fi
                         ;;
                 esac
             fi
@@ -166,6 +178,7 @@ _skillset() {
                 'list:list managed skillsets'
                 'codex:manage Codex-enabled skillsets'
                 'claude:manage Claude Code-enabled skillsets'
+                'augment:manage Auggie-enabled skillsets'
                 'current:print the active skillset name'
                 'show:show skills in a skillset'
                 'doctor:diagnose the managed layout'
@@ -249,6 +262,100 @@ _skillset() {
                             '(-v --verbose)'{-v,--verbose}'[show skill inventory]' && return 0
                     fi
                     ;;
+                augment)
+                    if (( CURRENT == 2 )); then
+                        _values 'Auggie command' \
+                            '-h:show help' \
+                            '--help:show help' \
+                            'enable:enable a skillset for Auggie' \
+                            'disable:disable a skillset for Auggie' \
+                            'list:list Auggie-enabled skillsets' \
+                            'skills:list effective Auggie skills'
+                        return
+                    fi
+                    if [[ "${words[2]}" == enable || "${words[2]}" == disable ]]; then
+                        local after_terminator
+                        after_terminator=${words[(I)--]}
+                        local -a options names
+                        options=()
+                        if (( ! after_terminator )); then
+                            if (( ! ${words[(I)-h]} && ! ${words[(I)--help]} )); then
+                                options+=('-h:show help' '--help:show help')
+                            fi
+                            if (( ! ${words[(I)-g]} && ! ${words[(I)--global]} &&
+                                ! ${words[(I)-l]} && ! ${words[(I)--local]} )); then
+                                options+=(
+                                    '-g:manage global Auggie skills'
+                                    '--global:manage global Auggie skills'
+                                    '-l:manage local Auggie skills'
+                                    '--local:manage local Auggie skills'
+                                )
+                            fi
+                            _describe -t options 'option' options && return 0
+                        fi
+                        local index
+                        for (( index = 3; index < CURRENT; index++ )); do
+                            [[ "${words[index]}" != -* ]] && return
+                        done
+                        names=("${(@f)$(_skillset_names)}")
+                        (( ${#names} )) && _describe 'skillset' names
+                    elif [[ "${words[2]}" == list ]]; then
+                        (( ${words[(I)--]} )) && return
+                        local -a options
+                        options=()
+                        if (( ! ${words[(I)-h]} && ! ${words[(I)--help]} )); then
+                            options+=('-h:show help' '--help:show help')
+                        fi
+                        if (( ! ${words[(I)-g]} && ! ${words[(I)--global]} &&
+                            ! ${words[(I)-l]} && ! ${words[(I)--local]} )); then
+                            options+=(
+                                '-g:list global Auggie skills'
+                                '--global:list global Auggie skills'
+                                '-l:list local Auggie skills'
+                                '--local:list local Auggie skills'
+                            )
+                        fi
+                        if (( ! ${words[(I)-v]} && ! ${words[(I)--verbose]} )); then
+                            options+=('-v:show skill inventory' '--verbose:show skill inventory')
+                        fi
+                        _describe -t options 'option' options && return 0
+                    elif [[ "${words[2]}" == skills ]]; then
+                        if (( CURRENT == 3 )); then
+                            _values 'Auggie skills command' \
+                                '-h:show help' \
+                                '--help:show help' \
+                                'list:list effective Auggie skills'
+                            return
+                        elif [[ "${words[3]}" == list ]]; then
+                            (( ${words[(I)--]} )) && return
+                            local -a list_options
+                            list_options=(
+                            )
+                            if (( ! ${words[(I)-h]} && ! ${words[(I)--help]} )); then
+                                list_options+=(
+                                    '-h:show help'
+                                    '--help:show help'
+                                )
+                            fi
+                            if (( ! ${words[(I)-g]} && ! ${words[(I)--global]} &&
+                                ! ${words[(I)-l]} && ! ${words[(I)--local]} )); then
+                                list_options+=(
+                                    '-g:Filter effective winners from all User roots'
+                                    '--global:Filter effective winners from all User roots'
+                                    '-l:Filter effective winners from all Workspace roots'
+                                    '--local:Filter effective winners from all Workspace roots'
+                                )
+                            fi
+                            if (( ! ${words[(I)-v]} && ! ${words[(I)--verbose]} )); then
+                                list_options+=(
+                                    '-v:show resolved skill paths'
+                                    '--verbose:show resolved skill paths'
+                                )
+                            fi
+                            _describe -t options 'option' list_options && return 0
+                        fi
+                    fi
+                    ;;
                 current)
                     _arguments -S '(-h --help)'{-h,--help}'[show help]' && return 0
                     ;;
@@ -314,6 +421,16 @@ function __skillset_using_claude_command
     test (count $tokens) -ge 3; and test $tokens[3] = $argv[1]
 end
 
+function __skillset_using_augment_command
+    set -l tokens (commandline -xpc)
+    test (count $tokens) -ge 3; and test $tokens[3] = $argv[1]
+end
+
+function __skillset_using_augment_skills_command
+    set -l tokens (commandline -xpc)
+    test (count $tokens) -ge 4; and test $tokens[3] = skills; and test $tokens[4] = $argv[1]
+end
+
 function __skillset_positional_count
     set -l tokens (commandline -xpc)
     set -e tokens[1..2]
@@ -357,13 +474,14 @@ complete -c skillset -n __skillset_needs_command -a remove -d 'Remove an inactiv
 complete -c skillset -n __skillset_needs_command -a list -d 'List managed skillsets'
 complete -c skillset -n __skillset_needs_command -a codex -d 'Manage Codex-enabled skillsets'
 complete -c skillset -n __skillset_needs_command -a claude -d 'Manage Claude Code-enabled skillsets'
+complete -c skillset -n __skillset_needs_command -a augment -d 'Manage Auggie-enabled skillsets'
 complete -c skillset -n __skillset_needs_command -a current -d 'Print the active skillset name'
 complete -c skillset -n __skillset_needs_command -a show -d 'Show skills in a skillset'
 complete -c skillset -n __skillset_needs_command -a doctor -d 'Diagnose the managed layout'
 complete -c skillset -n __skillset_needs_command -a skills -d 'Run managed upstream skills'
 complete -c skillset -n __skillset_needs_command -a completions -d 'Emit a shell completion script'
 
-for subcommand in init create use rename remove list codex claude current show doctor completions
+for subcommand in init create use rename remove list codex claude augment current show doctor completions
     complete -c skillset -n "__skillset_using_command $subcommand" -s h -l help -d 'Show help'
     complete -c skillset -n "__skillset_using_command $subcommand; and __skillset_at_empty_token" -a '-h --help' -d 'Show help'
 end
@@ -414,6 +532,30 @@ complete -c skillset -n '__skillset_using_command claude; and __skillset_using_c
 complete -c skillset -n '__skillset_using_command claude; and __skillset_using_claude_command list; and __skillset_at_empty_token' -a '-v --verbose' -d 'Show skill inventory'
 complete -c skillset -n '__skillset_using_command claude; and __skillset_using_claude_command list; and __skillset_at_empty_token' -a '-g --global' -d 'List global Claude Code skills'
 complete -c skillset -n '__skillset_using_command claude; and __skillset_using_claude_command list; and __skillset_at_empty_token' -a '-l --local' -d 'List local Claude Code skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_at_position 0' -a 'enable disable list skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command enable; and __skillset_at_position 1' -a '(__skillset_names)'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command disable; and __skillset_at_position 1' -a '(__skillset_names)'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command enable' -s g -l global -d 'Manage global Auggie skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command enable' -s l -l local -d 'Manage local Auggie skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command enable; and __skillset_at_empty_token' -a '-g --global' -d 'Manage global Auggie skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command enable; and __skillset_at_empty_token' -a '-l --local' -d 'Manage local Auggie skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command disable' -s g -l global -d 'Manage global Auggie skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command disable' -s l -l local -d 'Manage local Auggie skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command disable; and __skillset_at_empty_token' -a '-g --global' -d 'Manage global Auggie skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command disable; and __skillset_at_empty_token' -a '-l --local' -d 'Manage local Auggie skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command list' -s v -l verbose -d 'Show skill inventory'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command list' -s g -l global -d 'List global Auggie skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command list' -s l -l local -d 'List local Auggie skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command list; and __skillset_at_empty_token' -a '-v --verbose' -d 'Show skill inventory'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command list; and __skillset_at_empty_token' -a '-g --global' -d 'List global Auggie skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command list; and __skillset_at_empty_token' -a '-l --local' -d 'List local Auggie skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_command skills; and __skillset_at_position 1' -a list -d 'List effective Auggie skills'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_skills_command list' -s v -l verbose -d 'Show resolved skill paths'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_skills_command list' -s g -l global -d 'Filter effective winners from all User roots'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_skills_command list' -s l -l local -d 'Filter effective winners from all Workspace roots'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_skills_command list; and __skillset_at_empty_token' -a '-v --verbose' -d 'Show resolved skill paths'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_skills_command list; and __skillset_at_empty_token' -a '-g --global' -d 'Filter effective winners from all User roots'
+complete -c skillset -n '__skillset_using_command augment; and __skillset_using_augment_skills_command list; and __skillset_at_empty_token' -a '-l --local' -d 'Filter effective winners from all Workspace roots'
 complete -c skillset -n '__skillset_using_command doctor' -l fix -d 'Create safe missing replacement files after confirmation'
 complete -c skillset -n '__skillset_using_command doctor; and __skillset_at_empty_token' -a '--fix' -d 'Create safe missing replacement files after confirmation'
 complete -c skillset -n '__skillset_using_command show; and __skillset_at_position 0' -a '(__skillset_names)'

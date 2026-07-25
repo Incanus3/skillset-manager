@@ -54,6 +54,12 @@ Rows retain the current lexical ordering by their sanitized displayed skill or d
 declared skill name and normalized description. Invalid rows use the directory name and the unchanged
 `[invalid: REASON]` description.
 
+On a TTY, the separator alone is capped to the current positive terminal-column count to prevent its dashes from
+wrapping. Detect the width immediately before rendering and truncate the unstyled ASCII separator from the right;
+headers, skill names, descriptions, and data rows remain complete and may wrap naturally. Apply dim styling after the
+cap when color is enabled. The cap also applies when `NO_COLOR` is set or `TERM=dumb`; pipes, redirects, unsupported
+width detection, and nonpositive widths retain the complete separator.
+
 An empty set prints exactly:
 
 ```text

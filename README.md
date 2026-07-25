@@ -221,9 +221,12 @@ removed so lock metadata resolves through the active managed alias.
 All `skillset` management, inspection, diagnostic, and delegated operations first
 take a stable, non-creating advisory lock on the existing HOME directory. Routine
 operations then take `~/.agents/.skillset.lock`, always in that order, and retain
-its existing on-disk compatibility. Routine inspection validates the complete
-managed layout and remains read-only; `doctor` aggregates invalid and partial
-state and acquires the managed lock only when it is a safe regular file.
+its existing on-disk compatibility. Routine managed inspection validates the
+complete managed layout and remains read-only. `skillset augment skills list` is
+a separate read-only discovery view: it neither requires nor validates the
+managed layout and uses its managed lock only when an existing candidate is a
+safe regular file. `doctor` aggregates invalid and partial state and acquires the
+managed lock only when it is a safe regular file.
 Delegation preserves both locks for the complete `npx skills` process lifetime,
 so wrapper operations safely wait for one another. After initialization, always
 prefer `skillset skills ...` for global installation and maintenance. Direct
@@ -525,6 +528,92 @@ skillsets, including malformed registration state that cannot safely be
 classified. Local
 registrations are not indexed globally, so disable every known local
 registration before renaming or removing its source set.
+
+## Use skillsets in Auggie
+
+Auggie, like Claude Code, discovers direct skill directories. `skillset
+augment` therefore projects a managed collection as flat, absolute links and
+keeps its registration outside the public skills directory:
+
+```text
+~/.augment/
+├── .skillsets/
+│   └── personal -> ~/.agents/skillsets/personal/skills
+└── skills/
+    ├── feature-status -> ~/.agents/skillsets/personal/skills/feature-status
+    └── handoff -> ~/.agents/skillsets/personal/skills/handoff
+```
+
+Enable or disable a managed collection globally, or in the exact current
+directory with `--local`:
+
+```sh
+skillset augment enable personal
+skillset augment enable personal --local
+skillset augment disable personal
+skillset augment disable personal --local
+```
+
+Global scope is the default for `enable` and `disable`; an unscoped
+`skillset augment list` combines global and exact-current-directory managed
+registrations. `-g`/`--global` and `-l`/`--local` are mutually exclusive for
+all three commands. `--verbose` adds the usual managed-skill inventory.
+
+`enable` never replaces unrelated entries. It rejects different-target direct
+skill-name collisions between the effective global and local `.augment`
+projections, while allowing the identical canonical target in both scopes.
+Rerun `enable` after changing direct source skills to reconcile missing and
+stale links; `disable` removes owned projected links before its registration.
+An interrupted or partial operation normally retains its registration as
+recovery intent, so rerun the same `enable` or use `disable` to recover. If an
+operation instead reports a preserved removal quarantine, inspect and recover
+that exact path manually before running another Auggie command. Empty
+containers remain in place.
+
+Global Auggie registrations, including malformed registration state, block
+rename and removal of their source skillset. Local registrations are not
+globally indexed, so disable every known local registration before renaming or
+removing its source set. Local `.augment` links and registrations contain
+machine-specific absolute paths: do **not** commit this generated state. The
+command does not edit `.gitignore` or unrelated entries.
+
+### Inspect effective Auggie discovery
+
+`skillset augment skills list` is separate from `skillset augment list`: it is
+a read-only view of effective individual skills, not the managed registration
+ledger. It scans all six documented discovery roots in this precedence order and prints each
+winning skill in a `SKILL | SOURCE | DIRECTORY` table. `SOURCE` uses concise,
+unbracketed labels: user roots are `~/.augment`, `~/.claude`, or `~/.agents`;
+workspace roots are `./.augment`, `./.claude`, or `./.agents`. `DIRECTORY` is
+the resolved skill-directory path. Paths under the configured home directory
+use `~`; paths outside it remain absolute:
+
+| Order | Precedence root | Skill root |
+| --- | --- | --- |
+| 1 | `User/.augment` | `~/.augment/skills` |
+| 2 | `Workspace/.augment` | `$PWD/.augment/skills` |
+| 3 | `User/.claude` | `~/.claude/skills` |
+| 4 | `Workspace/.claude` | `$PWD/.claude/skills` |
+| 5 | `User/.agents` | `~/.agents/skills` |
+| 6 | `Workspace/.agents` | `$PWD/.agents/skills` |
+
+Only direct child directories containing `SKILL.md` are candidates. The first
+candidate for a skill-directory name wins; lower-precedence duplicates are
+omitted. Effective winners print first in lexicographic concise source-label
+order, then in canonical resolved skill-directory order. On eligible TTY output, headers are bold, dividers are
+dim, skill names and `~/...` sources are cyan, and `./...` sources are green.
+Captured output and TTY output with `NO_COLOR` set or `TERM=dumb` remain plain.
+`--verbose` instead retains its non-tabular diagnostic blocks: its first line
+uses bracketed concise source labels, followed by unchanged resolved-directory
+and `SKILL.md` detail lines. The command resolves all six roots before
+`--global` or `--local` filters the winners, so a lower-precedence local skill
+shadowed by a global one is not reported as effective.
+
+The `.claude/skills` and `.agents/skills` roots are compatible, read-only
+external inputs to this view. Auggie management never creates, validates,
+modifies, registers, or removes entries there; a same-name compatible skill
+does not block a managed `.augment` projection because documented precedence
+selects the effective skill.
 
 ## Diagnose the managed layout
 

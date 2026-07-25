@@ -3,6 +3,7 @@ import fcntl
 import json
 import os
 import re
+import select
 import signal
 import shutil
 import stat
@@ -405,6 +406,7 @@ class SkillsetTests(unittest.TestCase):
                 "remove",
                 "codex",
                 "claude",
+                "augment",
                 "skills",
                 "list",
                 "current",
@@ -418,6 +420,7 @@ class SkillsetTests(unittest.TestCase):
         for integration, directory in (
             ("codex", ".codex"),
             ("claude", ".claude"),
+            ("augment", ".augment"),
         ):
             for command in ("enable", "disable"):
                 with self.subTest(
@@ -440,6 +443,34 @@ class SkillsetTests(unittest.TestCase):
                 self.assertNotIn(
                     f"~/{directory} directory (default)",
                     result.stdout,
+                )
+
+    def test_augment_skills_list_help_describes_available_flags(self):
+        result = self.run_cli("augment", "skills", "list", "--help")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        expected_help = {
+            "--global": "filter effective winners from all User roots",
+            "--local": "filter effective winners from all Workspace roots",
+        }
+        for option, description in expected_help.items():
+            with self.subTest(option=option):
+                self.assertIn(option, result.stdout)
+                self.assertIn(description, result.stdout)
+        self.assertIn("--verbose", result.stdout)
+        self.assertNotIn("manage the global ~/.augment directory", result.stdout)
+
+    def test_augment_skills_list_completion_descriptions_use_discovery_roots(self):
+        for shell in ("zsh", "fish"):
+            with self.subTest(shell=shell):
+                result = self.run_cli("completions", shell)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(
+                    "Filter effective winners from all User roots", result.stdout
+                )
+                self.assertIn(
+                    "Filter effective winners from all Workspace roots", result.stdout
                 )
 
     def test_completions_emit_deterministic_scripts_without_managed_state(self):
@@ -474,7 +505,7 @@ class SkillsetTests(unittest.TestCase):
     def test_completion_scripts_include_the_complete_wrapper_grammar(self):
         commands = (
             "init", "create", "use", "rename", "remove", "list",
-            "codex", "claude", "current", "show", "doctor", "skills",
+            "codex", "claude", "augment", "current", "show", "doctor", "skills",
             "completions",
         )
         for shell in ("bash", "zsh", "fish"):
@@ -505,13 +536,18 @@ class SkillsetTests(unittest.TestCase):
         outer_parser, nested_parsers = script.split('case "${words[1]}" in', 1)
         self.assertIn("_arguments -S -C \\", outer_parser)
         self.assertEqual(outer_parser.count("_arguments"), 1)
+        self.assertIn("'augment:", outer_parser)
         self.assertEqual(nested_parsers.count("_arguments"), 14)
         self.assertEqual(nested_parsers.count("_arguments -S"), 14)
         self.assertEqual(script.count("_arguments"), 15)
         self.assertEqual(script.count("_arguments -S"), 15)
         self.assertEqual(script.count("_arguments -S -C"), 1)
         self.assertIn('-A "-*"', outer_parser)
-        self.assertEqual(nested_parsers.count("&& return 0"), 14)
+        self.assertEqual(nested_parsers.count("&& return 0"), 17)
+        self.assertIn(
+            "_describe -t options 'option' list_options && return 0",
+            nested_parsers,
+        )
         self.assertIn("skills) return 0 ;;", script)
         self.assertIn(
             'if [[ "${zsh_eval_context[-1]}" == loadautofunc ]]; then',
@@ -573,7 +609,29 @@ printf 'claude-flag-after:%s\n' "${COMPREPLY[*]}"
 COMP_WORDS=(skillset claude enable -- ""); COMP_CWORD=4; _skillset_completion
 printf 'claude-terminator:%s\n' "${COMPREPLY[*]}"
 COMP_WORDS=(skillset claude list --v); COMP_CWORD=3; _skillset_completion
-printf 'claude-list:%s\n' "${COMPREPLY[*]}"'''
+printf 'claude-list:%s\n' "${COMPREPLY[*]}"
+COMP_WORDS=(skillset augment e); COMP_CWORD=2; _skillset_completion
+printf 'augment-command:%s\n' "${COMPREPLY[*]}"
+COMP_WORDS=(skillset augment enable --local d); COMP_CWORD=4; _skillset_completion
+printf 'augment-enable-local:%s\n' "${COMPREPLY[*]}"
+COMP_WORDS=(skillset augment disable --global d); COMP_CWORD=4; _skillset_completion
+printf 'augment-disable-global:%s\n' "${COMPREPLY[*]}"
+COMP_WORDS=(skillset augment enable --l); COMP_CWORD=3; _skillset_completion
+printf 'augment-flag:%s\n' "${COMPREPLY[*]}"
+COMP_WORDS=(skillset augment list --v); COMP_CWORD=3; _skillset_completion
+printf 'augment-list-verbose:%s\n' "${COMPREPLY[*]}"
+COMP_WORDS=(skillset augment list --g); COMP_CWORD=3; _skillset_completion
+printf 'augment-list-global:%s\n' "${COMPREPLY[*]}"
+COMP_WORDS=(skillset augment list --l); COMP_CWORD=3; _skillset_completion
+printf 'augment-list-local:%s\n' "${COMPREPLY[*]}"
+COMP_WORDS=(skillset augment skills l); COMP_CWORD=3; _skillset_completion
+printf 'augment-skills:%s\n' "${COMPREPLY[*]}"
+COMP_WORDS=(skillset augment skills list --v); COMP_CWORD=4; _skillset_completion
+printf 'augment-skills-list:%s\n' "${COMPREPLY[*]}"
+COMP_WORDS=(skillset augment skills list --g); COMP_CWORD=4; _skillset_completion
+printf 'augment-skills-list-global:%s\n' "${COMPREPLY[*]}"
+COMP_WORDS=(skillset augment skills list --l); COMP_CWORD=4; _skillset_completion
+printf 'augment-skills-list-local:%s\n' "${COMPREPLY[*]}"'''
         result = subprocess.run(
             [bash, "-c", probe, "bash", str(script)],
             env=environment,
@@ -597,6 +655,13 @@ printf 'claude-list:%s\n' "${COMPREPLY[*]}"'''
                 "claude-flag-before:--local",
                 "claude-flag-after:--local",
                 "claude-terminator:default demo", "claude-list:--verbose",
+                "augment-command:enable", "augment-enable-local:default demo",
+                "augment-disable-global:default demo", "augment-flag:--local",
+                "augment-list-verbose:--verbose", "augment-list-global:--global",
+                "augment-list-local:--local", "augment-skills:list",
+                "augment-skills-list:--verbose",
+                "augment-skills-list-global:--global",
+                "augment-skills-list-local:--local",
             ],
         )
 
@@ -642,6 +707,32 @@ printf 'claude-list:%s\n' "${COMPREPLY[*]}"'''
         self.assertEqual(candidates("skillset claude e"), ["enable"])
         self.assertEqual(candidates("skillset claude enable d"), ["default", "demo"])
         self.assertEqual(candidates("skillset claude list --v"), ["--verbose"])
+        self.assertEqual(
+            candidates("skillset augment "),
+            ["disable", "enable", "list", "skills", "-h", "--help"],
+        )
+        self.assertEqual(candidates("skillset augment e"), ["enable"])
+        self.assertEqual(
+            candidates("skillset augment enable --local d"), ["default", "demo"]
+        )
+        self.assertEqual(
+            candidates("skillset augment disable --global d"), ["default", "demo"]
+        )
+        self.assertEqual(candidates("skillset augment enable --l"), ["--local"])
+        self.assertEqual(candidates("skillset augment list --v"), ["--verbose"])
+        self.assertEqual(candidates("skillset augment list --g"), ["--global"])
+        self.assertEqual(candidates("skillset augment list --l"), ["--local"])
+        self.assertEqual(
+            candidates("skillset augment skills "), ["list", "-h", "--help"]
+        )
+        self.assertEqual(candidates("skillset augment skills l"), ["list"])
+        self.assertEqual(
+            candidates("skillset augment skills list --v"), ["--verbose"]
+        )
+        self.assertEqual(
+            set(candidates("skillset augment skills list ")),
+            {"-h", "--help", "-v", "--verbose", "-g", "--global", "-l", "--local"},
+        )
 
         for commandline, options in {
             "skillset ": ("-h", "--help"),
@@ -659,6 +750,12 @@ printf 'claude-list:%s\n' "${COMPREPLY[*]}"'''
             "skillset claude enable ": ("-h", "--help", "-g", "--global", "-l", "--local"),
             "skillset claude disable ": ("-h", "--help", "-g", "--global", "-l", "--local"),
             "skillset claude list ": ("-h", "--help", "-v", "--verbose", "-g", "--global", "-l", "--local"),
+            "skillset augment ": ("-h", "--help"),
+            "skillset augment enable ": ("-h", "--help", "-g", "--global", "-l", "--local"),
+            "skillset augment disable ": ("-h", "--help", "-g", "--global", "-l", "--local"),
+            "skillset augment list ": ("-h", "--help", "-v", "--verbose", "-g", "--global", "-l", "--local"),
+            "skillset augment skills ": ("-h", "--help"),
+            "skillset augment skills list ": ("-h", "--help", "-v", "--verbose", "-g", "--global", "-l", "--local"),
             "skillset current ": ("-h", "--help"),
             "skillset show ": ("-h", "--help"),
             "skillset doctor ": ("-h", "--help", "--fix"),
@@ -752,6 +849,21 @@ printf '%s\n' "${#COMPREPLY[@]}"'''
 
         self.assertEqual(generated.returncode, 0, generated.stderr)
         self.assertEqual(generated.stderr, "")
+        self.assertIn("'augment:", generated.stdout)
+        self.assertIn("augment)", generated.stdout)
+        augment_branch = generated.stdout.split("augment)", 1)[1].split(";;", 1)[0]
+        for candidate in (
+            "'enable:",
+            "'disable:",
+            "'list:",
+            "'skills:",
+            "'--help:show help'",
+            "'--verbose:show skill inventory'",
+            "'--global:list global Auggie skills'",
+            "'--local:list local Auggie skills'",
+        ):
+            with self.subTest(candidate=candidate):
+                self.assertIn(candidate, augment_branch)
         parsed = subprocess.run(
             [zsh, "-n"],
             input=generated.stdout,
@@ -786,6 +898,125 @@ _skillset'''
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "first-autoload-call\n")
+
+    def test_generated_zsh_completion_behavior(self):
+        zsh = shutil.which("zsh")
+        if zsh is None:
+            self.skipTest("zsh is not installed")
+        self.initialize()
+        self.make_set(self.root, "demo")
+        generated = self.run_cli("completions", "zsh")
+        self.assertEqual(generated.returncode, 0, generated.stderr)
+        completion_directory = self.sandbox / "zsh-completions"
+        completion_directory.mkdir()
+        (completion_directory / "_skillset").write_text(
+            generated.stdout, encoding="utf-8"
+        )
+
+        def candidates(commandline, expected_output):
+            master, slave = os.openpty()
+
+            def attach_controlling_terminal():
+                os.setsid()
+                fcntl.ioctl(slave, termios.TIOCSCTTY, 0)
+
+            process = subprocess.Popen(
+                [zsh, "-f", "-i"],
+                stdin=slave,
+                stdout=slave,
+                stderr=slave,
+                env=self.environment(extra={
+                    "PATH": f"{REPOSITORY_ROOT / 'bin'}:{os.environ.get('PATH', '')}",
+                }),
+                preexec_fn=attach_controlling_terminal,
+            )
+            os.close(slave)
+            self.addCleanup(
+                lambda: process.poll() is None and process.kill()
+            )
+
+            def read_until(marker):
+                output = b""
+                deadline = time.monotonic() + 5
+                while marker not in output:
+                    ready, _write, _errors = select.select(
+                        [master], [], [], max(0.0, deadline - time.monotonic())
+                    )
+                    self.assertTrue(ready, output.decode("utf-8", "replace"))
+                    output += os.read(master, 4096)
+                return output.decode("utf-8", "replace")
+
+            try:
+                setup = (
+                    "PS1=$'\\x1e'\n"
+                    f"fpath=({completion_directory} $fpath)\n"
+                    "autoload -Uz compinit\n"
+                    "compinit -D\n"
+                )
+                os.write(master, setup.encode("utf-8"))
+                read_until(b"\x1e")
+                os.write(master, commandline.encode("utf-8") + b"\t\t")
+                output = read_until(expected_output.encode("utf-8"))
+                os.write(
+                    master,
+                    b"\x03exit\n",
+                )
+            finally:
+                os.close(master)
+                process.wait(timeout=5)
+
+            return output
+
+        for commandline, expected_output, candidate in (
+            ("skillset augment e", "enable", "enable"),
+            ("skillset augment --h", "--help", "--help"),
+            ("skillset augment enable --local d", "default", "default"),
+            ("skillset augment disable --global d", "default", "default"),
+            ("skillset augment enable -- d", "default", "default"),
+            ("skillset augment disable -- d", "default", "default"),
+            ("skillset augment enable --l", "--local", "--local"),
+            ("skillset augment list --v", "--verbose", "--verbose"),
+            ("skillset augment list --g", "--global", "--global"),
+            ("skillset augment list --l", "--local", "--local"),
+            ("skillset augment skills l", "list", "list"),
+            ("skillset augment skills --h", "--help", "--help"),
+            (
+                "skillset augment skills list --v",
+                "--verbose",
+                "--verbose",
+            ),
+            (
+                "skillset augment skills list --g",
+                "--global",
+                "--global",
+            ),
+            (
+                "skillset augment skills list --l",
+                "--local",
+                "--local",
+            ),
+            (
+                "skillset augment skills list --global --l",
+                "\x07",
+                None,
+            ),
+            ("skillset augment skills list -- --v", "\x07", None),
+        ):
+            with self.subTest(commandline=commandline):
+                output = candidates(commandline, expected_output)
+                if candidate is None:
+                    self.assertNotIn("--verbose", output)
+                else:
+                    self.assertIn(candidate, output)
+                if commandline in {
+                    "skillset augment enable -- d",
+                    "skillset augment disable -- d",
+                }:
+                    self.assertNotIn("--help", output)
+                    self.assertNotIn("--global", output)
+                    self.assertNotIn("--local", output)
+                if commandline == "skillset augment skills list --global --l":
+                    self.assertNotIn("--local", output)
 
     def test_doctor_accepts_healthy_state_without_mutation_or_findings(self):
         self.initialize()
@@ -1960,6 +2191,37 @@ _skillset'''
         self.assert_refused(renamed)
         self.assert_refused(removed)
         self.assertEqual(self.filesystem_snapshot(self.home), before)
+
+    def test_augment_global_enable_flattens_skills_and_registers_the_set(self):
+        self.initialize()
+        personal = self.make_manual_set(self.root, "personal")
+        skills = personal / "skills"
+        alpha = self.write_skill(skills, "alpha-directory", """
+            name: alpha
+            description: Alpha skill
+        """)
+        malformed = skills / "malformed"
+        malformed.mkdir()
+        (skills / "ignored.txt").write_text("not a skill directory\n")
+
+        enabled = self.run_cli("augment", "enable", "personal")
+        listed = self.run_cli("augment", "list")
+        verbose = self.run_cli("augment", "list", "--verbose")
+
+        augment = self.home / ".augment"
+        registration = augment / ".skillsets" / "personal"
+        alpha_link = augment / "skills" / "alpha-directory"
+        malformed_link = augment / "skills" / "malformed"
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        self.assertEqual(os.readlink(registration), str(skills))
+        self.assertEqual(os.readlink(alpha_link), str(alpha))
+        self.assertEqual(os.readlink(malformed_link), str(malformed))
+        self.assertFalse(os.path.lexists(augment / "skills" / "personal"))
+        self.assertFalse(os.path.lexists(augment / "skills" / "ignored.txt"))
+        self.assertEqual(listed.stdout, "[g] personal [m]\n")
+        self.assertIn("[g] personal [m]", verbose.stdout)
+        self.assertIn("alpha", verbose.stdout)
+        self.assertIn("malformed [invalid: missing SKILL.md]", verbose.stdout)
 
     def test_claude_global_enable_flattens_skills_and_registers_the_set(self):
         self.initialize()
@@ -3988,6 +4250,7 @@ _skillset'''
             ("list",),
             ("codex", "list"),
             ("claude", "list"),
+            ("augment", "list"),
             ("current",),
             ("show", "default"),
         )
@@ -4057,6 +4320,10 @@ _skillset'''
             ("claude", "list"),
             ("claude", "list", "-v"),
             ("claude", "list", "--verbose"),
+            ("augment", "list"),
+            ("augment", "list", "-v"),
+            ("augment", "list", "--verbose"),
+            ("augment", "skills", "list"),
             ("current",),
             ("show", "default"),
         ):
@@ -4071,6 +4338,8 @@ _skillset'''
             ("list",): "* default\n",
             ("codex", "list"): "",
             ("claude", "list"): "",
+            ("augment", "list"): "",
+            ("augment", "skills", "list"): "",
             ("current",): "default\n",
             ("show", "default"): "No skills installed.\n",
         }
@@ -4083,10 +4352,14 @@ _skillset'''
                     import fcntl
                     from pathlib import Path
                     marker = Path({str(attempted)!r})
+                    advisory_lock = Path({str(lock_path)!r}).resolve()
                     original_flock = fcntl.flock
                     def marked_flock(file, operation):
                         if operation & fcntl.LOCK_EX:
-                            marker.write_text("attempted", encoding="utf-8")
+                            descriptor = file if isinstance(file, int) else file.fileno()
+                            flock_path = Path(f"/proc/self/fd/{{descriptor}}").resolve()
+                            if flock_path == advisory_lock:
+                                marker.write_text("attempted", encoding="utf-8")
                         return original_flock(file, operation)
                     fcntl.flock = marked_flock
                     """
@@ -4111,6 +4384,83 @@ _skillset'''
                 self.assertEqual(process.returncode, 0, (stdout, stderr))
                 self.assertEqual(stdout, stdout_expected)
                 self.assertEqual(stderr, "")
+
+    def test_augment_skills_list_falls_back_when_advisory_lock_is_replaced(self):
+        self.initialize()
+        lock_path = self.root / ".skillset.lock"
+        displaced = self.sandbox / "displaced-advisory-lock"
+        replacement = self.sandbox / "replacement-advisory-lock"
+        replacement.write_text("replacement", encoding="utf-8")
+        replaced_marker = self.sandbox / "advisory-lock-replaced"
+        attempted_replacement = self.sandbox / "advisory-lock-replacement-attempted"
+        original_identity = (lock_path.stat().st_dev, lock_path.stat().st_ino)
+        replacement_identity = (replacement.stat().st_dev, replacement.stat().st_ino)
+        before = self.tree_contract_snapshot(self.home)
+        fault = self.fault_environment(
+            f"""
+            import fcntl
+            import os
+            from pathlib import Path
+            lock_path = {str(lock_path)!r}
+            displaced = {str(displaced)!r}
+            replacement = {str(replacement)!r}
+            replacement_identity = {replacement_identity!r}
+            replaced_marker = Path({str(replaced_marker)!r})
+            attempted_replacement = Path({str(attempted_replacement)!r})
+            original_open = os.open
+            original_flock = fcntl.flock
+            replaced = False
+            def replace_lock_before_open(name, *args, **kwargs):
+                global replaced
+                if (
+                    name == ".skillset.lock"
+                    and kwargs.get("dir_fd") is not None
+                    and not replaced
+                ):
+                    os.rename(lock_path, displaced)
+                    os.symlink(replacement, lock_path)
+                    replaced_marker.write_text("replaced", encoding="utf-8")
+                    replaced = True
+                descriptor = original_open(name, *args, **kwargs)
+                metadata = os.fstat(descriptor)
+                if (metadata.st_dev, metadata.st_ino) == replacement_identity:
+                    attempted_replacement.write_text("opened", encoding="utf-8")
+                return descriptor
+            def mark_lock_attempt(file, operation):
+                if operation & fcntl.LOCK_EX:
+                    descriptor = file if isinstance(file, int) else file.fileno()
+                    metadata = os.fstat(descriptor)
+                    identity = (metadata.st_dev, metadata.st_ino)
+                    if identity == replacement_identity:
+                        attempted_replacement.write_text("attempted", encoding="utf-8")
+                return original_flock(file, operation)
+            os.open = replace_lock_before_open
+            fcntl.flock = mark_lock_attempt
+            """
+        )
+        try:
+            result = self.run_cli(
+                "augment", "skills", "list", extra_environment=fault
+            )
+        finally:
+            if os.path.lexists(displaced):
+                lock_path.unlink(missing_ok=True)
+                os.replace(displaced, lock_path)
+
+        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(result.stderr, "")
+        self.assertTrue(replaced_marker.exists())
+        self.assertFalse(
+            attempted_replacement.exists(),
+            "augment skills list followed the replacement advisory lock",
+        )
+        self.assertEqual(
+            (lock_path.stat().st_dev, lock_path.stat().st_ino), original_identity
+        )
+        self.assertFalse(lock_path.is_symlink())
+        self.assertFalse(os.path.lexists(displaced))
+        self.assertEqual(self.tree_contract_snapshot(self.home), before)
 
     def test_skills_appends_global_to_scoped_upstream_commands(self):
         self.initialize()
@@ -4444,6 +4794,19 @@ _skillset'''
             ("claude", "list", "--unknown"),
             ("claude", "enable", "default", "--global", "--local"),
             ("claude", "list", "--global", "--local"),
+            ("augment",),
+            ("augment", "unknown"),
+            ("augment", "enable"),
+            ("augment", "disable"),
+            ("augment", "list", "extra"),
+            ("augment", "list", "--unknown"),
+            ("augment", "enable", "default", "--global", "--local"),
+            ("augment", "list", "--global", "--local"),
+            ("augment", "skills"),
+            ("augment", "skills", "unknown"),
+            ("augment", "skills", "list", "extra"),
+            ("augment", "skills", "list", "--unknown"),
+            ("augment", "skills", "list", "--global", "--local"),
             ("current", "extra"),
             ("current", "--verbose"),
             ("show", "default", "extra"),
@@ -6418,6 +6781,3328 @@ _skillset'''
         self.assertIn(staged_set, report)
         self.assertIn("doctor", report.lower())
 
+
+
+    def test_augment_local_enable_is_exact_scoped_idempotent_and_reconciles(self):
+        self.initialize()
+        personal = self.make_set(self.root, "personal")
+        skills = personal / "skills"
+        alpha = self.write_skill(skills, "alpha", """
+            name: alpha
+            description: Alpha
+        """)
+        beta = self.write_skill(skills, "beta", """
+            name: beta
+            description: Beta
+        """)
+        project = self.sandbox / "project-augment"
+        project.mkdir()
+
+        first = self.run_cli("augment", "enable", "personal", "-l", cwd=project)
+        local = project / ".augment"
+        registration = local / ".skillsets" / "personal"
+        alpha_link = local / "skills" / "alpha"
+        beta_link = local / "skills" / "beta"
+        identities = {
+            path: path.lstat().st_ino
+            for path in (registration, alpha_link, beta_link)
+        }
+        second = self.run_cli(
+            "augment", "enable", "--local", "personal", cwd=project
+        )
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(
+            {path: path.lstat().st_ino for path in identities}, identities
+        )
+        self.assertFalse((self.home / ".augment").exists())
+
+        gamma = self.write_skill(skills, "gamma", """
+            name: gamma
+            description: Gamma
+        """)
+        shutil.rmtree(beta)
+        reconciled = self.run_cli(
+            "augment", "enable", "personal", "--local", cwd=project
+        )
+        global_list = self.run_cli("augment", "list", "--global", cwd=project)
+        local_list = self.run_cli("augment", "list", "--local", cwd=project)
+        combined = self.run_cli("augment", "list", cwd=project)
+
+        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
+        self.assertEqual(os.readlink(alpha_link), str(alpha))
+        self.assertFalse(os.path.lexists(beta_link))
+        self.assertEqual(os.readlink(local / "skills" / "gamma"), str(gamma))
+        self.assertEqual(global_list.stdout, "")
+        self.assertEqual(local_list.stdout, "personal\n")
+        self.assertEqual(combined.stdout, "[l] personal\n")
+
+    def test_augment_lists_overlapping_global_and_local_registrations_and_deduplicates_home(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        project = self.sandbox / "augment-overlap"
+        project.mkdir()
+        self.assertEqual(
+            self.run_cli("augment", "enable", "default").returncode, 0
+        )
+        self.assertEqual(
+            self.run_cli(
+                "augment", "enable", "default", "--local", cwd=project
+            ).returncode,
+            0,
+        )
+
+        combined = self.run_cli("augment", "list", cwd=project)
+        from_home = self.run_cli("augment", "list", cwd=self.home)
+
+        self.assertEqual(
+            combined.stdout, "[g] default\n[l] default\n"
+        )
+        self.assertEqual(from_home.stdout, "[g] default\n")
+
+    def test_augment_combined_list_deduplicates_aliased_home(self):
+        physical_parent = self.sandbox / "augment-list-physical"
+        physical_home = physical_parent / "home"
+        physical_home.mkdir(parents=True)
+        alias_parent = self.sandbox / "augment-list-alias"
+        alias_parent.symlink_to(physical_parent, target_is_directory=True)
+        alias_home = alias_parent / "home"
+        root = self.initialize(home=alias_home)
+        source = root / "skillsets" / "default" / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        enabled = self.run_cli(
+            "augment", "enable", "default", home=alias_home
+        )
+
+        listed = self.run_cli(
+            "augment", "list", home=physical_home, cwd=physical_home
+        )
+        disabled = self.run_cli("augment", "disable", "default", home=physical_home)
+        after_disable = self.run_cli("augment", "list", home=physical_home)
+
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(listed.stdout, "[g] default\n")
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        self.assertEqual(after_disable.stdout, "")
+
+    def test_augment_enable_validates_scope_roots_before_deduplication(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        self.write_skill(
+            source, "alpha", "name: alpha\ndescription: Alpha"
+        )
+        project = self.sandbox / "augment-dangling-scope"
+        project.mkdir()
+        global_root = self.home / ".augment"
+        local_root = project / ".augment"
+        global_root.symlink_to(local_root, target_is_directory=True)
+        before = self.filesystem_snapshot(self.sandbox)
+
+        result = self.run_cli(
+            "augment",
+            "enable",
+            "default",
+            "--local",
+            cwd=project,
+        )
+
+        self.assert_refused(result)
+        self.assertIn(
+            f"container must be a real directory: {global_root}",
+            result.stderr,
+        )
+        self.assertEqual(self.filesystem_snapshot(self.sandbox), before)
+        self.assertFalse(local_root.exists())
+
+    def test_augment_enable_refuses_cross_scope_skill_name_collisions(self):
+        for index, first_scope in enumerate(("global", "local")):
+            with self.subTest(first_scope=first_scope):
+                home = self.new_home(f"augment-cross-scope-enable-{index}")
+                root = self.make_managed_layout(home)
+                (root / ".skillset.lock").touch()
+                global_source = root / "skillsets" / "default" / "skills"
+                local_source = self.make_set(root, "project") / "skills"
+                self.write_skill(
+                    global_source,
+                    "shared",
+                    "name: shared\ndescription: Global",
+                )
+                self.write_skill(
+                    local_source,
+                    "shared",
+                    "name: shared\ndescription: Local",
+                )
+                project = self.sandbox / f"augment-cross-scope-project-{index}"
+                project.mkdir()
+                if first_scope == "global":
+                    first = self.run_cli(
+                        "augment",
+                        "enable",
+                        "default",
+                        home=home,
+                        cwd=project,
+                    )
+                    before = self.filesystem_snapshot(home)
+                    refused = self.run_cli(
+                        "augment",
+                        "enable",
+                        "project",
+                        "--local",
+                        home=home,
+                        cwd=project,
+                    )
+                    self.assertFalse((project / ".augment").exists())
+                    self.assertEqual(
+                        self.filesystem_snapshot(home), before
+                    )
+                else:
+                    first = self.run_cli(
+                        "augment",
+                        "enable",
+                        "project",
+                        "--local",
+                        home=home,
+                        cwd=project,
+                    )
+                    before = self.filesystem_snapshot(project)
+                    refused = self.run_cli(
+                        "augment",
+                        "enable",
+                        "default",
+                        home=home,
+                        cwd=project,
+                    )
+                    self.assertFalse((home / ".augment").exists())
+                    self.assertEqual(
+                        self.filesystem_snapshot(project), before
+                    )
+
+                self.assertEqual(first.returncode, 0, first.stderr)
+                self.assert_refused(refused)
+                self.assertIn(
+                    "skill name 'shared' conflicts across global and local scopes",
+                    refused.stderr,
+                )
+
+    def test_augment_enable_rechecks_opposite_scope_created_during_sync(self):
+        for index, enabled_scope in enumerate(("global", "local")):
+            with self.subTest(enabled_scope=enabled_scope):
+                home = self.new_home(f"augment-cross-scope-race-{index}")
+                root = self.make_managed_layout(home)
+                (root / ".skillset.lock").touch()
+                source = root / "skillsets" / "default" / "skills"
+                self.write_skill(
+                    source,
+                    "shared",
+                    "name: shared\ndescription: Shared",
+                )
+                project = self.sandbox / f"augment-cross-scope-race-project-{index}"
+                project.mkdir()
+                opposite_skills = (
+                    project / ".augment" / "skills"
+                    if enabled_scope == "global"
+                    else home / ".augment" / "skills"
+                )
+                fault = self.fault_environment(f"""
+                    import os
+                    original_symlink = os.symlink
+                    created_collision = False
+                    def create_opposite_collision(target, name, *args, **kwargs):
+                        global created_collision
+                        result = original_symlink(target, name, *args, **kwargs)
+                        if not created_collision and name == "shared":
+                            os.makedirs({str(opposite_skills)!r})
+                            with open(
+                                {str(opposite_skills / "shared")!r},
+                                "w",
+                                encoding="utf-8",
+                            ) as collision:
+                                collision.write("keep\\n")
+                            created_collision = True
+                        return result
+                    os.symlink = create_opposite_collision
+                """)
+                arguments = ["augment", "enable", "default"]
+                if enabled_scope == "local":
+                    arguments.append("--local")
+
+                result = self.run_cli(
+                    *arguments,
+                    home=home,
+                    cwd=project,
+                    extra_environment=fault,
+                )
+
+                self.assert_refused(result)
+                self.assertIn(
+                    "skill name 'shared' conflicts across global and local scopes",
+                    result.stderr,
+                )
+                self.assertEqual(
+                    (opposite_skills / "shared").read_text(),
+                    "keep\n",
+                )
+
+    def test_augment_list_rejects_cross_scope_masking(self):
+        home = self.new_home("augment-cross-scope-list")
+        root = self.make_managed_layout(home)
+        (root / ".skillset.lock").touch()
+        global_source = root / "skillsets" / "default" / "skills"
+        local_source = self.make_set(root, "project") / "skills"
+        self.write_skill(
+            global_source,
+            "shared",
+            "name: shared\ndescription: Global",
+        )
+        self.write_skill(
+            local_source,
+            "shared",
+            "name: shared\ndescription: Local",
+        )
+        project = self.sandbox / "augment-cross-scope-list-project"
+        elsewhere = self.sandbox / "augment-cross-scope-list-elsewhere"
+        project.mkdir()
+        elsewhere.mkdir()
+        local_enabled = self.run_cli(
+            "augment",
+            "enable",
+            "project",
+            "--local",
+            home=home,
+            cwd=project,
+        )
+        global_enabled = self.run_cli(
+            "augment",
+            "enable",
+            "default",
+            home=home,
+            cwd=elsewhere,
+        )
+
+        self.assertEqual(local_enabled.returncode, 0, local_enabled.stderr)
+        self.assertEqual(global_enabled.returncode, 0, global_enabled.stderr)
+        for arguments in (
+            ("augment", "list"),
+            ("augment", "list", "--global"),
+            ("augment", "list", "--local"),
+        ):
+            with self.subTest(arguments=arguments):
+                listed = self.run_cli(
+                    *arguments,
+                    home=home,
+                    cwd=project,
+                )
+                self.assert_refused(listed)
+                self.assertEqual(listed.stdout, "")
+                self.assertIn(
+                    "skill name 'shared' conflicts across global and local scopes",
+                    listed.stderr,
+                )
+
+    def test_augment_enable_refuses_source_symlinks_and_collisions_before_mutation(self):
+        for index, collision_kind in enumerate(("file", "directory", "relative", "absolute")):
+            with self.subTest(collision=collision_kind):
+                home = self.new_home(f"augment-collision-{index}")
+                root = self.make_managed_layout(home)
+                (root / ".skillset.lock").touch()
+                source = root / "skillsets" / "default" / "skills"
+                self.write_skill(source, "alpha", """
+                    name: alpha
+                    description: Alpha
+                """)
+                augment_skills = home / ".augment" / "skills"
+                augment_skills.mkdir(parents=True)
+                collision = augment_skills / "alpha"
+                if collision_kind == "file":
+                    collision.write_text("keep\n")
+                elif collision_kind == "directory":
+                    collision.mkdir()
+                elif collision_kind == "relative":
+                    collision.symlink_to("../somewhere")
+                else:
+                    collision.symlink_to("/tmp/unrelated")
+                before = self.filesystem_snapshot(home)
+
+                result = self.run_cli("augment", "enable", "default", home=home)
+
+                self.assert_refused(result)
+                self.assertEqual(self.filesystem_snapshot(home), before)
+                self.assertFalse(
+                    os.path.lexists(home / ".augment" / ".skillsets" / "default")
+                )
+
+        home = self.new_home("augment-source-symlink")
+        root = self.make_managed_layout(home)
+        (root / ".skillset.lock").touch()
+        source = root / "skillsets" / "default" / "skills"
+        (source / "linked").symlink_to(self.sandbox)
+        before = self.filesystem_snapshot(home)
+
+        result = self.run_cli("augment", "enable", "default", home=home)
+
+        self.assert_refused(result)
+        self.assertIn("must not be a symlink", result.stderr)
+        self.assertEqual(self.filesystem_snapshot(home), before)
+        self.assertFalse((home / ".augment").exists())
+
+    def test_augment_enable_ignores_compatible_root_collisions_without_mutation(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        alpha = self.write_skill(source, "alpha", """
+            name: alpha
+            description: managed alpha
+        """)
+        project = self.sandbox / "augment-compatible-root-project"
+        project.mkdir()
+        compatible_roots = (
+            self.home / ".claude" / "skills",
+            project / ".claude" / "skills",
+            project / ".agents" / "skills",
+        )
+        for root in compatible_roots:
+            root.mkdir(parents=True)
+            self.write_skill(root, "alpha", """
+                name: alpha
+                description: compatible alpha
+            """)
+        immutable_roots = compatible_roots + (self.home / ".agents",)
+        before = {
+            root: self.filesystem_snapshot(root) for root in immutable_roots
+        }
+
+        for scope, arguments, augment in (
+            ("global", (), self.home / ".augment"),
+            ("local", ("--local",), project / ".augment"),
+        ):
+            with self.subTest(scope=scope):
+                enabled = self.run_cli(
+                    "augment", "enable", "default", *arguments, cwd=project
+                )
+
+                self.assertEqual(enabled.returncode, 0, enabled.stderr)
+                self.assertEqual(
+                    os.readlink(augment / "skills" / "alpha"), str(alpha)
+                )
+                for root in immutable_roots:
+                    self.assertEqual(self.filesystem_snapshot(root), before[root])
+
+                disabled = self.run_cli(
+                    "augment", "disable", "default", *arguments, cwd=project
+                )
+
+                self.assertEqual(disabled.returncode, 0, disabled.stderr)
+                for root in immutable_roots:
+                    self.assertEqual(self.filesystem_snapshot(root), before[root])
+
+    def test_augment_local_enable_refuses_projection_roots_inside_source(self):
+        for index, nested in enumerate((False, True)):
+            with self.subTest(nested=nested):
+                home = self.new_home(f"augment-source-overlap-{index}")
+                root = self.make_managed_layout(home)
+                (root / ".skillset.lock").touch()
+                source = root / "skillsets" / "default" / "skills"
+                alpha = self.write_skill(source, "alpha", """
+                    name: alpha
+                    description: Alpha
+                """)
+                working_directory = alpha if nested else source
+                before = self.filesystem_snapshot(home)
+
+                result = self.run_cli(
+                    "augment",
+                    "enable",
+                    "default",
+                    "--local",
+                    home=home,
+                    cwd=working_directory,
+                )
+
+                self.assert_refused(result)
+                self.assertIn(
+                    "local projection must not be rooted inside its skill source",
+                    result.stderr,
+                )
+                self.assertEqual(self.filesystem_snapshot(home), before)
+                self.assertFalse(
+                    os.path.lexists(working_directory / ".augment")
+                )
+
+        physical_parent = self.sandbox / "augment-source-physical"
+        physical_home = physical_parent / "home"
+        physical_home.mkdir(parents=True)
+        alias_parent = self.sandbox / "augment-source-alias"
+        alias_parent.symlink_to(physical_parent, target_is_directory=True)
+        alias_home = alias_parent / "home"
+        root = self.make_managed_layout(physical_home)
+        (root / ".skillset.lock").touch()
+        source = root / "skillsets" / "default" / "skills"
+        self.write_skill(
+            source,
+            "alpha",
+            "name: alpha\ndescription: Alpha",
+        )
+        before = self.filesystem_snapshot(physical_home)
+
+        result = self.run_cli(
+            "augment",
+            "enable",
+            "default",
+            "--local",
+            home=alias_home,
+            cwd=source,
+        )
+
+        self.assert_refused(result)
+        self.assertIn(
+            "local projection must not be rooted inside its skill source",
+            result.stderr,
+        )
+        self.assertEqual(self.filesystem_snapshot(physical_home), before)
+        self.assertFalse(os.path.lexists(source / ".augment"))
+
+    def test_augment_enable_revalidates_public_directory_bindings(self):
+        for index, replaced_name in enumerate(
+            ("source", "projection", "registrations")
+        ):
+            with self.subTest(directory=replaced_name):
+                home = self.new_home(f"augment-binding-{index}")
+                root = self.make_managed_layout(home)
+                (root / ".skillset.lock").touch()
+                source = root / "skillsets" / "default" / "skills"
+                self.write_skill(
+                    source,
+                    "alpha",
+                    "name: alpha\ndescription: Alpha",
+                )
+                augment = home / ".augment"
+                paths = {
+                    "source": source,
+                    "projection": augment / "skills",
+                    "registrations": augment / ".skillsets",
+                }
+                replaced = paths[replaced_name]
+                detached = replaced.with_name(f"{replaced.name}.detached")
+                trigger = "alpha" if replaced_name == "projection" else "default"
+                fault = self.fault_environment(f"""
+                    import os
+                    original_symlink = os.symlink
+                    replaced = False
+                    def replace_directory_after_link(target, name, *args, **kwargs):
+                        global replaced
+                        result = original_symlink(target, name, *args, **kwargs)
+                        if (
+                            not replaced
+                            and name == {trigger!r}
+                            and kwargs.get("dir_fd") is not None
+                        ):
+                            os.rename({str(replaced)!r}, {str(detached)!r})
+                            os.mkdir({str(replaced)!r})
+                            replaced = True
+                        return result
+                    os.symlink = replace_directory_after_link
+                """)
+
+                result = self.run_cli(
+                    "augment",
+                    "enable",
+                    "default",
+                    home=home,
+                    extra_environment=fault,
+                )
+
+                self.assert_refused(result)
+                self.assertIn(
+                    "directory changed during synchronization",
+                    result.stderr,
+                )
+                self.assertTrue(detached.is_dir())
+
+                recovered = self.run_cli(
+                    "augment", "enable", "default", home=home
+                )
+                self.assertEqual(
+                    recovered.returncode, 0, recovered.stderr
+                )
+
+    def test_augment_disable_revalidates_public_directory_bindings(self):
+        for index, container_name in enumerate(("skills", ".skillsets")):
+            with self.subTest(container=container_name):
+                home = self.new_home(f"augment-disable-binding-{index}")
+                root = self.initialize(home=home)
+                source = root / "skillsets" / "default" / "skills"
+                self.write_skill(
+                    source,
+                    "alpha",
+                    "name: alpha\ndescription: Alpha",
+                )
+                self.assertEqual(
+                    self.run_cli(
+                        "augment", "enable", "default", home=home
+                    ).returncode,
+                    0,
+                )
+                augment = home / ".augment"
+                public = augment / container_name
+                detached = augment / f"{container_name}.detached"
+                trigger = (
+                    "alpha"
+                    if container_name == "skills"
+                    else "default"
+                )
+                recreated_name = trigger
+                recreated_target = (
+                    str(source / "alpha")
+                    if container_name == "skills"
+                    else str(source)
+                )
+                fault = self.fault_environment(f"""
+                    import os
+                    original_unlink = os.unlink
+                    replaced = False
+                    def replace_directory_after_unlink(name, *args, **kwargs):
+                        global replaced
+                        result = original_unlink(name, *args, **kwargs)
+                        if (
+                            not replaced
+                            and name == "entry"
+                            and kwargs.get("dir_fd") is not None
+                        ):
+                            os.rename({str(public)!r}, {str(detached)!r})
+                            os.mkdir({str(public)!r})
+                            os.symlink(
+                                {recreated_target!r},
+                                os.path.join(
+                                    {str(public)!r}, {recreated_name!r}
+                                ),
+                            )
+                            replaced = True
+                        return result
+                    os.unlink = replace_directory_after_unlink
+                """)
+
+                result = self.run_cli(
+                    "augment",
+                    "disable",
+                    "default",
+                    home=home,
+                    extra_environment=fault,
+                )
+
+                self.assert_refused(result)
+                self.assertIn(
+                    f"directory changed during synchronization: {public}",
+                    result.stderr,
+                )
+                self.assertIn(
+                    "skillset augment disable default", result.stderr
+                )
+                self.assertTrue(detached.is_dir())
+                self.assertTrue(
+                    os.path.lexists(public / recreated_name)
+                )
+
+                recovered = self.run_cli(
+                    "augment", "disable", "default", home=home
+                )
+                self.assertEqual(
+                    recovered.returncode, 0, recovered.stderr
+                )
+                self.assertFalse(
+                    os.path.lexists(public / recreated_name)
+                )
+
+    def test_augment_disable_detects_initially_absent_containers_appearing(self):
+        for index, container_name in enumerate(("skills", ".skillsets")):
+            with self.subTest(container=container_name):
+                home = self.new_home(
+                    f"augment-disable-appeared-{index}"
+                )
+                self.initialize(home=home)
+                augment = home / ".augment"
+                augment.mkdir()
+                appeared = augment / container_name
+                fault = self.fault_environment(f"""
+                    import os
+                    original_stat = os.stat
+                    appeared = False
+                    def create_during_final_verification(path, *args, **kwargs):
+                        global appeared
+                        if (
+                            not appeared
+                            and os.fspath(path) == {str(appeared)!r}
+                            and kwargs.get("follow_symlinks") is False
+                        ):
+                            os.mkdir({str(appeared)!r})
+                            appeared = True
+                        return original_stat(path, *args, **kwargs)
+                    os.stat = create_during_final_verification
+                """)
+
+                result = self.run_cli(
+                    "augment",
+                    "disable",
+                    "default",
+                    home=home,
+                    extra_environment=fault,
+                )
+
+                self.assert_refused(result)
+                self.assertIn(
+                    f"directory changed during synchronization: {appeared}",
+                    result.stderr,
+                )
+                self.assertIn(
+                    "skillset augment disable default", result.stderr
+                )
+                self.assertTrue(appeared.is_dir())
+                recovered = self.run_cli(
+                    "augment", "disable", "default", home=home
+                )
+                self.assertEqual(
+                    recovered.returncode, 0, recovered.stderr
+                )
+
+    def test_augment_ownership_requires_matching_basename_and_preserves_aliases(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        alpha = self.write_skill(source, "alpha", """
+            name: alpha
+            description: Alpha
+        """)
+        enabled = self.run_cli("augment", "enable", "default")
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        augment_skills = self.home / ".augment" / "skills"
+        alias = augment_skills / "alpha-alias"
+        alias.symlink_to(alpha)
+
+        shutil.rmtree(alpha)
+        reconciled = self.run_cli("augment", "enable", "default")
+        disabled = self.run_cli("augment", "disable", "default")
+
+        self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
+        self.assertFalse(os.path.lexists(augment_skills / "alpha"))
+        self.assertTrue(alias.is_symlink())
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        self.assertTrue(alias.is_symlink())
+        self.assertTrue((self.home / ".augment").is_dir())
+        self.assertTrue((self.home / ".augment" / ".skillsets").is_dir())
+        self.assertTrue(augment_skills.is_dir())
+
+    def test_augment_refuses_links_replaced_after_ownership_inspection(self):
+        for index, action in enumerate(
+            ("reconcile-stale", "disable-projection", "disable-registration")
+        ):
+            with self.subTest(action=action):
+                home = self.new_home(f"augment-replaced-link-{index}")
+                root = self.initialize(home=home)
+                source = root / "skillsets" / "default" / "skills"
+                alpha = self.write_skill(
+                    source, "alpha", "name: alpha\ndescription: Alpha"
+                )
+                self.assertEqual(
+                    self.run_cli(
+                        "augment", "enable", "default", home=home
+                    ).returncode,
+                    0,
+                )
+                augment = home / ".augment"
+                projection = augment / "skills" / "alpha"
+                registration = augment / ".skillsets" / "default"
+                if action == "reconcile-stale":
+                    shutil.rmtree(alpha)
+                    arguments = ("augment", "enable", "default")
+                    entry = projection
+                    trigger = "alpha"
+                elif action == "disable-projection":
+                    arguments = ("augment", "disable", "default")
+                    entry = projection
+                    trigger = "alpha"
+                else:
+                    arguments = ("augment", "disable", "default")
+                    entry = registration
+                    trigger = "default"
+                replacement = str(home / f"unrelated-{action}")
+                fault = self.fault_environment(f"""
+                    import os
+                    original_readlink = os.readlink
+                    reads = 0
+                    replaced = False
+                    def replace_after_ownership_read(name, *args, **kwargs):
+                        global reads, replaced
+                        target = original_readlink(name, *args, **kwargs)
+                        if (
+                            name == {trigger!r}
+                            and kwargs.get("dir_fd") is not None
+                            and not replaced
+                        ):
+                            reads += 1
+                            if reads == 2:
+                                os.unlink(name, dir_fd=kwargs["dir_fd"])
+                                os.symlink(
+                                    {replacement!r}, name,
+                                    dir_fd=kwargs["dir_fd"],
+                                )
+                                replaced = True
+                        return target
+                    os.readlink = replace_after_ownership_read
+                """)
+
+                result = self.run_cli(
+                    *arguments, home=home, extra_environment=fault
+                )
+
+                self.assert_refused(result)
+                self.assertIn("refused to remove changed Auggie entry", result.stderr)
+                self.assertTrue(os.path.lexists(entry))
+                self.assertEqual(os.readlink(entry), replacement)
+
+    def test_augment_quarantines_links_replaced_before_removal(self):
+        for index, action in enumerate(
+            ("reconcile-stale", "disable-projection", "disable-registration")
+        ):
+            with self.subTest(action=action):
+                home = self.new_home(f"augment-quarantined-link-{index}")
+                root = self.initialize(home=home)
+                source = root / "skillsets" / "default" / "skills"
+                alpha = self.write_skill(
+                    source, "alpha", "name: alpha\ndescription: Alpha"
+                )
+                self.assertEqual(
+                    self.run_cli(
+                        "augment", "enable", "default", home=home
+                    ).returncode,
+                    0,
+                )
+                augment = home / ".augment"
+                projection = augment / "skills" / "alpha"
+                registration = augment / ".skillsets" / "default"
+                if action == "reconcile-stale":
+                    shutil.rmtree(alpha)
+                    arguments = ("augment", "enable", "default")
+                    entry = projection
+                    trigger = "alpha"
+                elif action == "disable-projection":
+                    arguments = ("augment", "disable", "default")
+                    entry = projection
+                    trigger = "alpha"
+                else:
+                    arguments = ("augment", "disable", "default")
+                    entry = registration
+                    trigger = "default"
+                replacement = str(home / f"unrelated-quarantine-{action}")
+                fault = self.fault_environment(f"""
+                    import os
+                    original_rename = os.rename
+                    replaced = False
+                    def replace_before_quarantine(source, destination, *args, **kwargs):
+                        global replaced
+                        if (
+                            source == {trigger!r}
+                            and kwargs.get("src_dir_fd") is not None
+                            and not replaced
+                        ):
+                            os.unlink(source, dir_fd=kwargs["src_dir_fd"])
+                            os.symlink(
+                                {replacement!r}, source,
+                                dir_fd=kwargs["src_dir_fd"],
+                            )
+                            replaced = True
+                        return original_rename(source, destination, *args, **kwargs)
+                    os.rename = replace_before_quarantine
+                """)
+
+                result = self.run_cli(
+                    *arguments, home=home, extra_environment=fault
+                )
+
+                self.assert_refused(result)
+                quarantines = sorted(augment.glob(".skillset-removal-*"))
+                self.assertEqual(len(quarantines), 1)
+                quarantined = quarantines[0] / "entry"
+                self.assertFalse(os.path.lexists(entry))
+                self.assertTrue(os.path.lexists(quarantined))
+                self.assertEqual(os.readlink(quarantined), replacement)
+                self.assertIn(str(quarantined), result.stderr)
+
+    def test_augment_refuses_leftover_removal_quarantine_without_mutation(self):
+        self.initialize()
+        augment = self.home / ".augment"
+        quarantine = augment / ".skillset-removal-foreign"
+        quarantine.mkdir(parents=True)
+        (quarantine / "entry").write_text("preserve", encoding="utf-8")
+        before = self.filesystem_snapshot(self.home)
+
+        result = self.run_cli("augment", "list")
+
+        self.assert_refused(result)
+        self.assertIn(str(quarantine), result.stderr)
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+
+    def test_augment_preserves_quarantine_when_interrupted_after_move(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        alpha = self.write_skill(
+            source, "alpha", "name: alpha\ndescription: Alpha"
+        )
+        self.assertEqual(
+            self.run_cli("augment", "enable", "default").returncode, 0
+        )
+        augment = self.home / ".augment"
+        projected = augment / "skills" / "alpha"
+        registration = augment / ".skillsets" / "default"
+        fault = self.fault_environment("""
+            import os
+            original_rename = os.rename
+            interrupted = False
+            def interrupt_after_quarantine_move(source, destination, *args, **kwargs):
+                global interrupted
+                result = original_rename(source, destination, *args, **kwargs)
+                if (
+                    source == "alpha"
+                    and kwargs.get("src_dir_fd") is not None
+                    and not interrupted
+                ):
+                    interrupted = True
+                    raise KeyboardInterrupt()
+                return result
+            os.rename = interrupt_after_quarantine_move
+        """)
+
+        result = self.run_cli(
+            "augment", "disable", "default", extra_environment=fault
+        )
+
+        self.assertEqual(result.returncode, 130, result.stderr)
+        quarantines = sorted(augment.glob(".skillset-removal-*"))
+        self.assertEqual(len(quarantines), 1)
+        quarantined = quarantines[0] / "entry"
+        self.assertFalse(os.path.lexists(projected))
+        self.assertTrue(registration.is_symlink())
+        self.assertTrue(quarantined.is_symlink())
+        self.assertEqual(os.readlink(quarantined), str(alpha))
+        self.assertIn(str(quarantined), result.stderr)
+        self.assertIn("manual recovery", result.stderr)
+        self.assertNotIn("Rerun `skillset augment", result.stderr)
+        before = self.filesystem_snapshot(self.home)
+
+        blocked = self.run_cli("augment", "list")
+
+        self.assert_refused(blocked)
+        self.assertIn(str(quarantines[0]), blocked.stderr)
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+
+    def test_augment_reports_manual_recovery_after_post_mkdir_interrupt(self):
+        for operation in ("stat", "open"):
+            with self.subTest(operation=operation):
+                home = self.new_home(f"post-mkdir-{operation}-interrupt")
+                root = self.initialize(home=home)
+                source = root / "skillsets" / "default" / "skills"
+                self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+                self.assertEqual(
+                    self.run_cli("augment", "enable", "default", home=home).returncode,
+                    0,
+                )
+                augment = home / ".augment"
+                projected = augment / "skills" / "alpha"
+                fault = self.fault_environment(f"""
+                    import os
+                    original_mkdir = os.mkdir
+                    original_stat = os.stat
+                    original_open = os.open
+                    quarantine = None
+                    interrupted = False
+                    def track_quarantine(path, *args, **kwargs):
+                        global quarantine
+                        result = original_mkdir(path, *args, **kwargs)
+                        if path.startswith(".skillset-removal-") and kwargs.get("dir_fd") is not None:
+                            quarantine = path
+                        return result
+                    def interrupt_stat(path, *args, **kwargs):
+                        global interrupted
+                        if {operation!r} == "stat" and path == quarantine and kwargs.get("dir_fd") is not None and not interrupted:
+                            interrupted = True
+                            raise KeyboardInterrupt()
+                        return original_stat(path, *args, **kwargs)
+                    def interrupt_open(path, *args, **kwargs):
+                        global interrupted
+                        if {operation!r} == "open" and path == quarantine and kwargs.get("dir_fd") is not None and not interrupted:
+                            interrupted = True
+                            raise KeyboardInterrupt()
+                        return original_open(path, *args, **kwargs)
+                    os.mkdir = track_quarantine
+                    os.stat = interrupt_stat
+                    os.open = interrupt_open
+                """)
+
+                result = self.run_cli(
+                    "augment", "disable", "default", home=home,
+                    extra_environment=fault,
+                )
+
+                self.assertEqual(result.returncode, 130, result.stderr)
+                quarantines = list(augment.glob(".skillset-removal-*"))
+                self.assertEqual(len(quarantines), 1)
+                self.assertTrue(projected.is_symlink())
+                self.assertIn(str(quarantines[0]), result.stderr)
+                self.assertIn("manual recovery", result.stderr)
+                self.assertNotIn("Rerun `skillset augment", result.stderr)
+                before = self.filesystem_snapshot(home)
+
+                blocked = self.run_cli("augment", "list", home=home)
+
+                self.assert_refused(blocked)
+                self.assertIn(str(quarantines[0]), blocked.stderr)
+                self.assertEqual(self.filesystem_snapshot(home), before)
+
+    def test_augment_refuses_replaced_removal_quarantine_during_creation(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        self.assertEqual(
+            self.run_cli("augment", "enable", "default").returncode, 0
+        )
+        augment = self.home / ".augment"
+        projected = augment / "skills" / "alpha"
+        fault = self.fault_environment(f"""
+            import os
+            original_mkdir = os.mkdir
+            original_open = os.open
+            quarantine = None
+            replaced = False
+            def track_quarantine(path, *args, **kwargs):
+                global quarantine
+                result = original_mkdir(path, *args, **kwargs)
+                if (
+                    path.startswith(".skillset-removal-")
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    quarantine = path
+                return result
+            def replace_quarantine(path, *args, **kwargs):
+                global replaced
+                if (
+                    path == quarantine
+                    and kwargs.get("dir_fd") is not None
+                    and not replaced
+                ):
+                    replaced = True
+                    directory = kwargs["dir_fd"]
+                    os.rename(
+                        path, path + ".detached",
+                        src_dir_fd=directory, dst_dir_fd=directory,
+                    )
+                    original_mkdir(path, dir_fd=directory)
+                    replacement_fd = original_open(
+                        path, os.O_RDONLY | os.O_DIRECTORY, dir_fd=directory,
+                    )
+                    os.symlink("/tmp/unrelated", "entry", dir_fd=replacement_fd)
+                    os.close(replacement_fd)
+                return original_open(path, *args, **kwargs)
+            os.mkdir = track_quarantine
+            os.open = replace_quarantine
+        """)
+
+        result = self.run_cli(
+            "augment", "disable", "default", extra_environment=fault
+        )
+
+        self.assert_refused(result)
+        quarantines = sorted(augment.glob(".skillset-removal-*"))
+        self.assertEqual(len(quarantines), 2)
+        replacement = next(
+            quarantine for quarantine in quarantines
+            if not quarantine.name.endswith(".detached")
+        )
+        self.assertTrue(projected.is_symlink())
+        self.assertEqual(os.readlink(replacement / "entry"), "/tmp/unrelated")
+        self.assertIn(str(replacement), result.stderr)
+
+    def test_augment_removes_empty_quarantine_after_open_failure(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        self.assertEqual(
+            self.run_cli("augment", "enable", "default").returncode, 0
+        )
+        augment = self.home / ".augment"
+        projected = augment / "skills" / "alpha"
+        fault = self.fault_environment("""
+            import errno
+            import os
+            original_mkdir = os.mkdir
+            original_open = os.open
+            quarantine = None
+            def track_quarantine(path, *args, **kwargs):
+                global quarantine
+                result = original_mkdir(path, *args, **kwargs)
+                if (
+                    path.startswith(".skillset-removal-")
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    quarantine = path
+                return result
+            def fail_quarantine_open(path, *args, **kwargs):
+                if path == quarantine and kwargs.get("dir_fd") is not None:
+                    raise PermissionError(errno.EACCES, "Permission denied", path)
+                return original_open(path, *args, **kwargs)
+            os.mkdir = track_quarantine
+            os.open = fail_quarantine_open
+        """)
+
+        result = self.run_cli(
+            "augment", "disable", "default", extra_environment=fault
+        )
+
+        self.assert_refused(result)
+        self.assertTrue(projected.is_symlink())
+        self.assertEqual(list(augment.glob(".skillset-removal-*")), [])
+
+    def test_augment_preserves_post_mkdir_quarantine_failures_with_recovery_path(
+        self,
+    ):
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                home = self.new_home(f"post-mkdir-quarantine-{interrupted}")
+                root = self.initialize(home=home)
+                source = root / "skillsets" / "default" / "skills"
+                self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+                self.assertEqual(
+                    self.run_cli(
+                        "augment", "enable", "default", home=home
+                    ).returncode,
+                    0,
+                )
+                augment = home / ".augment"
+                projected = augment / "skills" / "alpha"
+                fault = self.fault_environment(f"""
+                    import errno
+                    import os
+                    original_mkdir = os.mkdir
+                    failed = False
+                    def fail_after_quarantine_mkdir(path, *args, **kwargs):
+                        global failed
+                        result = original_mkdir(path, *args, **kwargs)
+                        if (
+                            path.startswith(".skillset-removal-")
+                            and kwargs.get("dir_fd") is not None
+                            and not failed
+                        ):
+                            failed = True
+                            if {interrupted!r}:
+                                raise KeyboardInterrupt()
+                            raise OSError(errno.EIO, "injected post-mkdir failure", path)
+                        return result
+                    os.mkdir = fail_after_quarantine_mkdir
+                """)
+
+                result = self.run_cli(
+                    "augment", "disable", "default", home=home,
+                    extra_environment=fault,
+                )
+
+                if interrupted:
+                    self.assertEqual(result.returncode, 130, result.stderr)
+                else:
+                    self.assert_refused(result)
+                quarantines = list(augment.glob(".skillset-removal-*"))
+                self.assertEqual(len(quarantines), 1)
+                self.assertTrue(projected.is_symlink())
+                self.assertIn(str(quarantines[0]), result.stderr)
+                before = self.filesystem_snapshot(home)
+                blocked = self.run_cli("augment", "list", home=home)
+                self.assert_refused(blocked)
+                self.assertIn(str(quarantines[0]), blocked.stderr)
+                self.assertEqual(self.filesystem_snapshot(home), before)
+
+    def test_augment_reports_pre_mkdir_quarantine_failure_without_marker(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        self.assertEqual(
+            self.run_cli("augment", "enable", "default").returncode, 0
+        )
+        augment = self.home / ".augment"
+        projected = augment / "skills" / "alpha"
+        original_target = os.readlink(projected)
+        fault = self.fault_environment("""
+            import errno
+            import os
+            original_mkdir = os.mkdir
+            def fail_before_quarantine_mkdir(path, *args, **kwargs):
+                if (
+                    str(path).startswith(".skillset-removal-")
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    raise OSError(errno.EIO, "injected pre-mkdir failure", path)
+                return original_mkdir(path, *args, **kwargs)
+            os.mkdir = fail_before_quarantine_mkdir
+        """)
+
+        result = self.run_cli(
+            "augment", "disable", "default", extra_environment=fault
+        )
+
+        self.assert_refused(result)
+        self.assertTrue(projected.is_symlink())
+        self.assertEqual(os.readlink(projected), original_target)
+        self.assertEqual(list(augment.glob(".skillset-removal-*")), [])
+        self.assertIn(
+            f"could not create Auggie removal quarantine in {augment}", result.stderr
+        )
+        self.assertNotIn("preserved removal quarantine", result.stderr)
+        before = self.filesystem_snapshot(self.home)
+        self.assertEqual(self.run_cli("augment", "list").returncode, 0)
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+
+    def test_augment_refuses_replaced_removal_quarantine_during_cleanup(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        self.assertEqual(
+            self.run_cli("augment", "enable", "default").returncode, 0
+        )
+        augment = self.home / ".augment"
+        fault = self.fault_environment("""
+            import os
+            original_mkdir = os.mkdir
+            original_stat = os.stat
+            quarantine = None
+            replaced = False
+            checks = 0
+            def track_quarantine(path, *args, **kwargs):
+                global quarantine
+                result = original_mkdir(path, *args, **kwargs)
+                if (
+                    path.startswith(".skillset-removal-")
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    quarantine = path
+                return result
+            def replace_before_cleanup(path, *args, **kwargs):
+                global checks, replaced
+                if (
+                    path == quarantine
+                    and kwargs.get("dir_fd") is not None
+                ):
+                    checks += 1
+                    if checks == 3 and not replaced:
+                        replaced = True
+                        directory = kwargs["dir_fd"]
+                        os.rename(
+                            path, path + ".detached",
+                            src_dir_fd=directory, dst_dir_fd=directory,
+                        )
+                        original_mkdir(path, dir_fd=directory)
+                return original_stat(path, *args, **kwargs)
+            os.mkdir = track_quarantine
+            os.stat = replace_before_cleanup
+        """)
+
+        result = self.run_cli(
+            "augment", "disable", "default", extra_environment=fault
+        )
+
+        self.assert_refused(result)
+        quarantines = sorted(augment.glob(".skillset-removal-*"))
+        self.assertEqual(len(quarantines), 2)
+        replacement = next(
+            quarantine for quarantine in quarantines
+            if not quarantine.name.endswith(".detached")
+        )
+        self.assertTrue(replacement.is_dir())
+        self.assertIn(str(replacement), result.stderr)
+
+    def test_augment_lifecycle_refuses_removal_quarantine_without_mutation(self):
+        for index, arguments in enumerate(
+            (("rename", "personal", "renamed"), ("remove", "personal", "--yes"))
+        ):
+            with self.subTest(command=arguments[0]):
+                home = self.new_home(f"augment-lifecycle-quarantine-{index}")
+                root = self.initialize(home=home)
+                self.make_set(root, "personal")
+                quarantine = home / ".augment" / ".skillset-removal-foreign"
+                quarantine.mkdir(parents=True)
+                (quarantine / "entry").write_text("preserve", encoding="utf-8")
+                before = self.filesystem_snapshot(home)
+
+                result = self.run_cli(*arguments, home=home)
+
+                self.assert_refused(result)
+                self.assertIn(str(quarantine), result.stderr)
+                self.assertEqual(self.filesystem_snapshot(home), before)
+
+    def test_augment_enable_adopts_only_exact_canonical_links(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        alpha = self.write_skill(source, "alpha", """
+            name: alpha
+            description: Alpha
+        """)
+        augment_skills = self.home / ".augment" / "skills"
+        augment_skills.mkdir(parents=True)
+        adopted = augment_skills / "alpha"
+        adopted.symlink_to(str(alpha) + "///")
+        inode = adopted.lstat().st_ino
+
+        enabled = self.run_cli("augment", "enable", "default")
+
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        self.assertEqual(adopted.lstat().st_ino, inode)
+        self.assertTrue(
+            (self.home / ".augment" / ".skillsets" / "default").is_symlink()
+        )
+
+        self.assertEqual(
+            self.run_cli("augment", "disable", "default").returncode, 0
+        )
+        interior = augment_skills / "alpha"
+        interior.symlink_to(str(source) + "/./alpha")
+        before = self.filesystem_snapshot(self.home)
+        refused = self.run_cli("augment", "enable", "default")
+        self.assert_refused(refused)
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+
+    def test_augment_skillsets_coexist_or_collide_by_direct_skill_name(self):
+        self.initialize()
+        first = self.make_set(self.root, "first") / "skills"
+        second = self.make_set(self.root, "second") / "skills"
+        self.write_skill(first, "alpha", "name: alpha\ndescription: Alpha")
+        self.write_skill(second, "beta", "name: beta\ndescription: Beta")
+        self.assertEqual(
+            self.run_cli("augment", "enable", "first").returncode, 0
+        )
+        self.assertEqual(
+            self.run_cli("augment", "enable", "second").returncode, 0
+        )
+        self.assertEqual(
+            self.run_cli("augment", "list").stdout,
+            "[g] first\n[g] second\n",
+        )
+
+        conflict = self.write_skill(second, "alpha", """
+            name: other-alpha
+            description: Conflicting directory name
+        """)
+        before = self.filesystem_snapshot(self.home / ".augment")
+        refused = self.run_cli("augment", "enable", "second")
+        self.assert_refused(refused)
+        self.assertEqual(
+            self.filesystem_snapshot(self.home / ".augment"), before
+        )
+        self.assertTrue(conflict.is_dir())
+
+    def test_augment_disable_recovers_dangling_links_after_source_removal(self):
+        self.initialize()
+        personal = self.make_set(self.root, "personal")
+        source = personal / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        self.assertEqual(
+            self.run_cli("augment", "enable", "personal").returncode, 0
+        )
+        shutil.rmtree(personal)
+
+        disabled = self.run_cli("augment", "disable", "personal")
+
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        self.assertFalse(
+            os.path.lexists(self.home / ".augment" / "skills" / "alpha")
+        )
+        self.assertFalse(
+            os.path.lexists(
+                self.home / ".augment" / ".skillsets" / "personal"
+            )
+        )
+
+    def test_augment_first_enable_classifies_directory_creation_interrupts(self):
+        for directory_name in (".augment", "skills", ".skillsets"):
+            for phase in ("before", "after"):
+                with self.subTest(
+                    directory=directory_name, phase=phase
+                ):
+                    suffix = directory_name.replace(".", "dot")
+                    home = self.new_home(
+                        f"augment-mkdir-{suffix}-{phase}"
+                    )
+                    root = self.initialize(home=home)
+                    source = root / "skillsets" / "default" / "skills"
+                    self.write_skill(
+                        source,
+                        "alpha",
+                        "name: alpha\ndescription: Alpha",
+                    )
+                    augment = home / ".augment"
+                    target = (
+                        augment
+                        if directory_name == ".augment"
+                        else augment / directory_name
+                    )
+                    fault = self.fault_environment(f"""
+                        import os
+                        original_mkdir = os.mkdir
+                        interrupted = False
+                        def interrupt_directory_creation(path, *args, **kwargs):
+                            global interrupted
+                            matches = (
+                                os.fspath(path) == {str(augment)!r}
+                                if {directory_name == ".augment"!r}
+                                else (
+                                    os.fspath(path) == {directory_name!r}
+                                    and kwargs.get("dir_fd") is not None
+                                )
+                            )
+                            if matches and not interrupted:
+                                interrupted = True
+                                if {phase == "before"!r}:
+                                    raise KeyboardInterrupt()
+                                original_mkdir(path, *args, **kwargs)
+                                raise KeyboardInterrupt()
+                            return original_mkdir(path, *args, **kwargs)
+                        os.mkdir = interrupt_directory_creation
+                    """)
+
+                    interrupted = self.run_cli(
+                        "augment",
+                        "enable",
+                        "default",
+                        home=home,
+                        extra_environment=fault,
+                    )
+
+                    self.assertEqual(
+                        interrupted.returncode, 130, interrupted.stderr
+                    )
+                    if directory_name == ".augment" and phase == "before":
+                        self.assertEqual(
+                            interrupted.stderr, "skillset: interrupted\n"
+                        )
+                        self.assertFalse(os.path.lexists(augment))
+                    else:
+                        self.assertIn(
+                            str(augment / ".skillsets" / "default"),
+                            interrupted.stderr,
+                        )
+                        self.assertIn(str(source), interrupted.stderr)
+                        self.assertIn(
+                            str(augment / "skills"), interrupted.stderr
+                        )
+                        self.assertIn(
+                            "skillset augment enable default",
+                            interrupted.stderr,
+                        )
+                        self.assertTrue(augment.is_dir())
+                    if phase == "after":
+                        self.assertTrue(target.is_dir())
+
+                    recovered = self.run_cli(
+                        "augment", "enable", "default", home=home
+                    )
+                    self.assertEqual(
+                        recovered.returncode, 0, recovered.stderr
+                    )
+                    self.assertTrue(
+                        (augment / "skills" / "alpha").is_symlink()
+                    )
+
+    def test_augment_interrupted_registration_creation_reports_and_recovers(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        target = str(source)
+        fault = self.fault_environment(f"""
+            import os
+            original_symlink = os.symlink
+            def interrupt_after_registration(target, name, *args, **kwargs):
+                result = original_symlink(target, name, *args, **kwargs)
+                if target == {target!r} and name == "default":
+                    raise KeyboardInterrupt()
+                return result
+            os.symlink = interrupt_after_registration
+        """)
+
+        interrupted = self.run_cli(
+            "augment", "enable", "default", extra_environment=fault
+        )
+
+        registration = self.home / ".augment" / ".skillsets" / "default"
+        projected = self.home / ".augment" / "skills" / "alpha"
+        self.assertEqual(interrupted.returncode, 130, interrupted.stderr)
+        self.assertIn("link was created", interrupted.stderr)
+        self.assertIn("skillset augment enable default", interrupted.stderr)
+        self.assertTrue(registration.is_symlink())
+        self.assertFalse(os.path.lexists(projected))
+
+        recovered = self.run_cli("augment", "enable", "default")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertTrue(projected.is_symlink())
+
+    def test_augment_interrupted_scope_repair_reports_and_recovers(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        self.assertEqual(
+            self.run_cli("augment", "enable", "default").returncode, 0
+        )
+        augment = self.home / ".augment"
+        registration = augment / ".skillsets" / "default"
+        projection = augment / "skills"
+        shutil.rmtree(projection)
+        fault = self.fault_environment("""
+            import os
+            original_mkdir = os.mkdir
+            def interrupt_after_scope_repair(path, *args, **kwargs):
+                result = original_mkdir(path, *args, **kwargs)
+                if path == "skills" and kwargs.get("dir_fd") is not None:
+                    raise KeyboardInterrupt()
+                return result
+            os.mkdir = interrupt_after_scope_repair
+        """)
+
+        interrupted = self.run_cli(
+            "augment", "enable", "default", extra_environment=fault
+        )
+
+        self.assertEqual(interrupted.returncode, 130, interrupted.stderr)
+        self.assertIn(str(registration), interrupted.stderr)
+        self.assertIn(str(source), interrupted.stderr)
+        self.assertIn(str(projection), interrupted.stderr)
+        self.assertIn("skillset augment enable default", interrupted.stderr)
+        self.assertTrue(registration.is_symlink())
+        self.assertTrue(projection.is_dir())
+        self.assertFalse(os.path.lexists(projection / "alpha"))
+
+        recovered = self.run_cli("augment", "enable", "default")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertTrue((projection / "alpha").is_symlink())
+
+    def test_augment_interrupted_after_registration_reports_recovery_paths(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        fault = self.fault_environment("""
+            import os
+            original_stat = os.stat
+            source_checks = 0
+            def interrupt_during_source_verification(path, *args, **kwargs):
+                global source_checks
+                if (
+                    path == "alpha"
+                    and kwargs.get("dir_fd") is not None
+                    and kwargs.get("follow_symlinks") is False
+                ):
+                    source_checks += 1
+                    if source_checks == 2:
+                        raise KeyboardInterrupt()
+                return original_stat(path, *args, **kwargs)
+            os.stat = interrupt_during_source_verification
+        """)
+
+        interrupted = self.run_cli(
+            "augment", "enable", "default", extra_environment=fault
+        )
+
+        registration = self.home / ".augment" / ".skillsets" / "default"
+        projection = self.home / ".augment" / "skills"
+        self.assertEqual(interrupted.returncode, 130, interrupted.stderr)
+        self.assertIn(str(registration), interrupted.stderr)
+        self.assertIn(str(source), interrupted.stderr)
+        self.assertIn(str(projection), interrupted.stderr)
+        self.assertIn("skillset augment enable default", interrupted.stderr)
+        self.assertTrue(registration.is_symlink())
+        self.assertFalse(os.path.lexists(projection / "alpha"))
+
+        recovered = self.run_cli("augment", "enable", "default")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertTrue((projection / "alpha").is_symlink())
+
+    def test_augment_interrupted_projected_unlink_reports_and_recovers(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        self.assertEqual(
+            self.run_cli("augment", "enable", "default").returncode, 0
+        )
+        fault = self.fault_environment("""
+            import os
+            original_unlink = os.unlink
+            def interrupt_after_projected_unlink(name, *args, **kwargs):
+                result = original_unlink(name, *args, **kwargs)
+                if name == "entry" and kwargs.get("dir_fd") is not None:
+                    raise KeyboardInterrupt()
+                return result
+            os.unlink = interrupt_after_projected_unlink
+        """)
+
+        interrupted = self.run_cli(
+            "augment", "disable", "default", extra_environment=fault
+        )
+
+        registration = self.home / ".augment" / ".skillsets" / "default"
+        projected = self.home / ".augment" / "skills" / "alpha"
+        self.assertEqual(interrupted.returncode, 130, interrupted.stderr)
+        self.assertIn("link was removed", interrupted.stderr)
+        self.assertIn("skillset augment disable default", interrupted.stderr)
+        self.assertFalse(os.path.lexists(projected))
+        self.assertTrue(registration.is_symlink())
+
+        recovered = self.run_cli("augment", "disable", "default")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(os.path.lexists(registration))
+
+    def test_augment_disable_interrupt_between_unlinks_reports_recovery(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        self.write_skill(source, "beta", "name: beta\ndescription: Beta")
+        self.assertEqual(
+            self.run_cli("augment", "enable", "default").returncode, 0
+        )
+        projected = self.home / ".augment" / "skills"
+        fault = self.fault_environment(f"""
+            import os
+            original_stat = os.stat
+            interrupted = False
+            def interrupt_before_second_unlink(path, *args, **kwargs):
+                global interrupted
+                if (
+                    path == "beta"
+                    and kwargs.get("dir_fd") is not None
+                    and kwargs.get("follow_symlinks") is False
+                    and not interrupted
+                    and not os.path.lexists({str(projected / "alpha")!r})
+                ):
+                    interrupted = True
+                    raise KeyboardInterrupt()
+                return original_stat(path, *args, **kwargs)
+            os.stat = interrupt_before_second_unlink
+        """)
+
+        interrupted = self.run_cli(
+            "augment", "disable", "default", extra_environment=fault
+        )
+
+        registration = self.home / ".augment" / ".skillsets" / "default"
+        self.assertEqual(interrupted.returncode, 130, interrupted.stderr)
+        self.assertIn(
+            "registration and projection may be incomplete",
+            interrupted.stderr,
+        )
+        self.assertIn("skillset augment disable default", interrupted.stderr)
+        self.assertFalse(os.path.lexists(projected / "alpha"))
+        self.assertTrue((projected / "beta").is_symlink())
+        self.assertTrue(registration.is_symlink())
+
+        recovered = self.run_cli("augment", "disable", "default")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(os.path.lexists(projected / "beta"))
+        self.assertFalse(os.path.lexists(registration))
+
+    def test_augment_projection_inspection_errors_never_hide_owned_links(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        self.assertEqual(
+            self.run_cli("augment", "enable", "default").returncode, 0
+        )
+        before = self.filesystem_snapshot(self.home)
+        faults = (
+            """
+            import os
+            original_stat = os.stat
+            def refuse_projected_stat(path, *args, **kwargs):
+                if (
+                    path == "alpha"
+                    and kwargs.get("dir_fd") is not None
+                    and kwargs.get("follow_symlinks") is False
+                ):
+                    raise PermissionError(13, "Permission denied", path)
+                return original_stat(path, *args, **kwargs)
+            os.stat = refuse_projected_stat
+            """,
+            """
+            import os
+            original_readlink = os.readlink
+            def refuse_projected_readlink(path, *args, **kwargs):
+                if path == "alpha" and kwargs.get("dir_fd") is not None:
+                    raise PermissionError(13, "Permission denied", path)
+                return original_readlink(path, *args, **kwargs)
+            os.readlink = refuse_projected_readlink
+            """,
+        )
+        for index, source_fault in enumerate(faults):
+            with self.subTest(inspection=index):
+                fault = self.fault_environment(source_fault)
+                result = self.run_cli(
+                    "augment", "disable", "default", extra_environment=fault
+                )
+                self.assert_refused(result)
+                self.assertIn(
+                    "could not inspect Auggie entry 'alpha'",
+                    result.stderr,
+                )
+                self.assertEqual(self.filesystem_snapshot(self.home), before)
+
+        readlink_fault = self.fault_environment(faults[1])
+        for arguments in (
+            ("augment", "enable", "default"),
+            ("augment", "list"),
+        ):
+            with self.subTest(command=arguments[1]):
+                result = self.run_cli(
+                    *arguments, extra_environment=readlink_fault
+                )
+                self.assert_refused(result)
+                self.assertIn(
+                    "could not inspect Auggie entry 'alpha'",
+                    result.stderr,
+                )
+                self.assertEqual(self.filesystem_snapshot(self.home), before)
+
+    def test_augment_disable_recovers_after_registration_unlink(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        registration = self.home / ".augment" / ".skillsets" / "default"
+        projected = self.home / ".augment" / "skills" / "alpha"
+
+        self.assertEqual(
+            self.run_cli("augment", "enable", "default").returncode, 0
+        )
+        interrupt = self.fault_environment("""
+            import os
+            original_unlink = os.unlink
+            unlinks = 0
+            def interrupt_after_registration_unlink(name, *args, **kwargs):
+                global unlinks
+                result = original_unlink(name, *args, **kwargs)
+                if name == "entry" and kwargs.get("dir_fd") is not None:
+                    unlinks += 1
+                    if unlinks == 2:
+                        raise KeyboardInterrupt()
+                return result
+            os.unlink = interrupt_after_registration_unlink
+        """)
+        interrupted = self.run_cli(
+            "augment", "disable", "default", extra_environment=interrupt
+        )
+
+        self.assertEqual(interrupted.returncode, 130, interrupted.stderr)
+        self.assertIn("link was removed", interrupted.stderr)
+        self.assertIn("skillset augment disable default", interrupted.stderr)
+        self.assertFalse(os.path.lexists(projected))
+        self.assertFalse(os.path.lexists(registration))
+        recovered = self.run_cli("augment", "disable", "default")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+
+        self.assertEqual(
+            self.run_cli("augment", "enable", "default").returncode, 0
+        )
+        verification_failure = self.fault_environment("""
+            import os
+            original_listdir = os.listdir
+            projection_checks = 0
+            def fail_final_projection_check(path):
+                global projection_checks
+                if isinstance(path, int):
+                    projection_checks += 1
+                    if projection_checks == 2:
+                        raise OSError(5, "Input/output error")
+                return original_listdir(path)
+            os.listdir = fail_final_projection_check
+        """)
+        failed = self.run_cli(
+            "augment",
+            "disable",
+            "default",
+            extra_environment=verification_failure,
+        )
+
+        self.assert_refused(failed)
+        self.assertIn("skillset augment disable default", failed.stderr)
+        self.assertFalse(os.path.lexists(projected))
+        self.assertFalse(os.path.lexists(registration))
+        recovered = self.run_cli("augment", "disable", "default")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+
+    def test_augment_list_reports_recognized_broken_registrations_without_mutation(self):
+        self.initialize()
+        registrations = self.home / ".augment" / ".skillsets"
+        registrations.mkdir(parents=True)
+        (registrations / "default").symlink_to("/tmp/noncanonical")
+        (registrations / "Not-Ours").write_text("ignored\n")
+        before = self.filesystem_snapshot(self.home)
+
+        result = self.run_cli("augment", "list")
+
+        self.assert_refused(result)
+        self.assertIn("noncanonical Auggie registration", result.stderr)
+        self.assertIn(str(registrations / "default"), result.stderr)
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+
+    def test_augment_global_registration_and_malformed_containers_block_lifecycle(self):
+        self.initialize()
+        self.make_set(self.root, "personal")
+        self.assertEqual(
+            self.run_cli("augment", "enable", "personal").returncode, 0
+        )
+        before = self.filesystem_snapshot(self.home)
+        for arguments in (
+            ("rename", "personal", "renamed"),
+            ("remove", "personal", "--yes"),
+        ):
+            result = self.run_cli(*arguments)
+            self.assert_refused(result)
+            self.assertIn("Auggie-enabled", result.stderr)
+            self.assertEqual(self.filesystem_snapshot(self.home), before)
+
+        self.assertEqual(
+            self.run_cli("augment", "disable", "personal").returncode, 0
+        )
+        shutil.rmtree(self.home / ".augment")
+        (self.home / ".augment").symlink_to(self.sandbox)
+        before = self.filesystem_snapshot(self.home)
+        blocked = self.run_cli("rename", "personal", "renamed")
+        self.assert_refused(blocked)
+        self.assertIn("cannot be verified", blocked.stderr)
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+
+    def test_orphaned_augment_projections_block_lifecycle(self):
+        for index, (arguments, missing_container) in enumerate(
+            (
+                (("rename", "personal", "renamed"), False),
+                (("remove", "personal", "--yes"), False),
+                (("rename", "personal", "renamed"), True),
+                (("remove", "personal", "--yes"), True),
+            )
+        ):
+            with self.subTest(
+                command=arguments[0], missing_container=missing_container
+            ):
+                home = self.new_home(f"orphaned-augment-projection-{index}")
+                root = self.initialize(home=home)
+                source = self.make_set(root, "personal")
+                self.write_skill(
+                    source / "skills",
+                    "alpha",
+                    "name: alpha\ndescription: alpha",
+                )
+                enabled = self.run_cli(
+                    "augment", "enable", "personal", home=home
+                )
+                self.assertEqual(enabled.returncode, 0, enabled.stderr)
+                registration = home / ".augment" / ".skillsets" / "personal"
+                projection = home / ".augment" / "skills" / "alpha"
+                registration.unlink()
+                if missing_container:
+                    registration.parent.rmdir()
+                before = self.filesystem_snapshot(home)
+
+                result = self.run_cli(*arguments, home=home)
+
+                self.assert_refused(result)
+                self.assertIn("incomplete Auggie projection", result.stderr)
+                self.assertEqual(self.filesystem_snapshot(home), before)
+                self.assertTrue(projection.is_symlink())
+                self.assertTrue((source / "skills").is_dir())
+
+    def test_augment_lifecycle_refuses_replaced_orphaned_projection(self):
+        for index, arguments in enumerate(
+            (("rename", "personal", "renamed"), ("remove", "personal", "--yes"))
+        ):
+            with self.subTest(command=arguments[0]):
+                home = self.new_home(f"augment-replaced-orphan-{index}")
+                root = self.initialize(home=home)
+                source = self.make_set(root, "personal")
+                alpha = self.write_skill(
+                    source / "skills",
+                    "alpha",
+                    "name: alpha\ndescription: alpha",
+                )
+                enabled = self.run_cli(
+                    "augment", "enable", "personal", home=home
+                )
+                self.assertEqual(enabled.returncode, 0, enabled.stderr)
+                augment = home / ".augment"
+                skills = augment / "skills"
+                detached = augment / "skills.detached"
+                registration = augment / ".skillsets" / "personal"
+                (skills / "alpha").unlink()
+                registration.unlink()
+                fault = self.fault_environment(f"""
+                    import os
+                    original_listdir = os.listdir
+                    original_stat = os.stat
+                    replaced = False
+                    def replace_after_empty_projection_inventory(path):
+                        global replaced
+                        names = original_listdir(path)
+                        if not replaced and isinstance(path, int):
+                            opened = os.fstat(path)
+                            public = original_stat(
+                                {str(skills)!r}, follow_symlinks=False
+                            )
+                            if (opened.st_dev, opened.st_ino) == (
+                                public.st_dev, public.st_ino
+                            ):
+                                os.rename({str(skills)!r}, {str(detached)!r})
+                                os.mkdir({str(skills)!r})
+                                os.symlink(
+                                    {str(alpha)!r},
+                                    {str(skills / "alpha")!r},
+                                )
+                                replaced = True
+                        return names
+                    os.listdir = replace_after_empty_projection_inventory
+                """)
+
+                result = self.run_cli(*arguments, home=home, extra_environment=fault)
+
+                self.assert_refused(result)
+                self.assertIn(
+                    f"cannot be verified at {skills}", result.stderr
+                )
+                self.assertTrue(detached.is_dir())
+                self.assertTrue((skills / "alpha").is_symlink())
+                self.assertTrue((root / "skillsets" / "personal").is_dir())
+                self.assertFalse((root / "skillsets" / "renamed").exists())
+
+    def test_augment_lifecycle_refuses_skills_replaced_before_orphan_open(self):
+        for index, arguments in enumerate(
+            (("rename", "personal", "renamed"), ("remove", "personal", "--yes"))
+        ):
+            with self.subTest(command=arguments[0]):
+                home = self.new_home(f"augment-replaced-skills-open-{index}")
+                root = self.initialize(home=home)
+                source = self.make_set(root, "personal")
+                self.write_skill(
+                    source / "skills",
+                    "alpha",
+                    "name: alpha\ndescription: alpha",
+                )
+                enabled = self.run_cli(
+                    "augment", "enable", "personal", home=home
+                )
+                self.assertEqual(enabled.returncode, 0, enabled.stderr)
+                augment = home / ".augment"
+                skills = augment / "skills"
+                detached = augment / "skills.detached"
+                (skills / "alpha").unlink()
+                (augment / ".skillsets" / "personal").unlink()
+                fault = self.fault_environment(f"""
+                    import os
+                    original_open = os.open
+                    replaced = False
+                    def replace_skills_before_open(path, *args, **kwargs):
+                        global replaced
+                        if (
+                            path == "skills"
+                            and kwargs.get("dir_fd") is not None
+                            and not replaced
+                        ):
+                            replaced = True
+                            os.rename({str(skills)!r}, {str(detached)!r})
+                            os.mkdir({str(skills)!r})
+                        return original_open(path, *args, **kwargs)
+                    os.open = replace_skills_before_open
+                """)
+
+                result = self.run_cli(*arguments, home=home, extra_environment=fault)
+
+                self.assert_refused(result)
+                self.assertIn(
+                    f"cannot be verified at {skills}", result.stderr
+                )
+                self.assertTrue(detached.is_dir())
+                self.assertTrue((root / "skillsets" / "personal").is_dir())
+                self.assertFalse((root / "skillsets" / "renamed").exists())
+
+    def test_augment_lifecycle_refuses_replaced_parent_before_orphan_return(self):
+        for index, arguments in enumerate(
+            (("rename", "personal", "renamed"), ("remove", "personal", "--yes"))
+        ):
+            with self.subTest(command=arguments[0]):
+                home = self.new_home(f"augment-replaced-parent-orphan-{index}")
+                root = self.initialize(home=home)
+                source = self.make_set(root, "personal")
+                self.write_skill(
+                    source / "skills",
+                    "alpha",
+                    "name: alpha\ndescription: alpha",
+                )
+                enabled = self.run_cli(
+                    "augment", "enable", "personal", home=home
+                )
+                self.assertEqual(enabled.returncode, 0, enabled.stderr)
+                augment = home / ".augment"
+                detached = home / ".augment.detached"
+                (augment / ".skillsets" / "personal").unlink()
+                fault = self.fault_environment(f"""
+                    import os
+                    original_stat = os.stat
+                    replaced = False
+                    def replace_parent_after_binding(path, *args, **kwargs):
+                        global replaced
+                        result = original_stat(path, *args, **kwargs)
+                        if (
+                            os.fspath(path) == {str(augment)!r}
+                            and kwargs.get("follow_symlinks") is False
+                            and not replaced
+                        ):
+                            replaced = True
+                            os.rename({str(augment)!r}, {str(detached)!r})
+                            os.mkdir({str(augment)!r})
+                        return result
+                    os.stat = replace_parent_after_binding
+                """)
+
+                result = self.run_cli(*arguments, home=home, extra_environment=fault)
+
+                self.assert_refused(result)
+                self.assertIn(
+                    f"cannot be verified at {augment}", result.stderr
+                )
+                self.assertTrue(detached.is_dir())
+                self.assertTrue((root / "skillsets" / "personal").is_dir())
+                self.assertFalse((root / "skillsets" / "renamed").exists())
+
+    def test_augment_lifecycle_refuses_orphan_created_after_missing_lookup(self):
+        for index, arguments in enumerate(
+            (("rename", "personal", "renamed"), ("remove", "personal", "--yes"))
+        ):
+            with self.subTest(command=arguments[0]):
+                home = self.new_home(f"augment-created-orphan-{index}")
+                root = self.initialize(home=home)
+                source = self.make_set(root, "personal")
+                alpha = self.write_skill(
+                    source / "skills",
+                    "alpha",
+                    "name: alpha\ndescription: alpha",
+                )
+                augment = home / ".augment"
+                augment.mkdir()
+                fault = self.fault_environment(f"""
+                    import os
+                    original_stat = os.stat
+                    created = False
+                    def create_orphan_after_missing_lookup(path, *args, **kwargs):
+                        global created
+                        try:
+                            return original_stat(path, *args, **kwargs)
+                        except FileNotFoundError:
+                            if (
+                                path == "skills"
+                                and kwargs.get("dir_fd") is not None
+                                and not created
+                            ):
+                                created = True
+                                directory = kwargs["dir_fd"]
+                                os.mkdir("skills", dir_fd=directory)
+                                skills_fd = os.open(
+                                    "skills", os.O_RDONLY | os.O_DIRECTORY,
+                                    dir_fd=directory,
+                                )
+                                os.symlink(
+                                    {str(alpha)!r}, "alpha", dir_fd=skills_fd
+                                )
+                                os.close(skills_fd)
+                            raise
+                    os.stat = create_orphan_after_missing_lookup
+                """)
+
+                result = self.run_cli(*arguments, home=home, extra_environment=fault)
+
+                self.assert_refused(result)
+                self.assertIn("incomplete Auggie projection", result.stderr)
+                self.assertTrue((augment / "skills" / "alpha").is_symlink())
+                self.assertTrue((root / "skillsets" / "personal").is_dir())
+                self.assertFalse((root / "skillsets" / "renamed").exists())
+
+    def test_augment_lifecycle_refuses_parent_replaced_after_missing_lookup(self):
+        for index, arguments in enumerate(
+            (("rename", "personal", "renamed"), ("remove", "personal", "--yes"))
+        ):
+            with self.subTest(command=arguments[0]):
+                home = self.new_home(f"augment-replaced-parent-missing-{index}")
+                root = self.initialize(home=home)
+                source = self.make_set(root, "personal")
+                alpha = self.write_skill(
+                    source / "skills",
+                    "alpha",
+                    "name: alpha\ndescription: alpha",
+                )
+                augment = home / ".augment"
+                detached = home / ".augment.detached"
+                augment.mkdir()
+                fault = self.fault_environment(f"""
+                    import os
+                    original_stat = os.stat
+                    checks = 0
+                    replaced = False
+                    def replace_parent_after_missing_lookup(path, *args, **kwargs):
+                        global checks, replaced
+                        result = original_stat(path, *args, **kwargs)
+                        if (
+                            os.fspath(path) == {str(augment)!r}
+                            and kwargs.get("follow_symlinks") is False
+                        ):
+                            checks += 1
+                            if checks == 3 and not replaced:
+                                replaced = True
+                                os.rename({str(augment)!r}, {str(detached)!r})
+                                os.mkdir({str(augment)!r})
+                                os.mkdir({str(augment / "skills")!r})
+                                os.symlink(
+                                    {str(alpha)!r},
+                                    {str(augment / "skills" / "alpha")!r},
+                                )
+                        return result
+                    os.stat = replace_parent_after_missing_lookup
+                """)
+
+                result = self.run_cli(*arguments, home=home, extra_environment=fault)
+
+                self.assert_refused(result)
+                self.assertIn(
+                    f"cannot be verified at {augment}", result.stderr
+                )
+                self.assertTrue(detached.is_dir())
+                self.assertTrue((augment / "skills" / "alpha").is_symlink())
+                self.assertTrue((root / "skillsets" / "personal").is_dir())
+                self.assertFalse((root / "skillsets" / "renamed").exists())
+
+    def test_unowned_augment_entries_do_not_block_lifecycle(self):
+        for index, arguments in enumerate(
+            (
+                ("rename", "personal", "renamed"),
+                ("remove", "personal", "--yes"),
+            )
+        ):
+            with self.subTest(command=arguments[0]):
+                home = self.new_home(f"unowned-augment-entry-{index}")
+                root = self.initialize(home=home)
+                self.make_set(root, "personal")
+                external = home / "external-skill"
+                self.write_skill(
+                    external, "", "name: external\ndescription: external"
+                )
+                skills = home / ".augment" / "skills"
+                skills.mkdir(parents=True)
+                unrelated = skills / "unrelated"
+                unrelated.symlink_to(external, target_is_directory=True)
+                before_external = self.filesystem_snapshot(external)
+
+                result = self.run_cli(*arguments, home=home)
+
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(unrelated.is_symlink())
+                self.assertEqual(os.readlink(unrelated), str(external))
+                self.assertEqual(self.filesystem_snapshot(external), before_external)
+                if arguments[0] == "rename":
+                    self.assertFalse((root / "skillsets" / "personal").exists())
+                    self.assertTrue((root / "skillsets" / "renamed").is_dir())
+                else:
+                    self.assertFalse((root / "skillsets" / "personal").exists())
+
+    def test_malformed_augment_registration_containers_block_lifecycle(self):
+        for index, kind in enumerate(("regular-file", "symlink")):
+            with self.subTest(kind=kind):
+                home = self.new_home(f"augment-malformed-container-{index}")
+                root = self.make_managed_layout(home)
+                (root / ".skillset.lock").touch()
+                self.make_set(root, "personal")
+                augment = home / ".augment"
+                augment.mkdir()
+                registrations = augment / ".skillsets"
+                if kind == "regular-file":
+                    registrations.write_text("not a directory\n")
+                else:
+                    registrations.symlink_to(self.sandbox)
+                before = self.filesystem_snapshot(home)
+
+                for arguments in (
+                    ("rename", "personal", "renamed"),
+                    ("remove", "personal", "--yes"),
+                ):
+                    result = self.run_cli(*arguments, home=home)
+
+                    self.assert_refused(result)
+                    self.assertIn(
+                        f"cannot be verified at {registrations}", result.stderr
+                    )
+                    self.assertIn(
+                        "repair the Auggie container first", result.stderr
+                    )
+                    self.assertEqual(self.filesystem_snapshot(home), before)
+
+    def test_malformed_exact_name_augment_registrations_require_repair(self):
+        self.initialize()
+        registrations = self.home / ".augment" / ".skillsets"
+        registrations.mkdir(parents=True)
+        cases = {
+            "regular-file": lambda path: path.write_text("not a link\n"),
+            "directory": lambda path: path.mkdir(),
+            "wrong-target-link": lambda path: path.symlink_to("/tmp/noncanonical"),
+        }
+
+        for name, create_registration in cases.items():
+            with self.subTest(kind=name):
+                self.make_set(self.root, name)
+                registration = registrations / name
+                create_registration(registration)
+                before = self.filesystem_snapshot(self.home)
+
+                for arguments in (
+                    ("rename", name, f"{name}-renamed"),
+                    ("remove", name, "--yes"),
+                ):
+                    result = self.run_cli(*arguments)
+                    self.assert_refused(result)
+                    self.assertIn(
+                        f"cannot be verified at {registration}",
+                        result.stderr,
+                    )
+                    self.assertIn(
+                        "repair the Auggie registration first",
+                        result.stderr,
+                    )
+                    self.assertNotIn("disable it first", result.stderr)
+                    self.assertEqual(
+                        self.filesystem_snapshot(self.home), before
+                    )
+
+    def test_malformed_augment_registration_reports_codex_blocker(self):
+        self.initialize()
+        self.make_set(self.root, "personal")
+        self.assertEqual(
+            self.run_cli("codex", "enable", "personal").returncode, 0
+        )
+        registration = self.home / ".augment" / ".skillsets" / "personal"
+        registration.parent.mkdir(parents=True)
+        registration.write_text("not a link\n")
+        before = self.filesystem_snapshot(self.home)
+
+        for arguments in (
+            ("rename", "personal", "renamed"),
+            ("remove", "personal", "--yes"),
+        ):
+            result = self.run_cli(*arguments)
+            self.assert_refused(result)
+            self.assertIn("Codex is enabled", result.stderr)
+            self.assertIn(
+                "Auggie registration state cannot be verified", result.stderr
+            )
+            self.assertIn(
+                "Disable Codex and repair the Auggie registration first",
+                result.stderr,
+            )
+            self.assertNotIn("if needed", result.stderr)
+            self.assertEqual(self.filesystem_snapshot(self.home), before)
+
+    def test_inaccessible_augment_registration_containers_block_lifecycle(self):
+        self.initialize()
+        self.make_set(self.root, "personal")
+        self.assertEqual(
+            self.run_cli("augment", "enable", "personal").returncode, 0
+        )
+        augment = self.home / ".augment"
+        registrations = augment / ".skillsets"
+        registration = registrations / "personal"
+        before = self.filesystem_snapshot(self.home)
+
+        for inaccessible, blocker in (
+            (registrations, augment),
+            (registration, registrations),
+        ):
+            with self.subTest(inaccessible=inaccessible):
+                fault = self.fault_environment(f"""
+                    import errno
+                    import os
+                    original_open = os.open
+                    original_stat = os.stat
+                    registrations = {str(registrations)!r}
+                    registration = {str(registration)!r}
+                    def refuse_open(path, *args, **kwargs):
+                        if (
+                            os.fspath(path) == ".skillsets"
+                            and kwargs.get("dir_fd") is not None
+                            and registrations == {str(inaccessible)!r}
+                        ):
+                            raise PermissionError(
+                                errno.EACCES, os.strerror(errno.EACCES), path
+                            )
+                        return original_open(path, *args, **kwargs)
+                    def refuse_stat(path, *args, **kwargs):
+                        if (
+                            os.fspath(path) == "personal"
+                            and kwargs.get("dir_fd") is not None
+                            and registration == {str(inaccessible)!r}
+                        ):
+                            raise PermissionError(
+                                errno.EACCES, os.strerror(errno.EACCES), path
+                            )
+                        return original_stat(path, *args, **kwargs)
+                    os.open = refuse_open
+                    os.stat = refuse_stat
+                """)
+                for arguments in (
+                    ("rename", "personal", "renamed"),
+                    ("remove", "personal", "--yes"),
+                ):
+                    result = self.run_cli(
+                        *arguments, extra_environment=fault
+                    )
+                    self.assert_refused(result)
+                    self.assertIn(
+                        f"cannot be verified at {blocker}", result.stderr
+                    )
+                    self.assertEqual(
+                        self.filesystem_snapshot(self.home), before
+                    )
+
+    def test_augment_lifecycle_refuses_replaced_registration_during_inspection(self):
+        for index, arguments in enumerate(
+            (
+                ("rename", "personal", "renamed"),
+                ("remove", "personal", "--yes"),
+            )
+        ):
+            with self.subTest(command=arguments[0]):
+                home = self.new_home(f"augment-replaced-registration-{index}")
+                root = self.initialize(home=home)
+                self.make_set(root, "personal")
+                enabled = self.run_cli("augment", "enable", "personal", home=home)
+                self.assertEqual(enabled.returncode, 0, enabled.stderr)
+                registration = home / ".augment" / ".skillsets" / "personal"
+                fault = self.fault_environment("""
+                    import os
+                    original_readlink = os.readlink
+                    replaced = False
+                    def replace_registration(path, *args, **kwargs):
+                        global replaced
+                        target = original_readlink(path, *args, **kwargs)
+                        if (
+                            path == "personal"
+                            and kwargs.get("dir_fd") is not None
+                            and not replaced
+                        ):
+                            replaced = True
+                            os.unlink(path, dir_fd=kwargs["dir_fd"])
+                            os.symlink("/tmp/replaced", path, dir_fd=kwargs["dir_fd"])
+                        return target
+                    os.readlink = replace_registration
+                """)
+
+                result = self.run_cli(*arguments, home=home, extra_environment=fault)
+
+                self.assert_refused(result)
+                self.assertIn(
+                    f"cannot be verified at {registration}", result.stderr
+                )
+                self.assertTrue((root / "skillsets" / "personal").is_dir())
+                self.assertFalse((root / "skillsets" / "renamed").exists())
+
+    def test_augment_lifecycle_refuses_removed_registration_during_inspection(self):
+        for index, arguments in enumerate(
+            (
+                ("rename", "personal", "renamed"),
+                ("remove", "personal", "--yes"),
+            )
+        ):
+            with self.subTest(command=arguments[0]):
+                home = self.new_home(f"augment-removed-registration-{index}")
+                root = self.initialize(home=home)
+                self.make_set(root, "personal")
+                enabled = self.run_cli("augment", "enable", "personal", home=home)
+                self.assertEqual(enabled.returncode, 0, enabled.stderr)
+                registration = home / ".augment" / ".skillsets" / "personal"
+                fault = self.fault_environment("""
+                    import os
+                    original_readlink = os.readlink
+                    removed = False
+                    def remove_registration(path, *args, **kwargs):
+                        global removed
+                        target = original_readlink(path, *args, **kwargs)
+                        if (
+                            path == "personal"
+                            and kwargs.get("dir_fd") is not None
+                            and not removed
+                        ):
+                            removed = True
+                            os.unlink(path, dir_fd=kwargs["dir_fd"])
+                        return target
+                    os.readlink = remove_registration
+                """)
+
+                result = self.run_cli(*arguments, home=home, extra_environment=fault)
+
+                self.assert_refused(result)
+                self.assertIn(
+                    f"cannot be verified at {registration}", result.stderr
+                )
+                self.assertTrue((root / "skillsets" / "personal").is_dir())
+                self.assertFalse((root / "skillsets" / "renamed").exists())
+
+    def test_augment_skills_list_renders_plain_table_with_concise_sources_without_mutation(
+        self,
+    ):
+        project = self.sandbox / "workspace-table-project"
+        project.mkdir()
+        global_skills = self.home / ".augment" / "skills"
+        local_skills = project / ".agents" / "skills"
+        global_skills.mkdir(parents=True)
+        local_skills.mkdir(parents=True)
+        self.write_skill(
+            global_skills, "global", "name: global\ndescription: global"
+        )
+        self.write_skill(
+            local_skills, "local", "name: local\ndescription: local"
+        )
+        global_directory = "~/.augment/skills/global"
+        local_directory = str(local_skills / "local")
+        rows = (
+            ("local", "./.agents", local_directory),
+            ("global", "~/.augment", global_directory),
+        )
+        widths = tuple(
+            max(len(header), *(len(row[index]) for row in rows))
+            for index, header in enumerate(("SKILL", "SOURCE", "DIRECTORY"))
+        )
+        header_line = " | ".join(
+            header.ljust(width)
+            for header, width in zip(("SKILL", "SOURCE", "DIRECTORY"), widths)
+        )
+        separator_line = "".join(
+            "|" if character == "|" else "-" for character in header_line
+        )
+        expected = "".join(
+            (
+                header_line + "\n",
+                separator_line + "\n",
+                *(
+                    " | ".join(
+                        value.ljust(width)
+                        for value, width in zip(row[:2], widths[:2])
+                    )
+                    + " | "
+                    + row[2]
+                    + "\n"
+                    for row in rows
+                ),
+            )
+        )
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+
+        result = self.run_cli("augment", "skills", "list", cwd=project)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(result.stdout, expected)
+        header, separator, *_rows = result.stdout.splitlines()
+        self.assertEqual(
+            [index for index, character in enumerate(header) if character == "|"],
+            [index for index, character in enumerate(separator) if character == "|"],
+        )
+        self.assertNotIn("\x1b", result.stdout)
+        self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
+
+    def test_augment_skills_list_tty_styles_table_and_honors_color_opt_outs(self):
+        project = self.sandbox / "workspace-tty-table-project"
+        project.mkdir()
+        global_skills = self.home / ".augment" / "skills"
+        local_skills = project / ".agents" / "skills"
+        global_skills.mkdir(parents=True)
+        local_skills.mkdir(parents=True)
+        self.write_skill(
+            global_skills, "global", "name: global\ndescription: global"
+        )
+        self.write_skill(
+            local_skills, "local", "name: local\ndescription: local"
+        )
+        plain = self.run_cli("augment", "skills", "list", cwd=project)
+        colored = self.run_cli_tty("augment", "skills", "list", cwd=project)
+
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertEqual(colored.returncode, 0, colored.stderr)
+        self.assertIn("\x1b[1mSKILL\x1b[0m", colored.stdout)
+        self.assertIn("\x1b[1mSOURCE\x1b[0m", colored.stdout)
+        self.assertIn("\x1b[1mDIRECTORY\x1b[0m", colored.stdout)
+        self.assertIn("\x1b[2m|\x1b[0m", colored.stdout)
+        self.assertRegex(colored.stdout, r"\x1b\[2m-+\|-+\|-+\x1b\[0m")
+        self.assertIn("\x1b[36mglobal\x1b[0m", colored.stdout)
+        self.assertIn("\x1b[36m~/.augment\x1b[0m", colored.stdout)
+        self.assertIn("\x1b[36mlocal\x1b[0m", colored.stdout)
+        self.assertIn("\x1b[32m./.agents\x1b[0m", colored.stdout)
+
+        for extra_environment in ({"NO_COLOR": "1"}, {"TERM": "dumb"}):
+            with self.subTest(environment=extra_environment):
+                opted_out = self.run_cli_tty(
+                    "augment",
+                    "skills",
+                    "list",
+                    cwd=project,
+                    extra_environment=extra_environment,
+                )
+
+                self.assertEqual(opted_out.returncode, 0, opted_out.stderr)
+                self.assertEqual(opted_out.stdout, plain.stdout)
+                self.assertNotIn("\x1b", opted_out.stdout)
+
+    def test_augment_skills_list_verbose_keeps_blocks_and_styles_first_lines(self):
+        project = self.sandbox / "workspace-verbose-project"
+        project.mkdir()
+        global_skills = self.home / ".augment" / "skills"
+        local_skills = project / ".agents" / "skills"
+        global_skills.mkdir(parents=True)
+        local_skills.mkdir(parents=True)
+        self.write_skill(
+            global_skills, "global", "name: global\ndescription: global"
+        )
+        self.write_skill(
+            local_skills, "local", "name: local\ndescription: local"
+        )
+        local_directory = local_skills / "local"
+        expected = "\n".join(
+            (
+                f"local [./.agents] {local_directory}",
+                f"  resolved directory: {local_directory}",
+                f"  resolved SKILL.md: {local_directory / 'SKILL.md'}",
+                "global [~/.augment] ~/.augment/skills/global",
+                f"  resolved directory: {global_skills / 'global'}",
+                f"  resolved SKILL.md: {global_skills / 'global' / 'SKILL.md'}",
+                "",
+            )
+        )
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+
+        plain = self.run_cli("augment", "skills", "list", "--verbose", cwd=project)
+        colored = self.run_cli_tty(
+            "augment", "skills", "list", "--verbose", cwd=project
+        )
+
+        self.assertEqual(plain.returncode, 0, plain.stderr)
+        self.assertEqual(plain.stdout, expected)
+        self.assertNotIn("SKILL | SOURCE | DIRECTORY", plain.stdout)
+        self.assertNotIn("|", plain.stdout)
+        self.assertNotIn("\x1b", plain.stdout)
+        self.assertEqual(colored.returncode, 0, colored.stderr)
+        self.assertNotIn("SKILL | SOURCE | DIRECTORY", colored.stdout)
+        self.assertIn(
+            "\x1b[36mglobal\x1b[0m \x1b[36m[~/.augment]\x1b[0m",
+            colored.stdout,
+        )
+        self.assertIn(
+            "\x1b[36mlocal\x1b[0m \x1b[32m[./.agents]\x1b[0m",
+            colored.stdout,
+        )
+        self.assertIn(
+            f"  resolved directory: {global_skills / 'global'}", colored.stdout
+        )
+        self.assertIn(
+            f"  resolved SKILL.md: {global_skills / 'global' / 'SKILL.md'}",
+            colored.stdout,
+        )
+        self.assertIn(f"  resolved directory: {local_directory}", colored.stdout)
+        self.assertIn(f"  resolved SKILL.md: {local_directory / 'SKILL.md'}", colored.stdout)
+
+        for extra_environment in ({"NO_COLOR": "1"}, {"TERM": "dumb"}):
+            with self.subTest(environment=extra_environment):
+                opted_out = self.run_cli_tty(
+                    "augment",
+                    "skills",
+                    "list",
+                    "--verbose",
+                    cwd=project,
+                    extra_environment=extra_environment,
+                )
+
+                self.assertEqual(opted_out.returncode, 0, opted_out.stderr)
+                self.assertEqual(opted_out.stdout, plain.stdout)
+                self.assertNotIn("\x1b", opted_out.stdout)
+
+        self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
+
+    def test_augment_skills_list_tty_caps_only_separator_at_terminal_width(self):
+        project = self.sandbox / "workspace-narrow-tty-table-project"
+        project.mkdir()
+        global_skills = self.home / ".augment" / "skills"
+        local_skills = project / ".agents" / "skills"
+        global_skills.mkdir(parents=True)
+        local_skills.mkdir(parents=True)
+        global_name = "global-complete"
+        local_name = "local-complete"
+        self.write_skill(
+            global_skills, global_name, "name: global\ndescription: global"
+        )
+        self.write_skill(local_skills, local_name, "name: local\ndescription: local")
+        global_directory = f"~/.augment/skills/{global_name}"
+        local_directory = str(local_skills / local_name)
+        divider = "\x1b[2m|\x1b[0m"
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+
+        colored = self.run_cli_tty(
+            "augment", "skills", "list", cwd=project, terminal_columns=20
+        )
+
+        self.assertEqual(colored.returncode, 0, colored.stderr)
+        lines = colored.stdout.splitlines()
+        self.assertIn("\x1b[1mSKILL\x1b[0m", lines[0])
+        self.assertIn("\x1b[1mSOURCE\x1b[0m", lines[0])
+        self.assertIn("\x1b[1mDIRECTORY\x1b[0m", lines[0])
+        self.assertEqual(lines[0].count(divider), 2)
+        self.assertEqual(lines[1], "\x1b[2m----------------|---\x1b[0m")
+        self.assertEqual(
+            lines[2:],
+            [
+                f"\x1b[36m{local_name}\x1b[0m  {divider} "
+                f"\x1b[32m./.agents\x1b[0m  {divider} {local_directory}",
+                f"\x1b[36m{global_name}\x1b[0m {divider} "
+                f"\x1b[36m~/.augment\x1b[0m {divider} {global_directory}",
+            ],
+        )
+        self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
+
+    def test_augment_skills_list_gives_each_higher_root_precedence_over_every_lower_root(
+        self,
+    ):
+        for winner_index in range(6):
+            with self.subTest(winner_index=winner_index):
+                home = self.new_home(f"augment-precedence-home-{winner_index}")
+                managed_root = self.make_managed_layout(home)
+                (managed_root / ".skillset.lock").touch()
+                project = self.sandbox / f"augment-precedence-project-{winner_index}"
+                project.mkdir()
+                roots = (
+                    ("User/.augment", home / ".augment" / "skills"),
+                    ("Workspace/.augment", project / ".augment" / "skills"),
+                    ("User/.claude", home / ".claude" / "skills"),
+                    ("Workspace/.claude", project / ".claude" / "skills"),
+                    ("User/.agents", home / ".agents" / "skills"),
+                    ("Workspace/.agents", project / ".agents" / "skills"),
+                )
+                for _label, root in roots[winner_index:]:
+                    root.mkdir(parents=True, exist_ok=True)
+                    self.write_skill(
+                        root,
+                        "shared",
+                        "name: shared\ndescription: precedence candidate",
+                    )
+                before_home = self.filesystem_snapshot(home)
+                before_project = self.filesystem_snapshot(project)
+
+                result = self.run_cli(
+                    "augment", "skills", "list", home=home, cwd=project
+                )
+
+                winner_label, winner_root = roots[winner_index]
+                winner_directory = (winner_root / "shared").resolve()
+                if winner_label.startswith("User/"):
+                    winner_directory = Path("~") / winner_directory.relative_to(home)
+                source = (
+                    f"~/{winner_label.removeprefix('User/')}"
+                    if winner_label.startswith("User/")
+                    else f"./{winner_label.removeprefix('Workspace/')}"
+                )
+                source_width = max(len("SOURCE"), len(source))
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.startswith("SKILL"))
+                self.assertIn("SOURCE", result.stdout.splitlines()[0])
+                self.assertIn("DIRECTORY", result.stdout.splitlines()[0])
+                rows = result.stdout.splitlines()[2:]
+                self.assertEqual(
+                    rows,
+                    [f"shared | {source.ljust(source_width)} | {winner_directory}"],
+                )
+                for lower_label, lower_root in roots[winner_index + 1 :]:
+                    lower_directory = (lower_root / "shared").resolve()
+                    if lower_label.startswith("User/"):
+                        lower_directory = Path("~") / lower_directory.relative_to(home)
+                    self.assertNotIn(str(lower_directory), result.stdout)
+                self.assertEqual(self.filesystem_snapshot(home), before_home)
+                self.assertEqual(
+                    self.filesystem_snapshot(project), before_project
+                )
+
+    def test_augment_skills_list_displays_resolved_directories_and_abbreviates_home(
+        self,
+    ):
+        self.initialize("personal")
+        project = self.sandbox / "augment-discovery-resolved-paths-project"
+        project.mkdir()
+        global_skills = self.home / ".augment" / "skills"
+        global_skills.mkdir(parents=True)
+        managed = self.write_skill(
+            self.root / "skillsets" / "personal" / "skills",
+            "managed",
+            "name: managed\ndescription: managed",
+        )
+        (global_skills / "managed").symlink_to(managed, target_is_directory=True)
+        self.write_skill(
+            global_skills, "direct", "name: direct\ndescription: direct"
+        )
+        external = self.sandbox / "augment-discovery-external-skill"
+        self.write_skill(external, "", "name: external\ndescription: external")
+        (global_skills / "external").symlink_to(external, target_is_directory=True)
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+        before_external = self.filesystem_snapshot(external)
+
+        result = self.run_cli("augment", "skills", "list", cwd=project)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith("SKILL"))
+        self.assertIn("SOURCE", result.stdout.splitlines()[0])
+        self.assertIn("DIRECTORY", result.stdout.splitlines()[0])
+        self.assertIn("external", result.stdout)
+        self.assertIn(str(external), result.stdout)
+        self.assertIn("managed", result.stdout)
+        self.assertIn("~/.agents/skillsets/personal/skills/managed", result.stdout)
+        self.assertIn("direct", result.stdout)
+        self.assertIn("~/.augment/skills/direct", result.stdout)
+        self.assertEqual(result.stdout.count("~/.augment"), 4)
+        self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
+        self.assertEqual(self.filesystem_snapshot(external), before_external)
+
+    def test_augment_skills_list_orders_effective_skills_by_resolved_directory(self):
+        self.initialize()
+        project = self.sandbox / "augment-discovery-ordered-project"
+        project.mkdir()
+        skills = self.home / ".augment" / "skills"
+        skills.mkdir(parents=True)
+        targets = self.sandbox / "augment-discovery-ordered-targets"
+        targets.mkdir()
+        alpha_directory = self.write_skill(
+            targets, "alpha-directory", "name: zulu\ndescription: zulu"
+        )
+        zulu_directory = self.write_skill(
+            targets, "zulu-directory", "name: alpha\ndescription: alpha"
+        )
+        (skills / "zulu").symlink_to(alpha_directory, target_is_directory=True)
+        (skills / "alpha").symlink_to(zulu_directory, target_is_directory=True)
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+        before_targets = self.filesystem_snapshot(targets)
+
+        first = self.run_cli("augment", "skills", "list", cwd=project)
+        second = self.run_cli("augment", "skills", "list", cwd=project)
+
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(first.stdout, second.stdout)
+        self.assertLess(
+            first.stdout.index(str(targets / "alpha-directory")),
+            first.stdout.index(str(targets / "zulu-directory")),
+        )
+        self.assertIn("zulu", first.stdout)
+        self.assertIn("alpha", first.stdout)
+        self.assertIn("~/.augment", first.stdout)
+        self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
+        self.assertEqual(self.filesystem_snapshot(targets), before_targets)
+
+    def test_augment_skills_list_orders_effective_skills_by_source_then_resolved_directory(
+        self,
+    ):
+        self.initialize()
+        project = self.sandbox / "z-source-ordered-project"
+        project.mkdir()
+        user_skills = self.home / ".claude" / "skills"
+        workspace_skills = project / ".augment" / "skills"
+        user_skills.mkdir(parents=True)
+        workspace_skills.mkdir(parents=True)
+        user_directory = self.write_skill(
+            user_skills, "user", "name: user\ndescription: user"
+        )
+        workspace_directory = self.write_skill(
+            workspace_skills, "workspace", "name: workspace\ndescription: workspace"
+        )
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+
+        result = self.run_cli("augment", "skills", "list", cwd=project)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(str(user_directory), str(workspace_directory))
+        self.assertEqual(
+            result.stdout.splitlines()[2:],
+            [
+                f"workspace | ./.augment | {workspace_directory}",
+                f"user      | ~/.claude  | ~/.claude/skills/user",
+            ],
+        )
+        self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
+
+    def test_augment_skills_list_escapes_control_characters_without_mutation(self):
+        self.initialize()
+        project = self.sandbox / "augment-discovery-control-character-project"
+        project.mkdir()
+        skills = self.home / ".augment" / "skills"
+        skills.mkdir(parents=True)
+        directory = "line\n\x1b[31mred"
+        self.write_skill(
+            skills, directory, "name: control\ndescription: control"
+        )
+        displayed = "line\\x0a\\x1b[31mred"
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+
+        normal = self.run_cli("augment", "skills", "list", cwd=project)
+        verbose = self.run_cli("augment", "skills", "list", "--verbose", cwd=project)
+
+        self.assertEqual(normal.returncode, 0, normal.stderr)
+        normal_directory = f"~/.augment/skills/{displayed}"
+        widths = (
+            max(len("SKILL"), len(displayed)),
+            max(len("SOURCE"), len("~/.augment")),
+            max(len("DIRECTORY"), len(normal_directory)),
+        )
+        self.assertEqual(
+            normal.stdout,
+            "".join(
+                (
+                    " | ".join(
+                        header.ljust(width)
+                        for header, width in zip(
+                            ("SKILL", "SOURCE", "DIRECTORY"), widths
+                        )
+                    )
+                    + "\n",
+                    "-" * (widths[0] + 1)
+                    + "|"
+                    + "-" * (widths[1] + 2)
+                    + "|"
+                    + "-" * (widths[2] + 1)
+                    + "\n",
+                    " | ".join(
+                        value.ljust(width)
+                        for value, width in zip(
+                            (displayed, "~/.augment", normal_directory), widths
+                        )
+                    )
+                    + "\n",
+                )
+            ),
+        )
+        self.assertEqual(normal.stdout.count("\n"), 3)
+        self.assertEqual(verbose.returncode, 0, verbose.stderr)
+        self.assertEqual(
+            verbose.stdout,
+            "\n".join(
+                (
+                    f"{displayed} [~/.augment] {normal_directory}",
+                    f"  resolved directory: {skills / displayed}",
+                    f"  resolved SKILL.md: {skills / displayed / 'SKILL.md'}",
+                    "",
+                )
+            ),
+        )
+        self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
+
+    def test_augment_skills_list_aligns_wide_and_combining_names_by_display_cell(self):
+        self.initialize()
+        project = self.sandbox / "augment-discovery-display-width-project"
+        project.mkdir()
+        skills = self.home / ".augment" / "skills"
+        skills.mkdir(parents=True)
+        combining = "e\u0301" * 6
+        self.write_skill(skills, combining, "name: combining\ndescription: combining")
+        self.write_skill(skills, "界界界", "name: wide\ndescription: wide")
+
+        result = self.run_cli("augment", "skills", "list", cwd=project)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout,
+            "SKILL  | SOURCE     | DIRECTORY               \n"
+            "-------|------------|-------------------------\n"
+            f"{combining} | ~/.augment | ~/.augment/skills/{combining}\n"
+            "界界界 | ~/.augment | ~/.augment/skills/界界界\n",
+        )
+
+    def test_augment_skills_list_ignores_direct_files_and_incomplete_directories(self):
+        self.initialize()
+        project = self.sandbox / "augment-discovery-ignored-project"
+        project.mkdir()
+        skills = self.home / ".augment" / "skills"
+        skills.mkdir(parents=True)
+        (skills / "ordinary-file").write_text("not a skill\n", encoding="utf-8")
+        (skills / "missing-skill-file").mkdir()
+        self.write_skill(skills, "valid", "name: valid\ndescription: valid")
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+
+        result = self.run_cli("augment", "skills", "list", cwd=project)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        directory = "~/.augment/skills/valid"
+        self.assertEqual(
+            result.stdout,
+            "".join(
+                (
+                    "SKILL | SOURCE     | "
+                    + "DIRECTORY".ljust(len(directory))
+                    + "\n",
+                    "------|------------|" + "-" * (len(directory) + 1) + "\n",
+                    f"valid | ~/.augment | {directory}\n",
+                )
+            ),
+        )
+        self.assertNotIn("ordinary-file", result.stdout)
+        self.assertNotIn("missing-skill-file", result.stdout)
+        self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
+
+    def test_augment_skills_list_reports_candidate_inspection_failures_without_mutation(self):
+        self.initialize()
+        project = self.sandbox / "augment-discovery-candidate-failure-project"
+        project.mkdir()
+        skills = self.home / ".augment" / "skills"
+        skills.mkdir(parents=True)
+        candidate = self.write_skill(
+            skills, "candidate", "name: candidate\ndescription: candidate"
+        )
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+        targets = (candidate, candidate / "SKILL.md")
+
+        for target in targets:
+            with self.subTest(target=target):
+                fault = self.fault_environment(
+                    f"""
+                    import errno
+                    import os
+                    from pathlib import Path
+                    target = {str(target)!r}
+                    original_stat = Path.stat
+                    def refuse_candidate_stat(path, *args, **kwargs):
+                        if os.fsdecode(os.fspath(path)) == target:
+                            raise PermissionError(
+                                errno.EACCES, os.strerror(errno.EACCES), target
+                            )
+                        return original_stat(path, *args, **kwargs)
+                    Path.stat = refuse_candidate_stat
+                    """
+                )
+
+                result = self.run_cli(
+                    "augment",
+                    "skills",
+                    "list",
+                    cwd=project,
+                    extra_environment=fault,
+                )
+
+                self.assert_refused(result)
+                self.assertIn("could not inspect Auggie skill candidate", result.stderr)
+                self.assertIn(str(target), result.stderr)
+                self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+                self.assertEqual(
+                    self.filesystem_snapshot(project), before_project
+                )
+
+    def test_augment_skills_list_reports_root_enumeration_failures_without_mutation(self):
+        self.initialize()
+        project = self.sandbox / "augment-discovery-root-failure-project"
+        project.mkdir()
+        skills = self.home / ".augment" / "skills"
+        skills.mkdir(parents=True)
+        self.write_skill(skills, "candidate", "name: candidate\ndescription: candidate")
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+        fault = self.fault_environment(
+            f"""
+            import errno
+            import os
+            from pathlib import Path
+            root = {str(skills)!r}
+            original_iterdir = Path.iterdir
+            def refuse_root_enumeration(path, *args, **kwargs):
+                if os.fsdecode(os.fspath(path)) == root:
+                    raise PermissionError(
+                        errno.EACCES, os.strerror(errno.EACCES), root
+                    )
+                return original_iterdir(path, *args, **kwargs)
+            Path.iterdir = refuse_root_enumeration
+            """
+        )
+
+        result = self.run_cli(
+            "augment",
+            "skills",
+            "list",
+            cwd=project,
+            extra_environment=fault,
+        )
+
+        self.assert_refused(result)
+        self.assertIn("could not inspect Auggie skill root", result.stderr)
+        self.assertIn(str(skills), result.stderr)
+        self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
+
+    def test_augment_skills_list_discovers_skills_without_a_managed_layout(self):
+        project = self.sandbox / "augment-discovery-pristine-managed-layout-project"
+        project.mkdir()
+        skills = self.home / ".augment" / "skills"
+        skills.mkdir(parents=True)
+        self.write_skill(skills, "external", "name: external\ndescription: external")
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+
+        result = self.run_cli("augment", "skills", "list", cwd=project)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        directory = "~/.augment/skills/external"
+        self.assertEqual(
+            result.stdout,
+            "".join(
+                (
+                    "SKILL    | SOURCE     | "
+                    + "DIRECTORY".ljust(len(directory))
+                    + "\n",
+                    "---------|------------|" + "-" * (len(directory) + 1) + "\n",
+                    f"external | ~/.augment | {directory}\n",
+                )
+            ),
+        )
+        self.assertFalse(self.root.exists())
+        self.assertFalse((self.root / ".skillset.lock").exists())
+        self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
+
+    def test_augment_skills_list_falls_back_from_unavailable_managed_locks_without_mutation(self):
+        cases = (
+            "missing-lock",
+            "root-symlink",
+            "lock-symlink",
+            "lock-directory",
+            "managed-root-open-error",
+            "lock-open-error",
+            "lock-fstat-error",
+        )
+        for index, case in enumerate(cases):
+            with self.subTest(case=case):
+                home = self.new_home(f"augment-discovery-lock-fallback-{index}")
+                project = self.sandbox / f"augment-discovery-lock-fallback-project-{index}"
+                project.mkdir()
+                root = home / ".agents"
+                external_root = None
+                if case == "root-symlink":
+                    external_root = self.sandbox / f"augment-discovery-external-root-{index}"
+                    external_root.mkdir()
+                    root.symlink_to(external_root, target_is_directory=True)
+                else:
+                    root.mkdir()
+                    lock_path = root / ".skillset.lock"
+                    if case == "lock-symlink":
+                        lock_path.symlink_to("missing-advisory-lock")
+                    elif case == "lock-directory":
+                        lock_path.mkdir()
+                    elif case in {"lock-open-error", "lock-fstat-error"}:
+                        lock_path.touch()
+
+                skills = home / ".augment" / "skills"
+                skills.mkdir(parents=True)
+                self.write_skill(skills, "external", "name: external\ndescription: external")
+                fault = None
+                if case == "managed-root-open-error":
+                    fault = self.fault_environment(
+                        f"""
+                        import errno
+                        import os
+                        managed_root = {str(root)!r}
+                        original_open = os.open
+                        def fail_managed_root_open(path, *args, **kwargs):
+                            if os.fsdecode(os.fspath(path)) == managed_root:
+                                raise OSError(
+                                    errno.EIO, os.strerror(errno.EIO), managed_root
+                                )
+                            return original_open(path, *args, **kwargs)
+                        os.open = fail_managed_root_open
+                        """
+                    )
+                elif case == "lock-open-error":
+                    fault = self.fault_environment(
+                        """
+                        import errno
+                        import os
+                        original_open = os.open
+                        def fail_advisory_lock_open(name, *args, **kwargs):
+                            if (
+                                name == ".skillset.lock"
+                                and kwargs.get("dir_fd") is not None
+                            ):
+                                raise OSError(
+                                    errno.EIO, os.strerror(errno.EIO), name
+                                )
+                            return original_open(name, *args, **kwargs)
+                        os.open = fail_advisory_lock_open
+                        """
+                    )
+                elif case == "lock-fstat-error":
+                    fault = self.fault_environment(
+                        """
+                        import errno
+                        import os
+                        lock_descriptor = None
+                        fstat_failed = False
+                        original_open = os.open
+                        original_fstat = os.fstat
+                        def track_advisory_lock_open(name, *args, **kwargs):
+                            global lock_descriptor
+                            descriptor = original_open(name, *args, **kwargs)
+                            if (
+                                name == ".skillset.lock"
+                                and kwargs.get("dir_fd") is not None
+                            ):
+                                lock_descriptor = descriptor
+                            return descriptor
+                        def fail_advisory_lock_fstat(descriptor, *args, **kwargs):
+                            global fstat_failed
+                            if descriptor == lock_descriptor and not fstat_failed:
+                                fstat_failed = True
+                                raise OSError(
+                                    errno.EIO, os.strerror(errno.EIO), ".skillset.lock"
+                                )
+                            return original_fstat(descriptor, *args, **kwargs)
+                        os.open = track_advisory_lock_open
+                        os.fstat = fail_advisory_lock_fstat
+                        """
+                    )
+                before_home = self.filesystem_snapshot(home)
+                before_project = self.filesystem_snapshot(project)
+                before_external = (
+                    self.filesystem_snapshot(external_root)
+                    if external_root is not None
+                    else None
+                )
+
+                result = self.run_cli(
+                    "augment",
+                    "skills",
+                    "list",
+                    home=home,
+                    cwd=project,
+                    extra_environment=fault,
+                )
+
+                directory = "~/.augment/skills/external"
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, "")
+                self.assertEqual(
+                    result.stdout,
+                    "".join(
+                        (
+                            "SKILL    | SOURCE     | "
+                            + "DIRECTORY".ljust(len(directory))
+                            + "\n",
+                            "---------|------------|" + "-" * (len(directory) + 1) + "\n",
+                            f"external | ~/.augment | {directory}\n",
+                        )
+                    ),
+                )
+                if case in {
+                    "missing-lock",
+                    "root-symlink",
+                    "managed-root-open-error",
+                }:
+                    self.assertFalse(os.path.lexists(root / ".skillset.lock"))
+                elif case == "lock-symlink":
+                    self.assertTrue((root / ".skillset.lock").is_symlink())
+                elif case == "lock-directory":
+                    self.assertTrue((root / ".skillset.lock").is_dir())
+                else:
+                    self.assertTrue((root / ".skillset.lock").is_file())
+                self.assertEqual(self.filesystem_snapshot(home), before_home)
+                self.assertEqual(self.filesystem_snapshot(project), before_project)
+                if external_root is not None:
+                    self.assertEqual(
+                        self.filesystem_snapshot(external_root), before_external
+                    )
+
+    def test_augment_skills_list_falls_back_from_fifo_lock_without_mutation(self):
+        home = self.new_home("augment-discovery-fifo-lock")
+        project = self.sandbox / "augment-discovery-fifo-lock-project"
+        project.mkdir()
+        root = home / ".agents"
+        root.mkdir()
+        lock_path = root / ".skillset.lock"
+        os.mkfifo(lock_path)
+        skills = home / ".augment" / "skills"
+        skills.mkdir(parents=True)
+        self.write_skill(skills, "external", "name: external\ndescription: external")
+        before_home = self.filesystem_snapshot(home)
+        before_project = self.filesystem_snapshot(project)
+
+        try:
+            result = self.run_cli(
+                "augment", "skills", "list", home=home, cwd=project, timeout=1
+            )
+        except subprocess.TimeoutExpired:
+            self.fail("Auggie discovery blocked while opening a FIFO advisory lock")
+
+        directory = "~/.augment/skills/external"
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        self.assertEqual(
+            result.stdout,
+            "".join(
+                (
+                    "SKILL    | SOURCE     | "
+                    + "DIRECTORY".ljust(len(directory))
+                    + "\n",
+                    "---------|------------|" + "-" * (len(directory) + 1) + "\n",
+                    f"external | ~/.augment | {directory}\n",
+                )
+            ),
+        )
+        self.assertTrue(stat.S_ISFIFO(lock_path.stat().st_mode))
+        self.assertEqual(self.filesystem_snapshot(home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
+
+    def test_augment_skills_list_filters_resolved_winners_without_mutation(self):
+        self.initialize()
+        project = self.sandbox / "augment-discovery-scope-project"
+        project.mkdir()
+        global_skills = self.home / ".augment" / "skills"
+        local_skills = project / ".augment" / "skills"
+        global_skills.mkdir(parents=True)
+        local_skills.mkdir(parents=True)
+        global_claude_skills = self.home / ".claude" / "skills"
+        local_claude_skills = project / ".claude" / "skills"
+        global_agents_skills = self.home / ".agents" / "skills"
+        local_agents_skills = project / ".agents" / "skills"
+        for root in (
+            global_claude_skills,
+            local_claude_skills,
+            global_agents_skills,
+            local_agents_skills,
+        ):
+            root.mkdir(parents=True, exist_ok=True)
+        self.write_skill(
+            global_skills, "shared", "name: shared\ndescription: global winner"
+        )
+        self.write_skill(
+            global_skills, "global-only", "name: global\ndescription: global"
+        )
+        self.write_skill(
+            local_skills, "shared", "name: shared\ndescription: local loser"
+        )
+        self.write_skill(
+            local_skills, "local-only", "name: local\ndescription: local"
+        )
+        self.write_skill(
+            global_claude_skills,
+            "global-claude",
+            "name: global claude\ndescription: global claude",
+        )
+        self.write_skill(
+            local_claude_skills,
+            "local-claude",
+            "name: local claude\ndescription: local claude",
+        )
+        self.write_skill(
+            global_agents_skills,
+            "global-agents",
+            "name: global agents\ndescription: global agents",
+        )
+        self.write_skill(
+            local_agents_skills,
+            "local-agents",
+            "name: local agents\ndescription: local agents",
+        )
+        external = self.sandbox / "managed-skill"
+        self.write_skill(external, "", "name: managed\ndescription: managed")
+        (global_skills / "managed").symlink_to(external, target_is_directory=True)
+        (global_skills / "not-a-skill").mkdir()
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+
+        global_result = self.run_cli("augment", "skills", "list", "--global", cwd=project)
+        local_result = self.run_cli("augment", "skills", "list", "--local", cwd=project)
+        verbose = self.run_cli("augment", "skills", "list", "--verbose", cwd=project)
+
+        self.assertEqual(global_result.returncode, 0, global_result.stderr)
+        self.assertTrue(global_result.stdout.startswith("SKILL"))
+        self.assertIn("SOURCE", global_result.stdout.splitlines()[0])
+        self.assertIn("DIRECTORY", global_result.stdout.splitlines()[0])
+        self.assertIn("shared", global_result.stdout)
+        self.assertIn("global-only", global_result.stdout)
+        self.assertIn("managed", global_result.stdout)
+        self.assertIn("~/.augment", global_result.stdout)
+        self.assertIn("global-claude", global_result.stdout)
+        self.assertIn("~/.claude", global_result.stdout)
+        self.assertIn("global-agents", global_result.stdout)
+        self.assertIn("~/.agents", global_result.stdout)
+        self.assertNotIn("local-only", global_result.stdout)
+        self.assertEqual(local_result.returncode, 0, local_result.stderr)
+        self.assertTrue(local_result.stdout.startswith("SKILL"))
+        self.assertIn("SOURCE", local_result.stdout.splitlines()[0])
+        self.assertIn("DIRECTORY", local_result.stdout.splitlines()[0])
+        self.assertIn("local-only", local_result.stdout)
+        self.assertIn("./.augment", local_result.stdout)
+        self.assertIn("local-claude", local_result.stdout)
+        self.assertIn("./.claude", local_result.stdout)
+        self.assertIn("local-agents", local_result.stdout)
+        self.assertIn("./.agents", local_result.stdout)
+        self.assertNotIn("shared", local_result.stdout)
+        self.assertIn("resolved directory", verbose.stdout)
+        self.assertIn("resolved SKILL.md", verbose.stdout)
+        self.assertIn(
+            "\n".join(
+                (
+                    f"managed [~/.augment] {external}",
+                    f"  resolved directory: {external}",
+                    f"  resolved SKILL.md: {external / 'SKILL.md'}",
+                )
+            ),
+            verbose.stdout,
+        )
+        self.assertNotIn("not-a-skill", verbose.stdout)
+        self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
+
+    def test_augment_skills_list_treats_missing_roots_as_empty_without_mutation(self):
+        self.initialize()
+        project = self.sandbox / "augment-discovery-empty-project"
+        project.mkdir()
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+
+        result = self.run_cli("augment", "skills", "list", cwd=project)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
+
+    def test_augment_skills_list_refuses_uninspectable_roots_without_mutation(self):
+        self.initialize()
+        project = self.sandbox / "augment-discovery-error-project"
+        project.mkdir()
+        root = self.home / ".augment" / "skills"
+        root.parent.mkdir()
+        root.write_text("not a directory\n")
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+
+        result = self.run_cli("augment", "skills", "list", cwd=project)
+
+        self.assert_refused(result)
+        self.assertIn("could not inspect Auggie skill root", result.stderr)
+        self.assertIn(str(root), result.stderr)
+        self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
 
 if __name__ == "__main__":
     unittest.main()

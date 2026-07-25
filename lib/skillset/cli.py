@@ -4,6 +4,10 @@ import argparse
 import sys
 from pathlib import Path
 
+from .augment import disable as augment_disable
+from .augment import enable as augment_enable
+from .augment import list_enabled as list_augment_enabled
+from .augment_discovery import list_effective_skills
 from .claude import disable as claude_disable
 from .claude import enable as claude_enable
 from .claude import list_enabled as list_claude_enabled
@@ -14,7 +18,7 @@ from .codex import list_enabled as list_codex_enabled
 from .delegate import delegate_skills
 from .doctor import doctor
 from .errors import ClaudeInterrupted, OperationalError
-from .layout import operation_lock, stable_home_lock
+from .layout import discovery_operation_lock, operation_lock, stable_home_lock
 from .metadata import current, list_sets, printable_text, show
 from .operations import create, init, remove, rename, use
 
@@ -141,6 +145,62 @@ def parser():
         directory=".claude",
         default="all",
     )
+    augment_parser = commands.add_parser(
+        "augment", help="manage Auggie-enabled skillsets"
+    )
+    augment_commands = augment_parser.add_subparsers(
+        dest="augment_command", required=True
+    )
+    augment_enable_parser = augment_commands.add_parser(
+        "enable", help="enable a skillset for Auggie"
+    )
+    augment_enable_parser.add_argument("name")
+    add_scope_options(
+        augment_enable_parser,
+        dest="augment_scope",
+        product="Auggie",
+        directory=".augment",
+    )
+    augment_disable_parser = augment_commands.add_parser(
+        "disable", help="disable a skillset for Auggie"
+    )
+    augment_disable_parser.add_argument("name")
+    add_scope_options(
+        augment_disable_parser,
+        dest="augment_scope",
+        product="Auggie",
+        directory=".augment",
+    )
+    augment_list_parser = augment_commands.add_parser(
+        "list", help="list Auggie-enabled skillsets"
+    )
+    augment_list_parser.add_argument("-v", "--verbose", action="store_true")
+    add_scope_options(
+        augment_list_parser,
+        dest="augment_scope",
+        product="Auggie",
+        directory=".augment",
+        default="all",
+    )
+    augment_skills_parser = augment_commands.add_parser(
+        "skills", help="list effective Auggie skills"
+    )
+    augment_skills_commands = augment_skills_parser.add_subparsers(
+        dest="augment_skills_command", required=True
+    )
+    augment_skills_list_parser = augment_skills_commands.add_parser(
+        "list", help="list effective Auggie skills"
+    )
+    augment_skills_list_parser.add_argument("-v", "--verbose", action="store_true")
+    add_scope_options(
+        augment_skills_list_parser,
+        dest="augment_skills_scope",
+        product="Auggie",
+        directory=".augment",
+        default="all",
+        global_help="filter effective winners from all User roots",
+        local_help="filter effective winners from all Workspace roots",
+    )
     commands.add_parser("current", help="print the active skillset name")
     show_parser = commands.add_parser("show", help="show skills in a skillset")
     show_parser.add_argument("name", nargs="?")
@@ -168,11 +228,18 @@ def add_scope_options(
     product,
     directory,
     default="global",
+    global_help=None,
+    local_help=None,
 ):
     scope = command_parser.add_mutually_exclusive_group()
-    global_help = f"manage the global ~/{directory} directory"
-    if default == "global":
-        global_help += " (default)"
+    if global_help is None:
+        global_help = f"manage the global ~/{directory} directory"
+        if default == "global":
+            global_help += " (default)"
+    if local_help is None:
+        local_help = (
+            f"manage the current directory's {directory} directory for {product}"
+        )
     scope.add_argument(
         "-g",
         "--global",
@@ -187,10 +254,7 @@ def add_scope_options(
         dest=dest,
         action="store_const",
         const="local",
-        help=(
-            f"manage the current directory's {directory} directory for "
-            f"{product}"
-        ),
+        help=local_help,
     )
     command_parser.set_defaults(**{dest: default})
 
@@ -234,6 +298,31 @@ def dispatch_locked_command(root, arguments, home_lock, lock_file, command_parse
             raise OperationalError(
                 f"unsupported Claude Code command: {arguments.claude_command}"
             )
+    elif arguments.command == "augment":
+        if arguments.augment_command == "enable":
+            augment_enable(root, arguments.name, arguments.augment_scope)
+        elif arguments.augment_command == "disable":
+            augment_disable(root, arguments.name, arguments.augment_scope)
+        elif arguments.augment_command == "list":
+            list_augment_enabled(
+                root, arguments.verbose, arguments.augment_scope
+            )
+        elif arguments.augment_command == "skills":
+            if arguments.augment_skills_command == "list":
+                list_effective_skills(
+                    root,
+                    arguments.verbose,
+                    arguments.augment_skills_scope,
+                )
+            else:
+                raise OperationalError(
+                    "unsupported Auggie skills command: "
+                    f"{arguments.augment_skills_command}"
+                )
+        else:
+            raise OperationalError(
+                f"unsupported Auggie command: {arguments.augment_command}"
+            )
     elif arguments.command == "current":
         current(root)
     elif arguments.command == "show":
@@ -251,14 +340,27 @@ def dispatch_locked_command(root, arguments, home_lock, lock_file, command_parse
 
 
 def run_managed_command(root, arguments, command_parser):
+    augment_discovery = (
+        arguments.command == "augment"
+        and arguments.augment_command == "skills"
+        and arguments.augment_skills_command == "list"
+    )
     inspection = arguments.command in {"list", "current", "show"} or (
         arguments.command == "codex" and arguments.codex_command == "list"
     ) or (
         arguments.command == "claude" and arguments.claude_command == "list"
-    )
+    ) or (
+        arguments.command == "augment" and arguments.augment_command == "list"
+    ) or augment_discovery
     with stable_home_lock(root) as home_lock:
         if arguments.command == "doctor":
             return doctor(root, fix=arguments.fix)
+        if augment_discovery:
+            with discovery_operation_lock(root) as lock_file:
+                dispatch_locked_command(
+                    root, arguments, home_lock, lock_file, command_parser
+                )
+            return 0
         with operation_lock(root, create=not inspection) as lock_file:
             dispatch_locked_command(
                 root, arguments, home_lock, lock_file, command_parser

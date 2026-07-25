@@ -339,6 +339,46 @@ def stable_home_lock(root):
 
 
 @contextmanager
+def discovery_operation_lock(root):
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        root_descriptor = os.open(root, directory_flags)
+    except OSError:
+        yield None
+        return
+    try:
+        try:
+            lock_descriptor = os.open(
+                ".skillset.lock",
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                dir_fd=root_descriptor,
+            )
+        except OSError:
+            yield None
+            return
+        try:
+            try:
+                if not stat.S_ISREG(os.fstat(lock_descriptor).st_mode):
+                    yield None
+                    return
+            except OSError:
+                yield None
+                return
+            locked = False
+            try:
+                fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
+                locked = True
+                yield lock_descriptor
+            finally:
+                if locked:
+                    fcntl.flock(lock_descriptor, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_descriptor)
+    finally:
+        os.close(root_descriptor)
+
+
+@contextmanager
 def operation_lock(root, create=True):
     if lexists(root) and not real_kind(root, stat.S_ISDIR):
         raise OperationalError(f"managed root must be a real directory: {root}")

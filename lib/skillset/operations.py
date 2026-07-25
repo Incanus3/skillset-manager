@@ -4,6 +4,7 @@ import stat
 import sys
 import json
 
+from .augment import global_registration_blocker as augment_registration_blocker
 from .claude import global_registration_blocker
 from .codex import canonical_link
 from .errors import OperationalError
@@ -449,13 +450,40 @@ def rename_active_set(root, old, new, old_name, new_name):
 def refuse_enabled_lifecycle(root, name, action):
     codex_enabled = canonical_link(root, name)
     claude_blocker = global_registration_blocker(root, name)
-    if not codex_enabled and claude_blocker is None:
+    augment_blocker = augment_registration_blocker(root, name)
+    if (
+        not codex_enabled
+        and claude_blocker is None
+        and augment_blocker is None
+    ):
         return
-    if claude_blocker is not None and not claude_blocker.enabled:
+    malformed = next(
+        (
+            ("Claude Code", claude_blocker, ".claude")
+            for claude_blocker in (claude_blocker,)
+            if claude_blocker is not None and not claude_blocker.enabled
+        ),
+        None,
+    ) or next(
+        (
+            ("Auggie", augment_blocker, ".augment")
+            for augment_blocker in (augment_blocker,)
+            if augment_blocker is not None and not augment_blocker.enabled
+        ),
+        None,
+    )
+    if malformed is not None:
+        product, blocker, directory = malformed
+        if getattr(blocker, "incomplete_projection", False):
+            raise OperationalError(
+                f"cannot {action} skillset {name!r}; incomplete {product} "
+                f"projection state at {blocker.path}. Rerun `skillset "
+                f"augment enable {name}` or `skillset augment disable {name}` "
+                "to recover it first"
+            )
         blocker_kind = (
             "registration"
-            if claude_blocker.path
-            == root.parent / ".claude" / ".skillsets" / name
+            if blocker.path == root.parent / directory / ".skillsets" / name
             else "container"
         )
         codex_blocker = "Codex is enabled, and " if codex_enabled else ""
@@ -465,15 +493,17 @@ def refuse_enabled_lifecycle(root, name, action):
             else "You must repair"
         )
         raise OperationalError(
-            f"cannot {action} skillset {name!r}; {codex_blocker}Claude Code "
-            f"registration state cannot be verified at {claude_blocker.path}. "
-            f"{remediation} the Claude Code {blocker_kind} first"
+            f"cannot {action} skillset {name!r}; {codex_blocker}{product} "
+            f"registration state cannot be verified at {blocker.path}. "
+            f"{remediation} the {product} {blocker_kind} first"
         )
     integrations = []
     if codex_enabled:
         integrations.append("Codex")
     if claude_blocker is not None and claude_blocker.enabled:
         integrations.append("Claude Code")
+    if augment_blocker is not None and augment_blocker.enabled:
+        integrations.append("Auggie")
     joined = " and ".join(integrations)
     raise OperationalError(
         f"cannot {action} {joined}-enabled skillset {name!r}; "

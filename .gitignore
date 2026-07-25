@@ -17,3 +17,6 @@ __pycache__
 /skills
 /.skill-lock.json
 /config.json
+
+# bv (beads viewer) local config and caches
+.bv/
