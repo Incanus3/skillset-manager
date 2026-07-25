@@ -72,6 +72,7 @@
     "kimi-code-cli",
     "opencode",
     "warp",
-    "zed"
+    "zed",
+    "augment"
   ]
 }
