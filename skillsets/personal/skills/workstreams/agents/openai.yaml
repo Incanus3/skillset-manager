@@ -1,7 +1,0 @@
-interface:
-  display_name: "Workstreams"
-  short_description: "List current and ready repository workstreams"
-  default_prompt: "Use $workstreams to list current and ready repository workstreams."
-
-policy:
-  allow_implicit_invocation: false

@@ -1,4 +1,0 @@
-interface:
-  display_name: "Skillset CLI"
-  short_description: "Manage agent skillsets for Codex and Claude"
-  default_prompt: "Use $skillset-cli to inspect and safely manage my agent skillsets."
