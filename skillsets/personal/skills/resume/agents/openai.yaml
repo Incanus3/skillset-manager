@@ -1,7 +1,0 @@
-interface:
-  display_name: "Resume Workstream"
-  short_description: "Refresh and continue a selected workstream"
-  default_prompt: "Use $resume to refresh and continue a selected workstream."
-
-policy:
-  allow_implicit_invocation: false
