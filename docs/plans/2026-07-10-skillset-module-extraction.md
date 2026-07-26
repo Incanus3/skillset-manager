@@ -27,8 +27,9 @@ history.
 - Do not combine extraction with unrelated cleanup.
 - Do not commit unless the user explicitly authorizes it. If authorized, use `jj commit` and wrap commit-message lines at
   100 characters.
-- Read `docs/specs/2026-07-10-skillset-module-extraction-design.md` and
-  `docs/guides/transactional-cli-safety.md` before editing.
+- This completed extraction plan predates the current local-CLI policy. For
+  later maintenance, read `docs/guides/local-cli-reliability.md` rather than
+  restoring its former transactional-hardening constraints.
 
 ## File map
 

@@ -185,11 +185,13 @@ owners; update affected indexes or references; and record bounded follow-up work
 Record the verification performed and unresolved uncertainty. Update or remove a handoff when work pauses or completes,
 and summarize the outcome rather than the conversation.
 
-## Load specialized guidance only when relevant
+## Local CLI reliability policy
 
-When work involves transactional filesystem operations, rollback, persistent staging markers, resource ownership, or
-transparent CLI delegation, read `docs/guides/transactional-cli-safety.md` before designing or reviewing the change.
-Keep specialized implementation guidance out of the baseline rules so unrelated sessions do not need to load it.
+`skillset` is a trusted local CLI, not a security boundary. Preserve serial
+functional reliability and proportionate recovery from ordinary errors, but do
+not add adversarial filesystem or TOCTOU hardening. Treat concurrency as best
+effort only. Before designing, testing, or reviewing filesystem behavior, read
+`docs/guides/local-cli-reliability.md`.
 
 ## Prefer repository-aware version-control tooling
 

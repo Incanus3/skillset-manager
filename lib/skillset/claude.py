@@ -144,20 +144,6 @@ def _identity(metadata):
     return metadata.st_dev, metadata.st_ino
 
 
-def directory_binding_problem(path, descriptor):
-    try:
-        public_metadata = os.stat(path, follow_symlinks=False)
-        opened_metadata = os.fstat(descriptor)
-    except OSError as error:
-        return f"directory changed during synchronization: {path}: {error}"
-    if (
-        not stat.S_ISDIR(public_metadata.st_mode)
-        or _identity(public_metadata) != _identity(opened_metadata)
-    ):
-        return f"directory changed during synchronization: {path}"
-    return None
-
-
 @dataclass(frozen=True)
 class ScopeState:
     claude_path: Path
@@ -166,29 +152,6 @@ class ScopeState:
     claude_fd: int | None
     skills_fd: int | None
     registrations_fd: int | None
-
-    def verify_bindings(self):
-        for path, descriptor in (
-            (self.claude_path, self.claude_fd),
-            (self.skills_path, self.skills_fd),
-            (self.registrations_path, self.registrations_fd),
-        ):
-            if descriptor is not None:
-                problem = directory_binding_problem(path, descriptor)
-                if problem is not None:
-                    return problem
-                continue
-            try:
-                os.stat(path, follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            except OSError as error:
-                return (
-                    f"directory changed during synchronization: {path}: "
-                    f"{error}"
-                )
-            return f"directory changed during synchronization: {path}"
-        return None
 
 
 def same_directory(first, second):
@@ -266,13 +229,9 @@ def ensure_scope_directories(
     root,
     scope,
     stack,
-    initial_state,
     set_name,
     created_directories,
 ):
-    problem = initial_state.verify_bindings()
-    if problem is not None:
-        raise OperationalError(problem)
     claude, skills, registrations = validate_scope_containers(root, scope)
     if not lexists(claude):
         create_scope_directory(
@@ -284,14 +243,6 @@ def ensure_scope_directories(
             created_directories,
         )
     claude_fd = stack.enter_context(open_directory(claude))
-    if (
-        initial_state.claude_fd is not None
-        and _identity(os.fstat(claude_fd))
-        != _identity(os.fstat(initial_state.claude_fd))
-    ):
-        raise OperationalError(
-            f"Claude Code container changed during inspection: {claude}"
-        )
     for name, path in (("skills", skills), (".skillsets", registrations)):
         try:
             metadata = os.stat(
@@ -320,19 +271,6 @@ def ensure_scope_directories(
                 f"could not open Claude Code container {path}: {error}"
             ) from error
         stack.callback(os.close, descriptor)
-        accepted_descriptor = (
-            initial_state.skills_fd
-            if name == "skills"
-            else initial_state.registrations_fd
-        )
-        if (
-            accepted_descriptor is not None
-            and _identity(os.fstat(descriptor))
-            != _identity(os.fstat(accepted_descriptor))
-        ):
-            raise OperationalError(
-                f"Claude Code container changed during inspection: {path}"
-            )
         if name == "skills":
             skills_fd = descriptor
         else:
@@ -373,7 +311,7 @@ def open_existing_scope(root, scope, stack):
 
 
 def source_inventory(source_fd, source_path):
-    inventory = {}
+    inventory = set()
     try:
         names = sorted(os.listdir(source_fd))
     except OSError as error:
@@ -394,24 +332,13 @@ def source_inventory(source_fd, source_path):
                 f"Claude Code skill source must not be a symlink: {source_path / name}"
             )
         if stat.S_ISDIR(metadata.st_mode):
-            inventory[name] = (metadata.st_dev, metadata.st_ino)
+            inventory.add(name)
     return inventory
 
 
 def open_source(root, name, stack):
     source_path = validate_set(root, name) / "skills"
-    try:
-        accepted = source_path.lstat()
-    except OSError as error:
-        raise OperationalError(
-            f"could not inspect Claude Code skill source {source_path}: {error}"
-        ) from error
     source_fd = stack.enter_context(open_directory(source_path))
-    opened = os.fstat(source_fd)
-    if (accepted.st_dev, accepted.st_ino) != (opened.st_dev, opened.st_ino):
-        raise OperationalError(
-            f"Claude Code skill source changed during inspection: {source_path}"
-        )
     return source_path, source_fd, source_inventory(source_fd, source_path)
 
 
@@ -546,24 +473,6 @@ def cross_scope_collision(
     return None
 
 
-def verify_source_child(source_fd, source_path, name, identity):
-    try:
-        metadata = os.stat(
-            name, dir_fd=source_fd, follow_symlinks=False
-        )
-    except OSError as error:
-        raise OperationalError(
-            f"Claude Code skill source changed during enable: {source_path / name}: {error}"
-        ) from error
-    if not stat.S_ISDIR(metadata.st_mode) or (
-        metadata.st_dev,
-        metadata.st_ino,
-    ) != identity:
-        raise OperationalError(
-            f"Claude Code skill source changed during enable: {source_path / name}"
-        )
-
-
 def owned_names(skills_fd, registered_target):
     if skills_fd is None:
         return []
@@ -610,10 +519,7 @@ def verify_enabled(
             "stale projected skill remains: "
             f"{scope_state.skills_path / sorted(stale)[0]}"
         )
-    problem = directory_binding_problem(source_path, source_fd)
-    if problem is not None:
-        return problem
-    return scope_state.verify_bindings()
+    return None
 
 
 def enable(root, name, scope):
@@ -625,7 +531,6 @@ def enable(root, name, scope):
     with ExitStack() as stack:
         source_path, source_fd, inventory = open_source(root, name, stack)
         validate_projection_root(source_path, scope)
-        other_state = None
         if not same_scope_directory(root):
             other_state = open_existing_scope(
                 root, opposite_scope(scope), stack
@@ -660,7 +565,6 @@ def enable(root, name, scope):
                 root,
                 scope,
                 stack,
-                initial_state,
                 name,
                 created_directories,
             )
@@ -676,10 +580,7 @@ def enable(root, name, scope):
                 "enable",
             )
             registration_created = not was_registered
-            for skill_name, identity in inventory.items():
-                verify_source_child(
-                    source_fd, source_path, skill_name, identity
-                )
+            for skill_name in inventory:
                 create_link(
                     scope_state.skills_fd,
                     skill_name,
@@ -716,22 +617,6 @@ def enable(root, name, scope):
             )
             if problem is not None:
                 raise OperationalError(problem)
-            if other_state is not None:
-                if other_state.skills_fd is None:
-                    other_state = open_existing_scope(
-                        root, opposite_scope(scope), stack
-                    )
-                problem = cross_scope_collision(
-                    inventory,
-                    target,
-                    other_state.skills_fd,
-                    other_state.skills_path,
-                )
-                if problem is not None:
-                    raise OperationalError(problem)
-                problem = other_state.verify_bindings()
-                if problem is not None:
-                    raise OperationalError(problem)
         except ClaudeInterrupted:
             raise
         except KeyboardInterrupt:
@@ -829,9 +714,6 @@ def disable(root, name, scope):
                     else registration_path
                 )
                 raise OperationalError(f"managed entry remains: {path}")
-            problem = scope_state.verify_bindings()
-            if problem is not None:
-                raise OperationalError(problem)
         except ClaudeInterrupted:
             raise
         except KeyboardInterrupt:
@@ -919,7 +801,7 @@ def validate_names_against_other_scope(root, scope, names):
             return
         for name in names:
             with ExitStack() as source_stack:
-                source_path, source_fd, inventory = open_source(
+                _source_path, _source_fd, inventory = open_source(
                     root, name, source_stack
                 )
                 problem = cross_scope_collision(
@@ -930,12 +812,6 @@ def validate_names_against_other_scope(root, scope, names):
                 )
                 if problem is not None:
                     raise OperationalError(problem)
-                problem = directory_binding_problem(source_path, source_fd)
-                if problem is not None:
-                    raise OperationalError(problem)
-        problem = other_state.verify_bindings()
-        if problem is not None:
-            raise OperationalError(problem)
 
 
 def list_enabled(root, verbose, scope):

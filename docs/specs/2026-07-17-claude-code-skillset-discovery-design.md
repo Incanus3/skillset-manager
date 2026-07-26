@@ -426,42 +426,15 @@ disable local Claude registrations before renaming or removing their source
 set. Stale local registrations remain diagnosable from their own project
 directory.
 
-## Locking and safety
+## Reliability and concurrency
 
-Claude commands use the existing stable HOME lock followed by
-`~/.agents/.skillset.lock`, in that order. Listing remains an inspection
-command and does not create the managed advisory lock.
-
-These locks serialize wrapper operations and keep source validation stable
-relative to `skillset skills` delegation. They cannot prevent direct edits in
-a project or direct upstream commands, so every mutation still validates the
-entry immediately before changing it.
-
-The implementation follows `docs/guides/transactional-cli-safety.md`:
-
-- Test failures before and after state-changing syscalls.
-- Inspect observed state after a post-syscall exception.
-- Treat registrations as persistent transaction state.
-- Never clean up a path based only on its name.
-- Report the exact remaining data and recovery command after incomplete work.
-- Keep unrelated project paths outside rollback and cleanup ownership.
-
-Expected collision failures complete before mutation. Unexpected partial
-operations converge through `enable` or `disable`; they do not require
-`skillset doctor`, which intentionally covers only the canonical managed
-layout.
-
-Ordinary operational failures exit 1. `KeyboardInterrupt` remains exit 130.
-Claude operations catch interruptions around state-changing syscalls long
-enough to classify the observed pre- or post-syscall state and attach the same
-registration, source, incomplete-path, and recovery details used for ordinary
-partial failures. Add a small interrupt exception carrying that diagnostic if
-needed so `lib/skillset/cli.py` can preserve both the actionable message and
-status 130. If an injected post-syscall exception is observed after the
-intended state was reached, the state machine treats that syscall as committed;
-ordinary processing or final verification continues. An interrupt still stops
-after classification, reports whether the complete state was reached, and
-recommends the idempotent command that verifies it.
+Claude commands may use advisory locking to reduce accidental overlap. This is
+best effort, not a guarantee against concurrent edits or direct upstream use.
+Registration state lets `enable` reconcile normal partial projections and lets
+`disable` remove its owned links before the registration. Ordinary operational
+failures exit 1; Ctrl+C remains exit 130 when the CLI can provide useful normal
+recovery information. The detailed local policy is
+`docs/guides/local-cli-reliability.md`.
 
 ## Implementation boundaries
 

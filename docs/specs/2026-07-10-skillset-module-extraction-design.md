@@ -14,8 +14,9 @@ not a new Python API.
 - The repository is itself expected to live at `~/.agents`; the README adds `~/.agents/bin` directly to `PATH`.
 - The CLI is Linux-only, uses Python 3 and the standard library, and relies on `fcntl`, Linux file-opening flags,
   symlinks, and process replacement.
-- `docs/guides/transactional-cli-safety.md` defines the safety constraints for filesystem transactions, persistent
-  staging markers, locks, rollback, and transparent delegation.
+- Historical designs included transactional filesystem hardening. The current
+  local-CLI policy is `docs/guides/local-cli-reliability.md`; it supersedes that
+  adversarial guidance while retaining ordinary functional recovery.
 - The working copy was clean before this design was written. The parent commit was
   `a7d28ad1071a Add skillset diagnostics and hardening`.
 - The earlier named-skillsets specification assigned every implementation responsibility to `bin/skillset`. This design

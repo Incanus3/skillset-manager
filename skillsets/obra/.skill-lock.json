@@ -82,15 +82,6 @@
       "installedAt": "2026-07-11T09:47:30.759Z",
       "updatedAt": "2026-07-11T09:47:30.759Z"
     },
-    "using-git-worktrees": {
-      "source": "obra/superpowers",
-      "sourceType": "github",
-      "sourceUrl": "https://github.com/obra/superpowers.git",
-      "skillPath": "skills/using-git-worktrees/SKILL.md",
-      "skillFolderHash": "069a24665c6ce34ca78da57727c84e3c05e65c76",
-      "installedAt": "2026-07-11T09:47:30.760Z",
-      "updatedAt": "2026-07-11T09:47:30.760Z"
-    },
     "using-superpowers": {
       "source": "obra/superpowers",
       "sourceType": "github",

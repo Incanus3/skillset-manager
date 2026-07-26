@@ -73,10 +73,12 @@ initial named set in the configured directory. Other valid named sets may
 already be present, but the initial name must be unused. Runtime aliases and
 locks remain under `~/.agents`.
 
-To migrate an initialized installation, stop concurrent `skillset` and
-delegated upstream commands, move the real `~/.agents/skillsets` directory to
-the desired destination, write `config.json`, and replace the old location with
-the exact absolute link. Then run:
+Before migration, close any `skillset` or delegated upstream command that is
+currently using the installation. Move the real `~/.agents/skillsets`
+directory to the desired destination, write `config.json`, and replace the old
+location with the exact absolute symlink to that destination. One `~/.agents`
+installation should own a configured directory; sharing it between
+installations is unsupported. Then run:
 
 ```sh
 skillset doctor
@@ -84,10 +86,8 @@ skillset list
 skillset current
 ```
 
-One `~/.agents` installation should own a configured directory. Sharing the
-same directory between installations with independent advisory locks is not
-supported. An alternate `HOME` continues to select both its own
-`.agents/config.json` and its own runtime state.
+An alternate `HOME` continues to select both its own `.agents/config.json` and
+its own runtime state.
 
 ## Shell completions
 
@@ -173,15 +173,14 @@ with a letter or digit.
 skillset use experiment
 ```
 
-Activation atomically retargets `~/.agents/active`. Managed collections keep
-the root lock alias pointed at `active/.skill-lock.json`; a manual collection
-instead uses the read-only shared empty-lock sentinel
-`~/.skillset-manual-empty-lock.json`. Keeping this runtime-owned file outside
-the skillset repository prevents version-control tools from trying to rewrite
-it during commits. `skillset use` recreates it when needed; `skillset doctor
---fix` can also restore a missing sentinel after confirmation. An interrupted activation leaves
-a verified intent record in place and is completed only after confirmation via
-`skillset doctor --fix`.
+Activation retargets `~/.agents/active`. Managed collections keep the root lock
+alias pointed at `active/.skill-lock.json`; a manual collection instead uses the
+read-only shared empty-lock sentinel `~/.skillset-manual-empty-lock.json`.
+Keeping this runtime-owned file outside the skillset repository prevents
+version-control tools from trying to rewrite it during commits. `skillset use`
+recreates it when needed; `skillset doctor --fix` can also restore a missing
+sentinel after confirmation. An interrupted activation may leave a recovery
+record for `skillset doctor --fix`.
 
 ## Install and maintain skills
 
@@ -218,20 +217,12 @@ upstream arguments or output. The delegated process inherits terminal streams,
 signals, and exit status; only its copied environment has `XDG_STATE_HOME`
 removed so lock metadata resolves through the active managed alias.
 
-All `skillset` management, inspection, diagnostic, and delegated operations first
-take a stable, non-creating advisory lock on the existing HOME directory. Routine
-operations then take `~/.agents/.skillset.lock`, always in that order, and retain
-its existing on-disk compatibility. Routine managed inspection validates the
-complete managed layout and remains read-only. `skillset augment skills list` is
-a separate read-only discovery view: it neither requires nor validates the
-managed layout and uses its managed lock only when an existing candidate is a
-safe regular file. `doctor` aggregates invalid and partial state and acquires the
-managed lock only when it is a safe regular file.
-Delegation preserves both locks for the complete `npx skills` process lifetime,
-so wrapper operations safely wait for one another. After initialization, always
-prefer `skillset skills ...` for global installation and maintenance. Direct
-`npx skills` commands cannot honor these locks and must not run concurrently with
-any `skillset` operation.
+`skillset` uses advisory locks to reduce accidental overlap between its own
+operations. This is best effort: do not run conflicting `skillset` or direct
+upstream mutations at the same time. Managed inspection remains read-only, and
+`skillset augment skills list` can inspect discovery roots without requiring a
+managed layout. After initialization, prefer `skillset skills ...` for global
+installation and maintenance.
 
 ## Inspect skillsets
 
@@ -564,11 +555,8 @@ skill-name collisions between the effective global and local `.augment`
 projections, while allowing the identical canonical target in both scopes.
 Rerun `enable` after changing direct source skills to reconcile missing and
 stale links; `disable` removes owned projected links before its registration.
-An interrupted or partial operation normally retains its registration as
-recovery intent, so rerun the same `enable` or use `disable` to recover. If an
-operation instead reports a preserved removal quarantine, inspect and recover
-that exact path manually before running another Auggie command. Empty
-containers remain in place.
+If a normal operation is interrupted, rerun `enable` to reconcile the projection
+or use `disable` to remove its owned links. Empty containers remain in place.
 
 Global Auggie registrations, including malformed registration state, block
 rename and removal of their source skillset. Local registrations are not
@@ -624,17 +612,12 @@ reports an invalid layout, or before attempting manual recovery:
 skillset doctor
 ```
 
-`doctor` first takes the stable advisory lock on the existing HOME directory. It
-then inspects `.skillset.lock` without following it and, when it is a real regular
-file, holds that lock for the full inspection. A missing `.agents` root or a
-missing, symlinked, or nonregular managed lock is reported alongside missing
-aliases, `active`, and `skillsets`; read-only `doctor` creates neither path.
-It does not stop at the first invalid component. It checks all three canonical aliases, the active target
-grammar and existence, direct skillset directory names and shapes, stale
-use/create staging markers, readable version-3 lockfiles, and each direct skill
-directory's `SKILL.md` metadata. Set directories, skill directories, and
-`SKILL.md` files must be real entries; diagnostic inspection never follows their
-symlinks.
+`doctor` inspects the managed layout without creating it and reports all
+discovered layout problems. A missing `.agents` root or managed lock is reported
+alongside missing aliases, `active`, and `skillsets`. It checks all three
+canonical aliases, the active target grammar and existence, direct skillset
+directory names and shapes, stale use/create staging markers, readable
+version-3 lockfiles, and each direct skill directory's `SKILL.md` metadata.
 
 Every finding is written to stderr on one line. Structural, alias, lockfile,
 metadata, symlink, and staging problems are `skillset: error:` findings. A lock
@@ -662,9 +645,7 @@ them. When an error names recovery paths:
 
 `doctor --fix` can repair a deliberately small set of lossless omissions after
 an interactive `y` or `yes` confirmation. It may create a missing advisory lock
-and a missing version-3 empty lockfile only when that skillset's real `skills`
-directory is empty. It never overwrites a file, follows a symlink, invents lock
-metadata for installed skills, deletes stale markers, rewrites lock metadata,
-changes aliases, or chooses between competing copies. Each created file is
-reported as `skillset: repaired:`. Resolve every other finding manually only
-after preserving the data it identifies.
+and a missing version-3 empty lockfile only when that skillset's `skills`
+directory is empty. It does not overwrite existing files. Each created file is
+reported as `skillset: repaired:`. Resolve every other finding manually after
+preserving the data it identifies.
