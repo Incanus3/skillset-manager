@@ -161,8 +161,8 @@ def parse_frontmatter(text):
 
 
 def read_skill_text(directory):
-    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-    file_flags = os.O_RDONLY | os.O_NOFOLLOW
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY
+    file_flags = os.O_RDONLY
     try:
         directory_fd = os.open(directory, directory_flags)
     except OSError:

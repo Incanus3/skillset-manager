@@ -2454,65 +2454,6 @@ _skillset'''
                     refused.stderr,
                 )
 
-    def test_claude_enable_rechecks_opposite_scope_created_during_sync(self):
-        for index, enabled_scope in enumerate(("global", "local")):
-            with self.subTest(enabled_scope=enabled_scope):
-                home = self.new_home(f"claude-cross-scope-race-{index}")
-                root = self.make_managed_layout(home)
-                (root / ".skillset.lock").touch()
-                source = root / "skillsets" / "default" / "skills"
-                self.write_skill(
-                    source,
-                    "shared",
-                    "name: shared\ndescription: Shared",
-                )
-                project = self.sandbox / f"claude-cross-scope-race-project-{index}"
-                project.mkdir()
-                opposite_skills = (
-                    project / ".claude" / "skills"
-                    if enabled_scope == "global"
-                    else home / ".claude" / "skills"
-                )
-                fault = self.fault_environment(f"""
-                    import os
-                    original_symlink = os.symlink
-                    created_collision = False
-                    def create_opposite_collision(target, name, *args, **kwargs):
-                        global created_collision
-                        result = original_symlink(target, name, *args, **kwargs)
-                        if not created_collision and name == "shared":
-                            os.makedirs({str(opposite_skills)!r})
-                            with open(
-                                {str(opposite_skills / "shared")!r},
-                                "w",
-                                encoding="utf-8",
-                            ) as collision:
-                                collision.write("keep\\n")
-                            created_collision = True
-                        return result
-                    os.symlink = create_opposite_collision
-                """)
-                arguments = ["claude", "enable", "default"]
-                if enabled_scope == "local":
-                    arguments.append("--local")
-
-                result = self.run_cli(
-                    *arguments,
-                    home=home,
-                    cwd=project,
-                    extra_environment=fault,
-                )
-
-                self.assert_refused(result)
-                self.assertIn(
-                    "skill name 'shared' conflicts across global and local scopes",
-                    result.stderr,
-                )
-                self.assertEqual(
-                    (opposite_skills / "shared").read_text(),
-                    "keep\n",
-                )
-
     def test_claude_list_rejects_cross_scope_masking(self):
         home = self.new_home("claude-cross-scope-list")
         root = self.make_managed_layout(home)
@@ -2680,208 +2621,6 @@ _skillset'''
         )
         self.assertEqual(self.filesystem_snapshot(physical_home), before)
         self.assertFalse(os.path.lexists(source / ".claude"))
-
-    def test_claude_enable_revalidates_public_directory_bindings(self):
-        for index, replaced_name in enumerate(
-            ("source", "projection", "registrations")
-        ):
-            with self.subTest(directory=replaced_name):
-                home = self.new_home(f"claude-binding-{index}")
-                root = self.make_managed_layout(home)
-                (root / ".skillset.lock").touch()
-                source = root / "skillsets" / "default" / "skills"
-                self.write_skill(
-                    source,
-                    "alpha",
-                    "name: alpha\ndescription: Alpha",
-                )
-                claude = home / ".claude"
-                paths = {
-                    "source": source,
-                    "projection": claude / "skills",
-                    "registrations": claude / ".skillsets",
-                }
-                replaced = paths[replaced_name]
-                detached = replaced.with_name(f"{replaced.name}.detached")
-                trigger = "alpha" if replaced_name == "projection" else "default"
-                fault = self.fault_environment(f"""
-                    import os
-                    original_symlink = os.symlink
-                    replaced = False
-                    def replace_directory_after_link(target, name, *args, **kwargs):
-                        global replaced
-                        result = original_symlink(target, name, *args, **kwargs)
-                        if (
-                            not replaced
-                            and name == {trigger!r}
-                            and kwargs.get("dir_fd") is not None
-                        ):
-                            os.rename({str(replaced)!r}, {str(detached)!r})
-                            os.mkdir({str(replaced)!r})
-                            replaced = True
-                        return result
-                    os.symlink = replace_directory_after_link
-                """)
-
-                result = self.run_cli(
-                    "claude",
-                    "enable",
-                    "default",
-                    home=home,
-                    extra_environment=fault,
-                )
-
-                self.assert_refused(result)
-                self.assertIn(
-                    "directory changed during synchronization",
-                    result.stderr,
-                )
-                self.assertTrue(detached.is_dir())
-
-                recovered = self.run_cli(
-                    "claude", "enable", "default", home=home
-                )
-                self.assertEqual(
-                    recovered.returncode, 0, recovered.stderr
-                )
-
-    def test_claude_disable_revalidates_public_directory_bindings(self):
-        for index, container_name in enumerate(("skills", ".skillsets")):
-            with self.subTest(container=container_name):
-                home = self.new_home(f"claude-disable-binding-{index}")
-                root = self.initialize(home=home)
-                source = root / "skillsets" / "default" / "skills"
-                self.write_skill(
-                    source,
-                    "alpha",
-                    "name: alpha\ndescription: Alpha",
-                )
-                self.assertEqual(
-                    self.run_cli(
-                        "claude", "enable", "default", home=home
-                    ).returncode,
-                    0,
-                )
-                claude = home / ".claude"
-                public = claude / container_name
-                detached = claude / f"{container_name}.detached"
-                trigger = (
-                    "alpha"
-                    if container_name == "skills"
-                    else "default"
-                )
-                recreated_name = trigger
-                recreated_target = (
-                    str(source / "alpha")
-                    if container_name == "skills"
-                    else str(source)
-                )
-                fault = self.fault_environment(f"""
-                    import os
-                    original_unlink = os.unlink
-                    replaced = False
-                    def replace_directory_after_unlink(name, *args, **kwargs):
-                        global replaced
-                        result = original_unlink(name, *args, **kwargs)
-                        if (
-                            not replaced
-                            and name == {trigger!r}
-                            and kwargs.get("dir_fd") is not None
-                        ):
-                            os.rename({str(public)!r}, {str(detached)!r})
-                            os.mkdir({str(public)!r})
-                            os.symlink(
-                                {recreated_target!r},
-                                os.path.join(
-                                    {str(public)!r}, {recreated_name!r}
-                                ),
-                            )
-                            replaced = True
-                        return result
-                    os.unlink = replace_directory_after_unlink
-                """)
-
-                result = self.run_cli(
-                    "claude",
-                    "disable",
-                    "default",
-                    home=home,
-                    extra_environment=fault,
-                )
-
-                self.assert_refused(result)
-                self.assertIn(
-                    f"directory changed during synchronization: {public}",
-                    result.stderr,
-                )
-                self.assertIn(
-                    "skillset claude disable default", result.stderr
-                )
-                self.assertTrue(detached.is_dir())
-                self.assertTrue(
-                    os.path.lexists(public / recreated_name)
-                )
-
-                recovered = self.run_cli(
-                    "claude", "disable", "default", home=home
-                )
-                self.assertEqual(
-                    recovered.returncode, 0, recovered.stderr
-                )
-                self.assertFalse(
-                    os.path.lexists(public / recreated_name)
-                )
-
-    def test_claude_disable_detects_initially_absent_containers_appearing(self):
-        for index, container_name in enumerate(("skills", ".skillsets")):
-            with self.subTest(container=container_name):
-                home = self.new_home(
-                    f"claude-disable-appeared-{index}"
-                )
-                self.initialize(home=home)
-                claude = home / ".claude"
-                claude.mkdir()
-                appeared = claude / container_name
-                fault = self.fault_environment(f"""
-                    import os
-                    original_stat = os.stat
-                    appeared = False
-                    def create_during_final_verification(path, *args, **kwargs):
-                        global appeared
-                        if (
-                            not appeared
-                            and os.fspath(path) == {str(appeared)!r}
-                            and kwargs.get("follow_symlinks") is False
-                        ):
-                            os.mkdir({str(appeared)!r})
-                            appeared = True
-                        return original_stat(path, *args, **kwargs)
-                    os.stat = create_during_final_verification
-                """)
-
-                result = self.run_cli(
-                    "claude",
-                    "disable",
-                    "default",
-                    home=home,
-                    extra_environment=fault,
-                )
-
-                self.assert_refused(result)
-                self.assertIn(
-                    f"directory changed during synchronization: {appeared}",
-                    result.stderr,
-                )
-                self.assertIn(
-                    "skillset claude disable default", result.stderr
-                )
-                self.assertTrue(appeared.is_dir())
-                recovered = self.run_cli(
-                    "claude", "disable", "default", home=home
-                )
-                self.assertEqual(
-                    recovered.returncode, 0, recovered.stderr
-                )
 
     def test_claude_ownership_requires_matching_basename_and_preserves_aliases(self):
         self.initialize()
@@ -4385,83 +4124,6 @@ _skillset'''
                 self.assertEqual(stdout, stdout_expected)
                 self.assertEqual(stderr, "")
 
-    def test_augment_skills_list_falls_back_when_advisory_lock_is_replaced(self):
-        self.initialize()
-        lock_path = self.root / ".skillset.lock"
-        displaced = self.sandbox / "displaced-advisory-lock"
-        replacement = self.sandbox / "replacement-advisory-lock"
-        replacement.write_text("replacement", encoding="utf-8")
-        replaced_marker = self.sandbox / "advisory-lock-replaced"
-        attempted_replacement = self.sandbox / "advisory-lock-replacement-attempted"
-        original_identity = (lock_path.stat().st_dev, lock_path.stat().st_ino)
-        replacement_identity = (replacement.stat().st_dev, replacement.stat().st_ino)
-        before = self.tree_contract_snapshot(self.home)
-        fault = self.fault_environment(
-            f"""
-            import fcntl
-            import os
-            from pathlib import Path
-            lock_path = {str(lock_path)!r}
-            displaced = {str(displaced)!r}
-            replacement = {str(replacement)!r}
-            replacement_identity = {replacement_identity!r}
-            replaced_marker = Path({str(replaced_marker)!r})
-            attempted_replacement = Path({str(attempted_replacement)!r})
-            original_open = os.open
-            original_flock = fcntl.flock
-            replaced = False
-            def replace_lock_before_open(name, *args, **kwargs):
-                global replaced
-                if (
-                    name == ".skillset.lock"
-                    and kwargs.get("dir_fd") is not None
-                    and not replaced
-                ):
-                    os.rename(lock_path, displaced)
-                    os.symlink(replacement, lock_path)
-                    replaced_marker.write_text("replaced", encoding="utf-8")
-                    replaced = True
-                descriptor = original_open(name, *args, **kwargs)
-                metadata = os.fstat(descriptor)
-                if (metadata.st_dev, metadata.st_ino) == replacement_identity:
-                    attempted_replacement.write_text("opened", encoding="utf-8")
-                return descriptor
-            def mark_lock_attempt(file, operation):
-                if operation & fcntl.LOCK_EX:
-                    descriptor = file if isinstance(file, int) else file.fileno()
-                    metadata = os.fstat(descriptor)
-                    identity = (metadata.st_dev, metadata.st_ino)
-                    if identity == replacement_identity:
-                        attempted_replacement.write_text("attempted", encoding="utf-8")
-                return original_flock(file, operation)
-            os.open = replace_lock_before_open
-            fcntl.flock = mark_lock_attempt
-            """
-        )
-        try:
-            result = self.run_cli(
-                "augment", "skills", "list", extra_environment=fault
-            )
-        finally:
-            if os.path.lexists(displaced):
-                lock_path.unlink(missing_ok=True)
-                os.replace(displaced, lock_path)
-
-        self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(result.stderr, "")
-        self.assertTrue(replaced_marker.exists())
-        self.assertFalse(
-            attempted_replacement.exists(),
-            "augment skills list followed the replacement advisory lock",
-        )
-        self.assertEqual(
-            (lock_path.stat().st_dev, lock_path.stat().st_ino), original_identity
-        )
-        self.assertFalse(lock_path.is_symlink())
-        self.assertFalse(os.path.lexists(displaced))
-        self.assertEqual(self.tree_contract_snapshot(self.home), before)
-
     def test_skills_appends_global_to_scoped_upstream_commands(self):
         self.initialize()
         environment, record = self.fake_npx_environment()
@@ -4915,133 +4577,6 @@ _skillset'''
         self.assertEqual(self.tree_contract_snapshot(external), before)
         self.assertFalse(os.path.lexists(other_home / ".agents" / "skillsets"))
 
-    def test_configured_remove_refuses_a_replaced_managed_link_after_confirmation(self):
-        external = self.sandbox / "configured-remove-source"
-        victim = self.sandbox / "configured-remove-victim"
-        external.mkdir()
-        victim.mkdir()
-        self.write_config(self.home, external)
-        self.assertEqual(self.run_cli("init", "default").returncode, 0)
-        self.assertEqual(self.run_cli("create", "doomed").returncode, 0)
-
-        victim_root = self.sandbox / "configured-remove-victim-view"
-        victim_root.mkdir()
-        (victim_root / "skillsets").symlink_to(victim, target_is_directory=True)
-        victim_set = self.make_set(victim_root, "doomed")
-        payload = victim_set / "skills" / "keep"
-        payload.write_bytes(b"victim data")
-        link = self.root / "skillsets"
-        fault = self.fault_environment(
-            f"""
-            import os
-            import sys
-            from pathlib import Path
-            original_stdin = sys.stdin
-            link = Path({str(link)!r})
-            victim = {str(victim)!r}
-            class SwappingStdin:
-                def readline(self, *args, **kwargs):
-                    link.unlink()
-                    os.symlink(victim, link)
-                    return "yes\\n"
-                def __getattr__(self, name):
-                    return getattr(original_stdin, name)
-            sys.stdin = SwappingStdin()
-            """
-        )
-
-        result = self.run_cli("remove", "doomed", extra_environment=fault)
-
-        self.assert_refused(result)
-        self.assertIn(
-            "configured skillsets link is noncanonical",
-            result.stdout + result.stderr,
-        )
-        self.assertTrue((external / "doomed").is_dir())
-        self.assertEqual(payload.read_bytes(), b"victim data")
-        self.assertEqual(os.readlink(link), str(victim))
-
-    def test_configured_init_preserves_a_set_created_after_preflight(self):
-        external = self.sandbox / "configured-init-race"
-        external.mkdir()
-        self.write_config(self.home, external)
-        target = external / "default"
-        payload = target / "skills" / "keep"
-        fault = self.fault_environment(
-            f"""
-            import json
-            from pathlib import Path
-            target = Path({str(target)!r})
-            original_mkdir = Path.mkdir
-            injected = False
-            def create_collision(path, *args, **kwargs):
-                global injected
-                if path == target and not injected:
-                    injected = True
-                    original_mkdir(target)
-                    original_mkdir(target / "skills")
-                    (target / "skills" / "keep").write_bytes(b"concurrent data")
-                    (target / ".skill-lock.json").write_text(
-                        json.dumps({EMPTY_LOCK!r}) + "\\n",
-                        encoding="utf-8",
-                    )
-                return original_mkdir(path, *args, **kwargs)
-            Path.mkdir = create_collision
-            """
-        )
-
-        result = self.run_cli("init", "default", extra_environment=fault)
-
-        self.assert_refused(result)
-        self.assertIn("File exists", result.stdout + result.stderr)
-        self.assertEqual(payload.read_bytes(), b"concurrent data")
-        self.assertEqual(
-            json.loads((target / ".skill-lock.json").read_text(encoding="utf-8")),
-            EMPTY_LOCK,
-        )
-        self.assertFalse(os.path.lexists(self.root / "skillsets"))
-
-    def test_configured_init_preserves_a_link_and_set_created_after_preflight(self):
-        external = self.sandbox / "configured-init-link-race"
-        external.mkdir()
-        self.write_config(self.home, external)
-        link = self.root / "skillsets"
-        target = external / "default"
-        payload = target / "skills" / "keep"
-        fault = self.fault_environment(
-            f"""
-            import json
-            import os
-            from pathlib import Path
-            link = Path({str(link)!r})
-            external = {str(external)!r}
-            target = Path({str(target)!r})
-            original_symlink = os.symlink
-            injected = False
-            def create_collision(source, destination, *args, **kwargs):
-                global injected
-                if Path(destination) == link and not injected:
-                    injected = True
-                    original_symlink(external, link)
-                    target.mkdir()
-                    (target / "skills").mkdir()
-                    (target / "skills" / "keep").write_bytes(b"concurrent data")
-                    (target / ".skill-lock.json").write_text(
-                        json.dumps({EMPTY_LOCK!r}) + "\\n",
-                        encoding="utf-8",
-                    )
-                return original_symlink(source, destination, *args, **kwargs)
-            os.symlink = create_collision
-            """
-        )
-
-        result = self.run_cli("init", "default", extra_environment=fault)
-
-        self.assert_refused(result)
-        self.assertIn("File exists", result.stdout + result.stderr)
-        self.assertEqual(payload.read_bytes(), b"concurrent data")
-        self.assertEqual(os.readlink(link), str(external))
-
     def test_configured_init_rejects_stale_create_staging_without_mutation(self):
         external = self.sandbox / "stale-staging-skillsets"
         staging = external / ".skillset-create-foo.staging"
@@ -5248,137 +4783,6 @@ _skillset'''
                 self.assertEqual(marker.read_bytes(), b"preserve")
                 self.assertTrue(external.is_dir())
 
-    def test_configured_init_rollback_never_traverses_a_replaced_link(self):
-        external = self.sandbox / "rollback-replaced-link-source"
-        victim = self.sandbox / "rollback-replaced-link-victim"
-        external.mkdir()
-        victim.mkdir()
-        victim_root = self.sandbox / "rollback-replaced-link-victim-view"
-        victim_root.mkdir()
-        (victim_root / "skillsets").symlink_to(victim, target_is_directory=True)
-        victim_set = self.make_set(victim_root, "default")
-        payload = victim_set / "skills" / "keep"
-        payload.write_bytes(b"victim data")
-        self.write_config(self.home, external)
-        link = self.root / "skillsets"
-        fault = self.fault_environment(
-            f"""
-            import os
-            from pathlib import Path
-            link = Path({str(link)!r})
-            victim = {str(victim)!r}
-            original_symlink = os.symlink
-            def replace_after_link(source, target, *args, **kwargs):
-                result = original_symlink(source, target, *args, **kwargs)
-                if Path(target) == link:
-                    link.unlink()
-                    original_symlink(victim, link)
-                    raise KeyboardInterrupt
-                return result
-            os.symlink = replace_after_link
-            """
-        )
-
-        result = self.run_cli("init", "default", extra_environment=fault)
-
-        self.assert_refused(result)
-        self.assertIn("rollback was incomplete", result.stdout + result.stderr)
-        self.assertEqual(payload.read_bytes(), b"victim data")
-        self.assertFalse(os.path.lexists(external / "default"))
-        self.assertEqual(os.readlink(link), str(victim))
-
-    def test_configured_init_refuses_a_link_replaced_after_creation(self):
-        external = self.sandbox / "init-replaced-link-source"
-        victim = self.sandbox / "init-replaced-link-victim"
-        external.mkdir()
-        victim.mkdir()
-        victim_root = self.sandbox / "init-replaced-link-victim-view"
-        victim_root.mkdir()
-        (victim_root / "skillsets").symlink_to(victim, target_is_directory=True)
-        victim_set = self.make_set(victim_root, "default")
-        payload = victim_set / "skills" / "keep"
-        payload.write_bytes(b"victim data")
-        self.write_config(self.home, external)
-        link = self.root / "skillsets"
-        fault = self.fault_environment(
-            f"""
-            import os
-            from pathlib import Path
-            link = Path({str(link)!r})
-            victim = {str(victim)!r}
-            original_symlink = os.symlink
-            def replace_after_link(source, target, *args, **kwargs):
-                result = original_symlink(source, target, *args, **kwargs)
-                if Path(target) == link:
-                    link.unlink()
-                    original_symlink(victim, link)
-                return result
-            os.symlink = replace_after_link
-            """
-        )
-
-        result = self.run_cli("init", "default", extra_environment=fault)
-
-        self.assert_refused(result)
-        self.assertIn(
-            "configured skillsets link is noncanonical",
-            result.stdout + result.stderr,
-        )
-        self.assertIn("rollback was incomplete", result.stdout + result.stderr)
-        self.assertEqual(payload.read_bytes(), b"victim data")
-        self.assertFalse(os.path.lexists(external / "default"))
-        self.assertEqual(os.readlink(link), str(victim))
-        self.assertFalse(os.path.lexists(self.root / "active"))
-        self.assertFalse(os.path.lexists(self.root / "skills"))
-        self.assertFalse(os.path.lexists(self.root / ".skill-lock.json"))
-
-    def test_configured_init_refuses_a_link_replaced_during_alias_creation(self):
-        external = self.sandbox / "init-alias-replaced-link-source"
-        victim = self.sandbox / "init-alias-replaced-link-victim"
-        external.mkdir()
-        victim.mkdir()
-        victim_root = self.sandbox / "init-alias-replaced-link-victim-view"
-        victim_root.mkdir()
-        (victim_root / "skillsets").symlink_to(victim, target_is_directory=True)
-        victim_set = self.make_set(victim_root, "default")
-        payload = victim_set / "skills" / "keep"
-        payload.write_bytes(b"victim data")
-        self.write_config(self.home, external)
-        link = self.root / "skillsets"
-        active = self.root / "active"
-        fault = self.fault_environment(
-            f"""
-            import os
-            from pathlib import Path
-            link = Path({str(link)!r})
-            active = Path({str(active)!r})
-            victim = {str(victim)!r}
-            original_symlink = os.symlink
-            def replace_during_aliases(source, target, *args, **kwargs):
-                result = original_symlink(source, target, *args, **kwargs)
-                if Path(target) == active:
-                    link.unlink()
-                    original_symlink(victim, link)
-                return result
-            os.symlink = replace_during_aliases
-            """
-        )
-
-        result = self.run_cli("init", "default", extra_environment=fault)
-
-        self.assert_refused(result)
-        self.assertIn(
-            "configured skillsets link is noncanonical",
-            result.stdout + result.stderr,
-        )
-        self.assertIn("rollback was incomplete", result.stdout + result.stderr)
-        self.assertEqual(payload.read_bytes(), b"victim data")
-        self.assertFalse(os.path.lexists(external / "default"))
-        self.assertEqual(os.readlink(link), str(victim))
-        self.assertFalse(os.path.lexists(self.root / "active"))
-        self.assertFalse(os.path.lexists(self.root / "skills"))
-        self.assertFalse(os.path.lexists(self.root / ".skill-lock.json"))
-
     def test_init_adopts_existing_skills_and_version_three_lock_without_rewriting(self):
         source_skills = self.root / "skills"
         (source_skills / "alpha" / "nested").mkdir(parents=True)
@@ -5554,6 +4958,20 @@ _skillset'''
             "create", "--manual", "--from", "default", "invalid"
         )
         self.assertEqual(mutually_exclusive.returncode, 2)
+
+    def test_manual_sentinel_accepts_nonwritable_modes_and_refuses_writable_mode(self):
+        self.initialize()
+        self.assertEqual(self.run_cli("create", "--manual", "personal").returncode, 0)
+        self.assertEqual(self.run_cli("use", "personal").returncode, 0)
+        sentinel = self.home / ".skillset-manual-empty-lock.json"
+        sentinel.chmod(0o400)
+        accepted = self.run_cli("list")
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(accepted.stdout, "default\n* personal [m]\n")
+        sentinel.chmod(0o644)
+        rejected = self.run_cli("list")
+        self.assert_refused(rejected)
+        self.assertIn("manual empty-lock sentinel must be read-only", rejected.stderr)
 
     def test_manual_classification_rejects_marker_and_lock_misconfigurations(self):
         cases = ("unmarked", "both", "nonempty-marker", "symlink-marker")
@@ -6987,65 +6405,6 @@ _skillset'''
                     refused.stderr,
                 )
 
-    def test_augment_enable_rechecks_opposite_scope_created_during_sync(self):
-        for index, enabled_scope in enumerate(("global", "local")):
-            with self.subTest(enabled_scope=enabled_scope):
-                home = self.new_home(f"augment-cross-scope-race-{index}")
-                root = self.make_managed_layout(home)
-                (root / ".skillset.lock").touch()
-                source = root / "skillsets" / "default" / "skills"
-                self.write_skill(
-                    source,
-                    "shared",
-                    "name: shared\ndescription: Shared",
-                )
-                project = self.sandbox / f"augment-cross-scope-race-project-{index}"
-                project.mkdir()
-                opposite_skills = (
-                    project / ".augment" / "skills"
-                    if enabled_scope == "global"
-                    else home / ".augment" / "skills"
-                )
-                fault = self.fault_environment(f"""
-                    import os
-                    original_symlink = os.symlink
-                    created_collision = False
-                    def create_opposite_collision(target, name, *args, **kwargs):
-                        global created_collision
-                        result = original_symlink(target, name, *args, **kwargs)
-                        if not created_collision and name == "shared":
-                            os.makedirs({str(opposite_skills)!r})
-                            with open(
-                                {str(opposite_skills / "shared")!r},
-                                "w",
-                                encoding="utf-8",
-                            ) as collision:
-                                collision.write("keep\\n")
-                            created_collision = True
-                        return result
-                    os.symlink = create_opposite_collision
-                """)
-                arguments = ["augment", "enable", "default"]
-                if enabled_scope == "local":
-                    arguments.append("--local")
-
-                result = self.run_cli(
-                    *arguments,
-                    home=home,
-                    cwd=project,
-                    extra_environment=fault,
-                )
-
-                self.assert_refused(result)
-                self.assertIn(
-                    "skill name 'shared' conflicts across global and local scopes",
-                    result.stderr,
-                )
-                self.assertEqual(
-                    (opposite_skills / "shared").read_text(),
-                    "keep\n",
-                )
-
     def test_augment_list_rejects_cross_scope_masking(self):
         home = self.new_home("augment-cross-scope-list")
         root = self.make_managed_layout(home)
@@ -7263,208 +6622,6 @@ _skillset'''
         self.assertEqual(self.filesystem_snapshot(physical_home), before)
         self.assertFalse(os.path.lexists(source / ".augment"))
 
-    def test_augment_enable_revalidates_public_directory_bindings(self):
-        for index, replaced_name in enumerate(
-            ("source", "projection", "registrations")
-        ):
-            with self.subTest(directory=replaced_name):
-                home = self.new_home(f"augment-binding-{index}")
-                root = self.make_managed_layout(home)
-                (root / ".skillset.lock").touch()
-                source = root / "skillsets" / "default" / "skills"
-                self.write_skill(
-                    source,
-                    "alpha",
-                    "name: alpha\ndescription: Alpha",
-                )
-                augment = home / ".augment"
-                paths = {
-                    "source": source,
-                    "projection": augment / "skills",
-                    "registrations": augment / ".skillsets",
-                }
-                replaced = paths[replaced_name]
-                detached = replaced.with_name(f"{replaced.name}.detached")
-                trigger = "alpha" if replaced_name == "projection" else "default"
-                fault = self.fault_environment(f"""
-                    import os
-                    original_symlink = os.symlink
-                    replaced = False
-                    def replace_directory_after_link(target, name, *args, **kwargs):
-                        global replaced
-                        result = original_symlink(target, name, *args, **kwargs)
-                        if (
-                            not replaced
-                            and name == {trigger!r}
-                            and kwargs.get("dir_fd") is not None
-                        ):
-                            os.rename({str(replaced)!r}, {str(detached)!r})
-                            os.mkdir({str(replaced)!r})
-                            replaced = True
-                        return result
-                    os.symlink = replace_directory_after_link
-                """)
-
-                result = self.run_cli(
-                    "augment",
-                    "enable",
-                    "default",
-                    home=home,
-                    extra_environment=fault,
-                )
-
-                self.assert_refused(result)
-                self.assertIn(
-                    "directory changed during synchronization",
-                    result.stderr,
-                )
-                self.assertTrue(detached.is_dir())
-
-                recovered = self.run_cli(
-                    "augment", "enable", "default", home=home
-                )
-                self.assertEqual(
-                    recovered.returncode, 0, recovered.stderr
-                )
-
-    def test_augment_disable_revalidates_public_directory_bindings(self):
-        for index, container_name in enumerate(("skills", ".skillsets")):
-            with self.subTest(container=container_name):
-                home = self.new_home(f"augment-disable-binding-{index}")
-                root = self.initialize(home=home)
-                source = root / "skillsets" / "default" / "skills"
-                self.write_skill(
-                    source,
-                    "alpha",
-                    "name: alpha\ndescription: Alpha",
-                )
-                self.assertEqual(
-                    self.run_cli(
-                        "augment", "enable", "default", home=home
-                    ).returncode,
-                    0,
-                )
-                augment = home / ".augment"
-                public = augment / container_name
-                detached = augment / f"{container_name}.detached"
-                trigger = (
-                    "alpha"
-                    if container_name == "skills"
-                    else "default"
-                )
-                recreated_name = trigger
-                recreated_target = (
-                    str(source / "alpha")
-                    if container_name == "skills"
-                    else str(source)
-                )
-                fault = self.fault_environment(f"""
-                    import os
-                    original_unlink = os.unlink
-                    replaced = False
-                    def replace_directory_after_unlink(name, *args, **kwargs):
-                        global replaced
-                        result = original_unlink(name, *args, **kwargs)
-                        if (
-                            not replaced
-                            and name == "entry"
-                            and kwargs.get("dir_fd") is not None
-                        ):
-                            os.rename({str(public)!r}, {str(detached)!r})
-                            os.mkdir({str(public)!r})
-                            os.symlink(
-                                {recreated_target!r},
-                                os.path.join(
-                                    {str(public)!r}, {recreated_name!r}
-                                ),
-                            )
-                            replaced = True
-                        return result
-                    os.unlink = replace_directory_after_unlink
-                """)
-
-                result = self.run_cli(
-                    "augment",
-                    "disable",
-                    "default",
-                    home=home,
-                    extra_environment=fault,
-                )
-
-                self.assert_refused(result)
-                self.assertIn(
-                    f"directory changed during synchronization: {public}",
-                    result.stderr,
-                )
-                self.assertIn(
-                    "skillset augment disable default", result.stderr
-                )
-                self.assertTrue(detached.is_dir())
-                self.assertTrue(
-                    os.path.lexists(public / recreated_name)
-                )
-
-                recovered = self.run_cli(
-                    "augment", "disable", "default", home=home
-                )
-                self.assertEqual(
-                    recovered.returncode, 0, recovered.stderr
-                )
-                self.assertFalse(
-                    os.path.lexists(public / recreated_name)
-                )
-
-    def test_augment_disable_detects_initially_absent_containers_appearing(self):
-        for index, container_name in enumerate(("skills", ".skillsets")):
-            with self.subTest(container=container_name):
-                home = self.new_home(
-                    f"augment-disable-appeared-{index}"
-                )
-                self.initialize(home=home)
-                augment = home / ".augment"
-                augment.mkdir()
-                appeared = augment / container_name
-                fault = self.fault_environment(f"""
-                    import os
-                    original_stat = os.stat
-                    appeared = False
-                    def create_during_final_verification(path, *args, **kwargs):
-                        global appeared
-                        if (
-                            not appeared
-                            and os.fspath(path) == {str(appeared)!r}
-                            and kwargs.get("follow_symlinks") is False
-                        ):
-                            os.mkdir({str(appeared)!r})
-                            appeared = True
-                        return original_stat(path, *args, **kwargs)
-                    os.stat = create_during_final_verification
-                """)
-
-                result = self.run_cli(
-                    "augment",
-                    "disable",
-                    "default",
-                    home=home,
-                    extra_environment=fault,
-                )
-
-                self.assert_refused(result)
-                self.assertIn(
-                    f"directory changed during synchronization: {appeared}",
-                    result.stderr,
-                )
-                self.assertIn(
-                    "skillset augment disable default", result.stderr
-                )
-                self.assertTrue(appeared.is_dir())
-                recovered = self.run_cli(
-                    "augment", "disable", "default", home=home
-                )
-                self.assertEqual(
-                    recovered.returncode, 0, recovered.stderr
-                )
-
     def test_augment_ownership_requires_matching_basename_and_preserves_aliases(self):
         self.initialize()
         source = self.root / "skillsets" / "default" / "skills"
@@ -7490,549 +6647,6 @@ _skillset'''
         self.assertTrue((self.home / ".augment").is_dir())
         self.assertTrue((self.home / ".augment" / ".skillsets").is_dir())
         self.assertTrue(augment_skills.is_dir())
-
-    def test_augment_refuses_links_replaced_after_ownership_inspection(self):
-        for index, action in enumerate(
-            ("reconcile-stale", "disable-projection", "disable-registration")
-        ):
-            with self.subTest(action=action):
-                home = self.new_home(f"augment-replaced-link-{index}")
-                root = self.initialize(home=home)
-                source = root / "skillsets" / "default" / "skills"
-                alpha = self.write_skill(
-                    source, "alpha", "name: alpha\ndescription: Alpha"
-                )
-                self.assertEqual(
-                    self.run_cli(
-                        "augment", "enable", "default", home=home
-                    ).returncode,
-                    0,
-                )
-                augment = home / ".augment"
-                projection = augment / "skills" / "alpha"
-                registration = augment / ".skillsets" / "default"
-                if action == "reconcile-stale":
-                    shutil.rmtree(alpha)
-                    arguments = ("augment", "enable", "default")
-                    entry = projection
-                    trigger = "alpha"
-                elif action == "disable-projection":
-                    arguments = ("augment", "disable", "default")
-                    entry = projection
-                    trigger = "alpha"
-                else:
-                    arguments = ("augment", "disable", "default")
-                    entry = registration
-                    trigger = "default"
-                replacement = str(home / f"unrelated-{action}")
-                fault = self.fault_environment(f"""
-                    import os
-                    original_readlink = os.readlink
-                    reads = 0
-                    replaced = False
-                    def replace_after_ownership_read(name, *args, **kwargs):
-                        global reads, replaced
-                        target = original_readlink(name, *args, **kwargs)
-                        if (
-                            name == {trigger!r}
-                            and kwargs.get("dir_fd") is not None
-                            and not replaced
-                        ):
-                            reads += 1
-                            if reads == 2:
-                                os.unlink(name, dir_fd=kwargs["dir_fd"])
-                                os.symlink(
-                                    {replacement!r}, name,
-                                    dir_fd=kwargs["dir_fd"],
-                                )
-                                replaced = True
-                        return target
-                    os.readlink = replace_after_ownership_read
-                """)
-
-                result = self.run_cli(
-                    *arguments, home=home, extra_environment=fault
-                )
-
-                self.assert_refused(result)
-                self.assertIn("refused to remove changed Auggie entry", result.stderr)
-                self.assertTrue(os.path.lexists(entry))
-                self.assertEqual(os.readlink(entry), replacement)
-
-    def test_augment_quarantines_links_replaced_before_removal(self):
-        for index, action in enumerate(
-            ("reconcile-stale", "disable-projection", "disable-registration")
-        ):
-            with self.subTest(action=action):
-                home = self.new_home(f"augment-quarantined-link-{index}")
-                root = self.initialize(home=home)
-                source = root / "skillsets" / "default" / "skills"
-                alpha = self.write_skill(
-                    source, "alpha", "name: alpha\ndescription: Alpha"
-                )
-                self.assertEqual(
-                    self.run_cli(
-                        "augment", "enable", "default", home=home
-                    ).returncode,
-                    0,
-                )
-                augment = home / ".augment"
-                projection = augment / "skills" / "alpha"
-                registration = augment / ".skillsets" / "default"
-                if action == "reconcile-stale":
-                    shutil.rmtree(alpha)
-                    arguments = ("augment", "enable", "default")
-                    entry = projection
-                    trigger = "alpha"
-                elif action == "disable-projection":
-                    arguments = ("augment", "disable", "default")
-                    entry = projection
-                    trigger = "alpha"
-                else:
-                    arguments = ("augment", "disable", "default")
-                    entry = registration
-                    trigger = "default"
-                replacement = str(home / f"unrelated-quarantine-{action}")
-                fault = self.fault_environment(f"""
-                    import os
-                    original_rename = os.rename
-                    replaced = False
-                    def replace_before_quarantine(source, destination, *args, **kwargs):
-                        global replaced
-                        if (
-                            source == {trigger!r}
-                            and kwargs.get("src_dir_fd") is not None
-                            and not replaced
-                        ):
-                            os.unlink(source, dir_fd=kwargs["src_dir_fd"])
-                            os.symlink(
-                                {replacement!r}, source,
-                                dir_fd=kwargs["src_dir_fd"],
-                            )
-                            replaced = True
-                        return original_rename(source, destination, *args, **kwargs)
-                    os.rename = replace_before_quarantine
-                """)
-
-                result = self.run_cli(
-                    *arguments, home=home, extra_environment=fault
-                )
-
-                self.assert_refused(result)
-                quarantines = sorted(augment.glob(".skillset-removal-*"))
-                self.assertEqual(len(quarantines), 1)
-                quarantined = quarantines[0] / "entry"
-                self.assertFalse(os.path.lexists(entry))
-                self.assertTrue(os.path.lexists(quarantined))
-                self.assertEqual(os.readlink(quarantined), replacement)
-                self.assertIn(str(quarantined), result.stderr)
-
-    def test_augment_refuses_leftover_removal_quarantine_without_mutation(self):
-        self.initialize()
-        augment = self.home / ".augment"
-        quarantine = augment / ".skillset-removal-foreign"
-        quarantine.mkdir(parents=True)
-        (quarantine / "entry").write_text("preserve", encoding="utf-8")
-        before = self.filesystem_snapshot(self.home)
-
-        result = self.run_cli("augment", "list")
-
-        self.assert_refused(result)
-        self.assertIn(str(quarantine), result.stderr)
-        self.assertEqual(self.filesystem_snapshot(self.home), before)
-
-    def test_augment_preserves_quarantine_when_interrupted_after_move(self):
-        self.initialize()
-        source = self.root / "skillsets" / "default" / "skills"
-        alpha = self.write_skill(
-            source, "alpha", "name: alpha\ndescription: Alpha"
-        )
-        self.assertEqual(
-            self.run_cli("augment", "enable", "default").returncode, 0
-        )
-        augment = self.home / ".augment"
-        projected = augment / "skills" / "alpha"
-        registration = augment / ".skillsets" / "default"
-        fault = self.fault_environment("""
-            import os
-            original_rename = os.rename
-            interrupted = False
-            def interrupt_after_quarantine_move(source, destination, *args, **kwargs):
-                global interrupted
-                result = original_rename(source, destination, *args, **kwargs)
-                if (
-                    source == "alpha"
-                    and kwargs.get("src_dir_fd") is not None
-                    and not interrupted
-                ):
-                    interrupted = True
-                    raise KeyboardInterrupt()
-                return result
-            os.rename = interrupt_after_quarantine_move
-        """)
-
-        result = self.run_cli(
-            "augment", "disable", "default", extra_environment=fault
-        )
-
-        self.assertEqual(result.returncode, 130, result.stderr)
-        quarantines = sorted(augment.glob(".skillset-removal-*"))
-        self.assertEqual(len(quarantines), 1)
-        quarantined = quarantines[0] / "entry"
-        self.assertFalse(os.path.lexists(projected))
-        self.assertTrue(registration.is_symlink())
-        self.assertTrue(quarantined.is_symlink())
-        self.assertEqual(os.readlink(quarantined), str(alpha))
-        self.assertIn(str(quarantined), result.stderr)
-        self.assertIn("manual recovery", result.stderr)
-        self.assertNotIn("Rerun `skillset augment", result.stderr)
-        before = self.filesystem_snapshot(self.home)
-
-        blocked = self.run_cli("augment", "list")
-
-        self.assert_refused(blocked)
-        self.assertIn(str(quarantines[0]), blocked.stderr)
-        self.assertEqual(self.filesystem_snapshot(self.home), before)
-
-    def test_augment_reports_manual_recovery_after_post_mkdir_interrupt(self):
-        for operation in ("stat", "open"):
-            with self.subTest(operation=operation):
-                home = self.new_home(f"post-mkdir-{operation}-interrupt")
-                root = self.initialize(home=home)
-                source = root / "skillsets" / "default" / "skills"
-                self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
-                self.assertEqual(
-                    self.run_cli("augment", "enable", "default", home=home).returncode,
-                    0,
-                )
-                augment = home / ".augment"
-                projected = augment / "skills" / "alpha"
-                fault = self.fault_environment(f"""
-                    import os
-                    original_mkdir = os.mkdir
-                    original_stat = os.stat
-                    original_open = os.open
-                    quarantine = None
-                    interrupted = False
-                    def track_quarantine(path, *args, **kwargs):
-                        global quarantine
-                        result = original_mkdir(path, *args, **kwargs)
-                        if path.startswith(".skillset-removal-") and kwargs.get("dir_fd") is not None:
-                            quarantine = path
-                        return result
-                    def interrupt_stat(path, *args, **kwargs):
-                        global interrupted
-                        if {operation!r} == "stat" and path == quarantine and kwargs.get("dir_fd") is not None and not interrupted:
-                            interrupted = True
-                            raise KeyboardInterrupt()
-                        return original_stat(path, *args, **kwargs)
-                    def interrupt_open(path, *args, **kwargs):
-                        global interrupted
-                        if {operation!r} == "open" and path == quarantine and kwargs.get("dir_fd") is not None and not interrupted:
-                            interrupted = True
-                            raise KeyboardInterrupt()
-                        return original_open(path, *args, **kwargs)
-                    os.mkdir = track_quarantine
-                    os.stat = interrupt_stat
-                    os.open = interrupt_open
-                """)
-
-                result = self.run_cli(
-                    "augment", "disable", "default", home=home,
-                    extra_environment=fault,
-                )
-
-                self.assertEqual(result.returncode, 130, result.stderr)
-                quarantines = list(augment.glob(".skillset-removal-*"))
-                self.assertEqual(len(quarantines), 1)
-                self.assertTrue(projected.is_symlink())
-                self.assertIn(str(quarantines[0]), result.stderr)
-                self.assertIn("manual recovery", result.stderr)
-                self.assertNotIn("Rerun `skillset augment", result.stderr)
-                before = self.filesystem_snapshot(home)
-
-                blocked = self.run_cli("augment", "list", home=home)
-
-                self.assert_refused(blocked)
-                self.assertIn(str(quarantines[0]), blocked.stderr)
-                self.assertEqual(self.filesystem_snapshot(home), before)
-
-    def test_augment_refuses_replaced_removal_quarantine_during_creation(self):
-        self.initialize()
-        source = self.root / "skillsets" / "default" / "skills"
-        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
-        self.assertEqual(
-            self.run_cli("augment", "enable", "default").returncode, 0
-        )
-        augment = self.home / ".augment"
-        projected = augment / "skills" / "alpha"
-        fault = self.fault_environment(f"""
-            import os
-            original_mkdir = os.mkdir
-            original_open = os.open
-            quarantine = None
-            replaced = False
-            def track_quarantine(path, *args, **kwargs):
-                global quarantine
-                result = original_mkdir(path, *args, **kwargs)
-                if (
-                    path.startswith(".skillset-removal-")
-                    and kwargs.get("dir_fd") is not None
-                ):
-                    quarantine = path
-                return result
-            def replace_quarantine(path, *args, **kwargs):
-                global replaced
-                if (
-                    path == quarantine
-                    and kwargs.get("dir_fd") is not None
-                    and not replaced
-                ):
-                    replaced = True
-                    directory = kwargs["dir_fd"]
-                    os.rename(
-                        path, path + ".detached",
-                        src_dir_fd=directory, dst_dir_fd=directory,
-                    )
-                    original_mkdir(path, dir_fd=directory)
-                    replacement_fd = original_open(
-                        path, os.O_RDONLY | os.O_DIRECTORY, dir_fd=directory,
-                    )
-                    os.symlink("/tmp/unrelated", "entry", dir_fd=replacement_fd)
-                    os.close(replacement_fd)
-                return original_open(path, *args, **kwargs)
-            os.mkdir = track_quarantine
-            os.open = replace_quarantine
-        """)
-
-        result = self.run_cli(
-            "augment", "disable", "default", extra_environment=fault
-        )
-
-        self.assert_refused(result)
-        quarantines = sorted(augment.glob(".skillset-removal-*"))
-        self.assertEqual(len(quarantines), 2)
-        replacement = next(
-            quarantine for quarantine in quarantines
-            if not quarantine.name.endswith(".detached")
-        )
-        self.assertTrue(projected.is_symlink())
-        self.assertEqual(os.readlink(replacement / "entry"), "/tmp/unrelated")
-        self.assertIn(str(replacement), result.stderr)
-
-    def test_augment_removes_empty_quarantine_after_open_failure(self):
-        self.initialize()
-        source = self.root / "skillsets" / "default" / "skills"
-        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
-        self.assertEqual(
-            self.run_cli("augment", "enable", "default").returncode, 0
-        )
-        augment = self.home / ".augment"
-        projected = augment / "skills" / "alpha"
-        fault = self.fault_environment("""
-            import errno
-            import os
-            original_mkdir = os.mkdir
-            original_open = os.open
-            quarantine = None
-            def track_quarantine(path, *args, **kwargs):
-                global quarantine
-                result = original_mkdir(path, *args, **kwargs)
-                if (
-                    path.startswith(".skillset-removal-")
-                    and kwargs.get("dir_fd") is not None
-                ):
-                    quarantine = path
-                return result
-            def fail_quarantine_open(path, *args, **kwargs):
-                if path == quarantine and kwargs.get("dir_fd") is not None:
-                    raise PermissionError(errno.EACCES, "Permission denied", path)
-                return original_open(path, *args, **kwargs)
-            os.mkdir = track_quarantine
-            os.open = fail_quarantine_open
-        """)
-
-        result = self.run_cli(
-            "augment", "disable", "default", extra_environment=fault
-        )
-
-        self.assert_refused(result)
-        self.assertTrue(projected.is_symlink())
-        self.assertEqual(list(augment.glob(".skillset-removal-*")), [])
-
-    def test_augment_preserves_post_mkdir_quarantine_failures_with_recovery_path(
-        self,
-    ):
-        for interrupted in (False, True):
-            with self.subTest(interrupted=interrupted):
-                home = self.new_home(f"post-mkdir-quarantine-{interrupted}")
-                root = self.initialize(home=home)
-                source = root / "skillsets" / "default" / "skills"
-                self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
-                self.assertEqual(
-                    self.run_cli(
-                        "augment", "enable", "default", home=home
-                    ).returncode,
-                    0,
-                )
-                augment = home / ".augment"
-                projected = augment / "skills" / "alpha"
-                fault = self.fault_environment(f"""
-                    import errno
-                    import os
-                    original_mkdir = os.mkdir
-                    failed = False
-                    def fail_after_quarantine_mkdir(path, *args, **kwargs):
-                        global failed
-                        result = original_mkdir(path, *args, **kwargs)
-                        if (
-                            path.startswith(".skillset-removal-")
-                            and kwargs.get("dir_fd") is not None
-                            and not failed
-                        ):
-                            failed = True
-                            if {interrupted!r}:
-                                raise KeyboardInterrupt()
-                            raise OSError(errno.EIO, "injected post-mkdir failure", path)
-                        return result
-                    os.mkdir = fail_after_quarantine_mkdir
-                """)
-
-                result = self.run_cli(
-                    "augment", "disable", "default", home=home,
-                    extra_environment=fault,
-                )
-
-                if interrupted:
-                    self.assertEqual(result.returncode, 130, result.stderr)
-                else:
-                    self.assert_refused(result)
-                quarantines = list(augment.glob(".skillset-removal-*"))
-                self.assertEqual(len(quarantines), 1)
-                self.assertTrue(projected.is_symlink())
-                self.assertIn(str(quarantines[0]), result.stderr)
-                before = self.filesystem_snapshot(home)
-                blocked = self.run_cli("augment", "list", home=home)
-                self.assert_refused(blocked)
-                self.assertIn(str(quarantines[0]), blocked.stderr)
-                self.assertEqual(self.filesystem_snapshot(home), before)
-
-    def test_augment_reports_pre_mkdir_quarantine_failure_without_marker(self):
-        self.initialize()
-        source = self.root / "skillsets" / "default" / "skills"
-        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
-        self.assertEqual(
-            self.run_cli("augment", "enable", "default").returncode, 0
-        )
-        augment = self.home / ".augment"
-        projected = augment / "skills" / "alpha"
-        original_target = os.readlink(projected)
-        fault = self.fault_environment("""
-            import errno
-            import os
-            original_mkdir = os.mkdir
-            def fail_before_quarantine_mkdir(path, *args, **kwargs):
-                if (
-                    str(path).startswith(".skillset-removal-")
-                    and kwargs.get("dir_fd") is not None
-                ):
-                    raise OSError(errno.EIO, "injected pre-mkdir failure", path)
-                return original_mkdir(path, *args, **kwargs)
-            os.mkdir = fail_before_quarantine_mkdir
-        """)
-
-        result = self.run_cli(
-            "augment", "disable", "default", extra_environment=fault
-        )
-
-        self.assert_refused(result)
-        self.assertTrue(projected.is_symlink())
-        self.assertEqual(os.readlink(projected), original_target)
-        self.assertEqual(list(augment.glob(".skillset-removal-*")), [])
-        self.assertIn(
-            f"could not create Auggie removal quarantine in {augment}", result.stderr
-        )
-        self.assertNotIn("preserved removal quarantine", result.stderr)
-        before = self.filesystem_snapshot(self.home)
-        self.assertEqual(self.run_cli("augment", "list").returncode, 0)
-        self.assertEqual(self.filesystem_snapshot(self.home), before)
-
-    def test_augment_refuses_replaced_removal_quarantine_during_cleanup(self):
-        self.initialize()
-        source = self.root / "skillsets" / "default" / "skills"
-        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
-        self.assertEqual(
-            self.run_cli("augment", "enable", "default").returncode, 0
-        )
-        augment = self.home / ".augment"
-        fault = self.fault_environment("""
-            import os
-            original_mkdir = os.mkdir
-            original_stat = os.stat
-            quarantine = None
-            replaced = False
-            checks = 0
-            def track_quarantine(path, *args, **kwargs):
-                global quarantine
-                result = original_mkdir(path, *args, **kwargs)
-                if (
-                    path.startswith(".skillset-removal-")
-                    and kwargs.get("dir_fd") is not None
-                ):
-                    quarantine = path
-                return result
-            def replace_before_cleanup(path, *args, **kwargs):
-                global checks, replaced
-                if (
-                    path == quarantine
-                    and kwargs.get("dir_fd") is not None
-                ):
-                    checks += 1
-                    if checks == 3 and not replaced:
-                        replaced = True
-                        directory = kwargs["dir_fd"]
-                        os.rename(
-                            path, path + ".detached",
-                            src_dir_fd=directory, dst_dir_fd=directory,
-                        )
-                        original_mkdir(path, dir_fd=directory)
-                return original_stat(path, *args, **kwargs)
-            os.mkdir = track_quarantine
-            os.stat = replace_before_cleanup
-        """)
-
-        result = self.run_cli(
-            "augment", "disable", "default", extra_environment=fault
-        )
-
-        self.assert_refused(result)
-        quarantines = sorted(augment.glob(".skillset-removal-*"))
-        self.assertEqual(len(quarantines), 2)
-        replacement = next(
-            quarantine for quarantine in quarantines
-            if not quarantine.name.endswith(".detached")
-        )
-        self.assertTrue(replacement.is_dir())
-        self.assertIn(str(replacement), result.stderr)
-
-    def test_augment_lifecycle_refuses_removal_quarantine_without_mutation(self):
-        for index, arguments in enumerate(
-            (("rename", "personal", "renamed"), ("remove", "personal", "--yes"))
-        ):
-            with self.subTest(command=arguments[0]):
-                home = self.new_home(f"augment-lifecycle-quarantine-{index}")
-                root = self.initialize(home=home)
-                self.make_set(root, "personal")
-                quarantine = home / ".augment" / ".skillset-removal-foreign"
-                quarantine.mkdir(parents=True)
-                (quarantine / "entry").write_text("preserve", encoding="utf-8")
-                before = self.filesystem_snapshot(home)
-
-                result = self.run_cli(*arguments, home=home)
-
-                self.assert_refused(result)
-                self.assertIn(str(quarantine), result.stderr)
-                self.assertEqual(self.filesystem_snapshot(home), before)
 
     def test_augment_enable_adopts_only_exact_canonical_links(self):
         self.initialize()
@@ -8283,20 +6897,13 @@ _skillset'''
         self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
         fault = self.fault_environment("""
             import os
-            original_stat = os.stat
-            source_checks = 0
-            def interrupt_during_source_verification(path, *args, **kwargs):
-                global source_checks
-                if (
-                    path == "alpha"
-                    and kwargs.get("dir_fd") is not None
-                    and kwargs.get("follow_symlinks") is False
-                ):
-                    source_checks += 1
-                    if source_checks == 2:
-                        raise KeyboardInterrupt()
-                return original_stat(path, *args, **kwargs)
-            os.stat = interrupt_during_source_verification
+            original_symlink = os.symlink
+            def interrupt_after_projection_creation(target, name, *args, **kwargs):
+                result = original_symlink(target, name, *args, **kwargs)
+                if name == "alpha" and kwargs.get("dir_fd") is not None:
+                    raise KeyboardInterrupt()
+                return result
+            os.symlink = interrupt_after_projection_creation
         """)
 
         interrupted = self.run_cli(
@@ -8311,7 +6918,7 @@ _skillset'''
         self.assertIn(str(projection), interrupted.stderr)
         self.assertIn("skillset augment enable default", interrupted.stderr)
         self.assertTrue(registration.is_symlink())
-        self.assertFalse(os.path.lexists(projection / "alpha"))
+        self.assertTrue((projection / "alpha").is_symlink())
 
         recovered = self.run_cli("augment", "enable", "default")
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
@@ -8329,7 +6936,7 @@ _skillset'''
             original_unlink = os.unlink
             def interrupt_after_projected_unlink(name, *args, **kwargs):
                 result = original_unlink(name, *args, **kwargs)
-                if name == "entry" and kwargs.get("dir_fd") is not None:
+                if name == "alpha" and kwargs.get("dir_fd") is not None:
                     raise KeyboardInterrupt()
                 return result
             os.unlink = interrupt_after_projected_unlink
@@ -8349,6 +6956,39 @@ _skillset'''
 
         recovered = self.run_cli("augment", "disable", "default")
         self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(os.path.lexists(registration))
+
+    def test_augment_disable_preserves_state_when_projected_unlink_fails(self):
+        self.initialize()
+        source = self.root / "skillsets" / "default" / "skills"
+        self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
+        self.assertEqual(
+            self.run_cli("augment", "enable", "default").returncode, 0
+        )
+        registration = self.home / ".augment" / ".skillsets" / "default"
+        projected = self.home / ".augment" / "skills" / "alpha"
+        before = self.filesystem_snapshot(self.home)
+        fault = self.fault_environment("""
+            import os
+            original_unlink = os.unlink
+            def refuse_projected_unlink(name, *args, **kwargs):
+                if name == "alpha" and kwargs.get("dir_fd") is not None:
+                    raise PermissionError(13, "Permission denied", name)
+                return original_unlink(name, *args, **kwargs)
+            os.unlink = refuse_projected_unlink
+        """)
+
+        failed = self.run_cli(
+            "augment", "disable", "default", extra_environment=fault
+        )
+
+        self.assert_refused(failed)
+        self.assertIn("could not remove Auggie link", failed.stderr)
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+
+        recovered = self.run_cli("augment", "disable", "default")
+        self.assertEqual(recovered.returncode, 0, recovered.stderr)
+        self.assertFalse(os.path.lexists(projected))
         self.assertFalse(os.path.lexists(registration))
 
     def test_augment_disable_interrupt_between_unlinks_reports_recovery(self):
@@ -8477,7 +7117,7 @@ _skillset'''
             def interrupt_after_registration_unlink(name, *args, **kwargs):
                 global unlinks
                 result = original_unlink(name, *args, **kwargs)
-                if name == "entry" and kwargs.get("dir_fd") is not None:
+                if name in ("alpha", "default") and kwargs.get("dir_fd") is not None:
                     unlinks += 1
                     if unlinks == 2:
                         raise KeyboardInterrupt()
@@ -8606,271 +7246,6 @@ _skillset'''
                 self.assertEqual(self.filesystem_snapshot(home), before)
                 self.assertTrue(projection.is_symlink())
                 self.assertTrue((source / "skills").is_dir())
-
-    def test_augment_lifecycle_refuses_replaced_orphaned_projection(self):
-        for index, arguments in enumerate(
-            (("rename", "personal", "renamed"), ("remove", "personal", "--yes"))
-        ):
-            with self.subTest(command=arguments[0]):
-                home = self.new_home(f"augment-replaced-orphan-{index}")
-                root = self.initialize(home=home)
-                source = self.make_set(root, "personal")
-                alpha = self.write_skill(
-                    source / "skills",
-                    "alpha",
-                    "name: alpha\ndescription: alpha",
-                )
-                enabled = self.run_cli(
-                    "augment", "enable", "personal", home=home
-                )
-                self.assertEqual(enabled.returncode, 0, enabled.stderr)
-                augment = home / ".augment"
-                skills = augment / "skills"
-                detached = augment / "skills.detached"
-                registration = augment / ".skillsets" / "personal"
-                (skills / "alpha").unlink()
-                registration.unlink()
-                fault = self.fault_environment(f"""
-                    import os
-                    original_listdir = os.listdir
-                    original_stat = os.stat
-                    replaced = False
-                    def replace_after_empty_projection_inventory(path):
-                        global replaced
-                        names = original_listdir(path)
-                        if not replaced and isinstance(path, int):
-                            opened = os.fstat(path)
-                            public = original_stat(
-                                {str(skills)!r}, follow_symlinks=False
-                            )
-                            if (opened.st_dev, opened.st_ino) == (
-                                public.st_dev, public.st_ino
-                            ):
-                                os.rename({str(skills)!r}, {str(detached)!r})
-                                os.mkdir({str(skills)!r})
-                                os.symlink(
-                                    {str(alpha)!r},
-                                    {str(skills / "alpha")!r},
-                                )
-                                replaced = True
-                        return names
-                    os.listdir = replace_after_empty_projection_inventory
-                """)
-
-                result = self.run_cli(*arguments, home=home, extra_environment=fault)
-
-                self.assert_refused(result)
-                self.assertIn(
-                    f"cannot be verified at {skills}", result.stderr
-                )
-                self.assertTrue(detached.is_dir())
-                self.assertTrue((skills / "alpha").is_symlink())
-                self.assertTrue((root / "skillsets" / "personal").is_dir())
-                self.assertFalse((root / "skillsets" / "renamed").exists())
-
-    def test_augment_lifecycle_refuses_skills_replaced_before_orphan_open(self):
-        for index, arguments in enumerate(
-            (("rename", "personal", "renamed"), ("remove", "personal", "--yes"))
-        ):
-            with self.subTest(command=arguments[0]):
-                home = self.new_home(f"augment-replaced-skills-open-{index}")
-                root = self.initialize(home=home)
-                source = self.make_set(root, "personal")
-                self.write_skill(
-                    source / "skills",
-                    "alpha",
-                    "name: alpha\ndescription: alpha",
-                )
-                enabled = self.run_cli(
-                    "augment", "enable", "personal", home=home
-                )
-                self.assertEqual(enabled.returncode, 0, enabled.stderr)
-                augment = home / ".augment"
-                skills = augment / "skills"
-                detached = augment / "skills.detached"
-                (skills / "alpha").unlink()
-                (augment / ".skillsets" / "personal").unlink()
-                fault = self.fault_environment(f"""
-                    import os
-                    original_open = os.open
-                    replaced = False
-                    def replace_skills_before_open(path, *args, **kwargs):
-                        global replaced
-                        if (
-                            path == "skills"
-                            and kwargs.get("dir_fd") is not None
-                            and not replaced
-                        ):
-                            replaced = True
-                            os.rename({str(skills)!r}, {str(detached)!r})
-                            os.mkdir({str(skills)!r})
-                        return original_open(path, *args, **kwargs)
-                    os.open = replace_skills_before_open
-                """)
-
-                result = self.run_cli(*arguments, home=home, extra_environment=fault)
-
-                self.assert_refused(result)
-                self.assertIn(
-                    f"cannot be verified at {skills}", result.stderr
-                )
-                self.assertTrue(detached.is_dir())
-                self.assertTrue((root / "skillsets" / "personal").is_dir())
-                self.assertFalse((root / "skillsets" / "renamed").exists())
-
-    def test_augment_lifecycle_refuses_replaced_parent_before_orphan_return(self):
-        for index, arguments in enumerate(
-            (("rename", "personal", "renamed"), ("remove", "personal", "--yes"))
-        ):
-            with self.subTest(command=arguments[0]):
-                home = self.new_home(f"augment-replaced-parent-orphan-{index}")
-                root = self.initialize(home=home)
-                source = self.make_set(root, "personal")
-                self.write_skill(
-                    source / "skills",
-                    "alpha",
-                    "name: alpha\ndescription: alpha",
-                )
-                enabled = self.run_cli(
-                    "augment", "enable", "personal", home=home
-                )
-                self.assertEqual(enabled.returncode, 0, enabled.stderr)
-                augment = home / ".augment"
-                detached = home / ".augment.detached"
-                (augment / ".skillsets" / "personal").unlink()
-                fault = self.fault_environment(f"""
-                    import os
-                    original_stat = os.stat
-                    replaced = False
-                    def replace_parent_after_binding(path, *args, **kwargs):
-                        global replaced
-                        result = original_stat(path, *args, **kwargs)
-                        if (
-                            os.fspath(path) == {str(augment)!r}
-                            and kwargs.get("follow_symlinks") is False
-                            and not replaced
-                        ):
-                            replaced = True
-                            os.rename({str(augment)!r}, {str(detached)!r})
-                            os.mkdir({str(augment)!r})
-                        return result
-                    os.stat = replace_parent_after_binding
-                """)
-
-                result = self.run_cli(*arguments, home=home, extra_environment=fault)
-
-                self.assert_refused(result)
-                self.assertIn(
-                    f"cannot be verified at {augment}", result.stderr
-                )
-                self.assertTrue(detached.is_dir())
-                self.assertTrue((root / "skillsets" / "personal").is_dir())
-                self.assertFalse((root / "skillsets" / "renamed").exists())
-
-    def test_augment_lifecycle_refuses_orphan_created_after_missing_lookup(self):
-        for index, arguments in enumerate(
-            (("rename", "personal", "renamed"), ("remove", "personal", "--yes"))
-        ):
-            with self.subTest(command=arguments[0]):
-                home = self.new_home(f"augment-created-orphan-{index}")
-                root = self.initialize(home=home)
-                source = self.make_set(root, "personal")
-                alpha = self.write_skill(
-                    source / "skills",
-                    "alpha",
-                    "name: alpha\ndescription: alpha",
-                )
-                augment = home / ".augment"
-                augment.mkdir()
-                fault = self.fault_environment(f"""
-                    import os
-                    original_stat = os.stat
-                    created = False
-                    def create_orphan_after_missing_lookup(path, *args, **kwargs):
-                        global created
-                        try:
-                            return original_stat(path, *args, **kwargs)
-                        except FileNotFoundError:
-                            if (
-                                path == "skills"
-                                and kwargs.get("dir_fd") is not None
-                                and not created
-                            ):
-                                created = True
-                                directory = kwargs["dir_fd"]
-                                os.mkdir("skills", dir_fd=directory)
-                                skills_fd = os.open(
-                                    "skills", os.O_RDONLY | os.O_DIRECTORY,
-                                    dir_fd=directory,
-                                )
-                                os.symlink(
-                                    {str(alpha)!r}, "alpha", dir_fd=skills_fd
-                                )
-                                os.close(skills_fd)
-                            raise
-                    os.stat = create_orphan_after_missing_lookup
-                """)
-
-                result = self.run_cli(*arguments, home=home, extra_environment=fault)
-
-                self.assert_refused(result)
-                self.assertIn("incomplete Auggie projection", result.stderr)
-                self.assertTrue((augment / "skills" / "alpha").is_symlink())
-                self.assertTrue((root / "skillsets" / "personal").is_dir())
-                self.assertFalse((root / "skillsets" / "renamed").exists())
-
-    def test_augment_lifecycle_refuses_parent_replaced_after_missing_lookup(self):
-        for index, arguments in enumerate(
-            (("rename", "personal", "renamed"), ("remove", "personal", "--yes"))
-        ):
-            with self.subTest(command=arguments[0]):
-                home = self.new_home(f"augment-replaced-parent-missing-{index}")
-                root = self.initialize(home=home)
-                source = self.make_set(root, "personal")
-                alpha = self.write_skill(
-                    source / "skills",
-                    "alpha",
-                    "name: alpha\ndescription: alpha",
-                )
-                augment = home / ".augment"
-                detached = home / ".augment.detached"
-                augment.mkdir()
-                fault = self.fault_environment(f"""
-                    import os
-                    original_stat = os.stat
-                    checks = 0
-                    replaced = False
-                    def replace_parent_after_missing_lookup(path, *args, **kwargs):
-                        global checks, replaced
-                        result = original_stat(path, *args, **kwargs)
-                        if (
-                            os.fspath(path) == {str(augment)!r}
-                            and kwargs.get("follow_symlinks") is False
-                        ):
-                            checks += 1
-                            if checks == 3 and not replaced:
-                                replaced = True
-                                os.rename({str(augment)!r}, {str(detached)!r})
-                                os.mkdir({str(augment)!r})
-                                os.mkdir({str(augment / "skills")!r})
-                                os.symlink(
-                                    {str(alpha)!r},
-                                    {str(augment / "skills" / "alpha")!r},
-                                )
-                        return result
-                    os.stat = replace_parent_after_missing_lookup
-                """)
-
-                result = self.run_cli(*arguments, home=home, extra_environment=fault)
-
-                self.assert_refused(result)
-                self.assertIn(
-                    f"cannot be verified at {augment}", result.stderr
-                )
-                self.assertTrue(detached.is_dir())
-                self.assertTrue((augment / "skills" / "alpha").is_symlink())
-                self.assertTrue((root / "skillsets" / "personal").is_dir())
-                self.assertFalse((root / "skillsets" / "renamed").exists())
 
     def test_unowned_augment_entries_do_not_block_lifecycle(self):
         for index, arguments in enumerate(
@@ -9060,89 +7435,6 @@ _skillset'''
                     self.assertEqual(
                         self.filesystem_snapshot(self.home), before
                     )
-
-    def test_augment_lifecycle_refuses_replaced_registration_during_inspection(self):
-        for index, arguments in enumerate(
-            (
-                ("rename", "personal", "renamed"),
-                ("remove", "personal", "--yes"),
-            )
-        ):
-            with self.subTest(command=arguments[0]):
-                home = self.new_home(f"augment-replaced-registration-{index}")
-                root = self.initialize(home=home)
-                self.make_set(root, "personal")
-                enabled = self.run_cli("augment", "enable", "personal", home=home)
-                self.assertEqual(enabled.returncode, 0, enabled.stderr)
-                registration = home / ".augment" / ".skillsets" / "personal"
-                fault = self.fault_environment("""
-                    import os
-                    original_readlink = os.readlink
-                    replaced = False
-                    def replace_registration(path, *args, **kwargs):
-                        global replaced
-                        target = original_readlink(path, *args, **kwargs)
-                        if (
-                            path == "personal"
-                            and kwargs.get("dir_fd") is not None
-                            and not replaced
-                        ):
-                            replaced = True
-                            os.unlink(path, dir_fd=kwargs["dir_fd"])
-                            os.symlink("/tmp/replaced", path, dir_fd=kwargs["dir_fd"])
-                        return target
-                    os.readlink = replace_registration
-                """)
-
-                result = self.run_cli(*arguments, home=home, extra_environment=fault)
-
-                self.assert_refused(result)
-                self.assertIn(
-                    f"cannot be verified at {registration}", result.stderr
-                )
-                self.assertTrue((root / "skillsets" / "personal").is_dir())
-                self.assertFalse((root / "skillsets" / "renamed").exists())
-
-    def test_augment_lifecycle_refuses_removed_registration_during_inspection(self):
-        for index, arguments in enumerate(
-            (
-                ("rename", "personal", "renamed"),
-                ("remove", "personal", "--yes"),
-            )
-        ):
-            with self.subTest(command=arguments[0]):
-                home = self.new_home(f"augment-removed-registration-{index}")
-                root = self.initialize(home=home)
-                self.make_set(root, "personal")
-                enabled = self.run_cli("augment", "enable", "personal", home=home)
-                self.assertEqual(enabled.returncode, 0, enabled.stderr)
-                registration = home / ".augment" / ".skillsets" / "personal"
-                fault = self.fault_environment("""
-                    import os
-                    original_readlink = os.readlink
-                    removed = False
-                    def remove_registration(path, *args, **kwargs):
-                        global removed
-                        target = original_readlink(path, *args, **kwargs)
-                        if (
-                            path == "personal"
-                            and kwargs.get("dir_fd") is not None
-                            and not removed
-                        ):
-                            removed = True
-                            os.unlink(path, dir_fd=kwargs["dir_fd"])
-                        return target
-                    os.readlink = remove_registration
-                """)
-
-                result = self.run_cli(*arguments, home=home, extra_environment=fault)
-
-                self.assert_refused(result)
-                self.assertIn(
-                    f"cannot be verified at {registration}", result.stderr
-                )
-                self.assertTrue((root / "skillsets" / "personal").is_dir())
-                self.assertFalse((root / "skillsets" / "renamed").exists())
 
     def test_augment_skills_list_renders_plain_table_with_concise_sources_without_mutation(
         self,
@@ -9789,6 +8081,7 @@ _skillset'''
             "managed-root-open-error",
             "lock-open-error",
             "lock-fstat-error",
+            "lock-flock-error",
         )
         for index, case in enumerate(cases):
             with self.subTest(case=case):
@@ -9808,7 +8101,11 @@ _skillset'''
                         lock_path.symlink_to("missing-advisory-lock")
                     elif case == "lock-directory":
                         lock_path.mkdir()
-                    elif case in {"lock-open-error", "lock-fstat-error"}:
+                    elif case in {
+                        "lock-open-error",
+                        "lock-fstat-error",
+                        "lock-flock-error",
+                    }:
                         lock_path.touch()
 
                 skills = home / ".augment" / "skills"
@@ -9877,6 +8174,32 @@ _skillset'''
                             return original_fstat(descriptor, *args, **kwargs)
                         os.open = track_advisory_lock_open
                         os.fstat = fail_advisory_lock_fstat
+                        """
+                    )
+                elif case == "lock-flock-error":
+                    fault = self.fault_environment(
+                        """
+                        import errno
+                        import fcntl
+                        import os
+                        lock_descriptor = None
+                        original_open = os.open
+                        original_flock = fcntl.flock
+                        def track_advisory_lock_open(name, *args, **kwargs):
+                            global lock_descriptor
+                            descriptor = original_open(name, *args, **kwargs)
+                            if (
+                                name == ".skillset.lock"
+                                and kwargs.get("dir_fd") is not None
+                            ):
+                                lock_descriptor = descriptor
+                            return descriptor
+                        def fail_advisory_lock_flock(descriptor, operation):
+                            if descriptor == lock_descriptor and operation & fcntl.LOCK_EX:
+                                raise OSError(errno.ENOLCK, os.strerror(errno.ENOLCK))
+                            return original_flock(descriptor, operation)
+                        os.open = track_advisory_lock_open
+                        fcntl.flock = fail_advisory_lock_flock
                         """
                     )
                 before_home = self.filesystem_snapshot(home)

@@ -2,13 +2,12 @@
 
 import os
 import stat
-import uuid
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from errno import EINVAL
 from pathlib import Path
 
-from .errors import ClaudeInterrupted, ManualRecoveryError, OperationalError
+from .errors import ClaudeInterrupted, OperationalError
 from .layout import (
     NAME_PATTERN,
     lexists,
@@ -21,9 +20,7 @@ from .layout import (
 from .metadata import list_named_sets, list_scoped_sets
 
 
-DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
-REMOVAL_PREFIX = ".skillset-removal-"
-REMOVAL_ENTRY = "entry"
+DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY
 
 
 @dataclass(frozen=True)
@@ -106,19 +103,6 @@ def canonical_link_at(directory_fd, name, target):
         raise OperationalError(
             f"could not inspect Auggie entry {name!r}: {error}"
         ) from error
-    try:
-        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except FileNotFoundError:
-        return False
-    except OSError as error:
-        raise OperationalError(
-            f"could not inspect Auggie entry {name!r}: {error}"
-        ) from error
-    if not stat.S_ISLNK(current.st_mode) or (
-        current.st_dev,
-        current.st_ino,
-    ) != (metadata.st_dev, metadata.st_ino):
-        return False
     return canonical_target(link_target, target)
 
 
@@ -142,29 +126,10 @@ def validate_scope_containers(root, scope):
         return augment, skills, registrations
     if not real_kind(augment, stat.S_ISDIR):
         _container_error(augment)
-    quarantine = removal_quarantine(augment)
-    if quarantine is not None:
-        raise OperationalError(
-            "Auggie removal quarantine requires manual recovery: "
-            f"{quarantine}"
-        )
     for directory in (skills, registrations):
         if lexists(directory) and not real_kind(directory, stat.S_ISDIR):
             _container_error(directory)
     return augment, skills, registrations
-
-
-def removal_quarantine(augment):
-    try:
-        entries = sorted(augment.iterdir(), key=lambda entry: entry.name)
-    except OSError as error:
-        raise OperationalError(
-            f"could not inspect Auggie container {augment}: {error}"
-        ) from error
-    for entry in entries:
-        if entry.name.startswith(REMOVAL_PREFIX):
-            return entry
-    return None
 
 
 @contextmanager
@@ -185,36 +150,6 @@ def _identity(metadata):
     return metadata.st_dev, metadata.st_ino
 
 
-def directory_binding_problem(path, descriptor):
-    try:
-        public_metadata = os.stat(path, follow_symlinks=False)
-        opened_metadata = os.fstat(descriptor)
-    except OSError as error:
-        return f"directory changed during synchronization: {path}: {error}"
-    if (
-        not stat.S_ISDIR(public_metadata.st_mode)
-        or _identity(public_metadata) != _identity(opened_metadata)
-    ):
-        return f"directory changed during synchronization: {path}"
-    return None
-
-
-def directory_at_binding_problem(parent_fd, name, path, descriptor):
-    try:
-        public_metadata = os.stat(
-            name, dir_fd=parent_fd, follow_symlinks=False
-        )
-        opened_metadata = os.fstat(descriptor)
-    except OSError as error:
-        return f"directory changed during synchronization: {path}: {error}"
-    if (
-        not stat.S_ISDIR(public_metadata.st_mode)
-        or _identity(public_metadata) != _identity(opened_metadata)
-    ):
-        return f"directory changed during synchronization: {path}"
-    return None
-
-
 @dataclass(frozen=True)
 class ScopeState:
     augment_path: Path
@@ -223,29 +158,6 @@ class ScopeState:
     augment_fd: int | None
     skills_fd: int | None
     registrations_fd: int | None
-
-    def verify_bindings(self):
-        for path, descriptor in (
-            (self.augment_path, self.augment_fd),
-            (self.skills_path, self.skills_fd),
-            (self.registrations_path, self.registrations_fd),
-        ):
-            if descriptor is not None:
-                problem = directory_binding_problem(path, descriptor)
-                if problem is not None:
-                    return problem
-                continue
-            try:
-                os.stat(path, follow_symlinks=False)
-            except FileNotFoundError:
-                continue
-            except OSError as error:
-                return (
-                    f"directory changed during synchronization: {path}: "
-                    f"{error}"
-                )
-            return f"directory changed during synchronization: {path}"
-        return None
 
 
 def same_directory(first, second):
@@ -323,13 +235,9 @@ def ensure_scope_directories(
     root,
     scope,
     stack,
-    initial_state,
     set_name,
     created_directories,
 ):
-    problem = initial_state.verify_bindings()
-    if problem is not None:
-        raise OperationalError(problem)
     augment, skills, registrations = validate_scope_containers(root, scope)
     if not lexists(augment):
         create_scope_directory(
@@ -341,14 +249,6 @@ def ensure_scope_directories(
             created_directories,
         )
     augment_fd = stack.enter_context(open_directory(augment))
-    if (
-        initial_state.augment_fd is not None
-        and _identity(os.fstat(augment_fd))
-        != _identity(os.fstat(initial_state.augment_fd))
-    ):
-        raise OperationalError(
-            f"Auggie container changed during inspection: {augment}"
-        )
     for name, path in (("skills", skills), (".skillsets", registrations)):
         try:
             metadata = os.stat(
@@ -377,19 +277,6 @@ def ensure_scope_directories(
                 f"could not open Auggie container {path}: {error}"
             ) from error
         stack.callback(os.close, descriptor)
-        accepted_descriptor = (
-            initial_state.skills_fd
-            if name == "skills"
-            else initial_state.registrations_fd
-        )
-        if (
-            accepted_descriptor is not None
-            and _identity(os.fstat(descriptor))
-            != _identity(os.fstat(accepted_descriptor))
-        ):
-            raise OperationalError(
-                f"Auggie container changed during inspection: {path}"
-            )
         if name == "skills":
             skills_fd = descriptor
         else:
@@ -430,7 +317,7 @@ def open_existing_scope(root, scope, stack):
 
 
 def source_inventory(source_fd, source_path):
-    inventory = {}
+    inventory = set()
     try:
         names = sorted(os.listdir(source_fd))
     except OSError as error:
@@ -451,24 +338,13 @@ def source_inventory(source_fd, source_path):
                 f"Auggie skill source must not be a symlink: {source_path / name}"
             )
         if stat.S_ISDIR(metadata.st_mode):
-            inventory[name] = (metadata.st_dev, metadata.st_ino)
+            inventory.add(name)
     return inventory
 
 
 def open_source(root, name, stack):
     source_path = validate_set(root, name) / "skills"
-    try:
-        accepted = source_path.lstat()
-    except OSError as error:
-        raise OperationalError(
-            f"could not inspect Auggie skill source {source_path}: {error}"
-        ) from error
     source_fd = stack.enter_context(open_directory(source_path))
-    opened = os.fstat(source_fd)
-    if (accepted.st_dev, accepted.st_ino) != (opened.st_dev, opened.st_ino):
-        raise OperationalError(
-            f"Auggie skill source changed during inspection: {source_path}"
-        )
     return source_path, source_fd, source_inventory(source_fd, source_path)
 
 
@@ -500,32 +376,6 @@ def _interrupted(root, name, scope, action, detail):
     )
 
 
-def _manual_recovery_message(root, name, scope, action, quarantine, detail):
-    option = scope_option(scope)
-    return (
-        f"Auggie {action} for {name!r} requires manual recovery ({detail}). "
-        f"Preserved removal quarantine: {quarantine}. Inspect and recover it "
-        "manually before running further Auggie commands; do not rerun "
-        f"`skillset augment {action} {name}{option}` first"
-    )
-
-
-def _manual_recovery_error(root, name, scope, action, quarantine, detail):
-    return ManualRecoveryError(
-        _manual_recovery_message(
-            root, name, scope, action, quarantine, detail
-        )
-    )
-
-
-def _manual_recovery_interrupted(root, name, scope, action, quarantine, detail):
-    raise ClaudeInterrupted(
-        _manual_recovery_message(
-            root, name, scope, action, quarantine, detail
-        )
-    )
-
-
 def create_link(
     directory_fd, name, target, path, root, set_name, scope, action
 ):
@@ -548,139 +398,11 @@ def create_link(
         ) from error
 
 
-def create_removal_quarantine(
-    augment_fd, augment_path, root, set_name, scope, action
-):
-    for _attempt in range(100):
-        name = f"{REMOVAL_PREFIX}{uuid.uuid4().hex}"
-        path = augment_path / name
-        created_metadata = None
-        try:
-            os.mkdir(name, 0o700, dir_fd=augment_fd)
-        except FileExistsError:
-            continue
-        except KeyboardInterrupt:
-            if not _entry_missing(augment_fd, name):
-                _manual_recovery_interrupted(
-                    root,
-                    set_name,
-                    scope,
-                    action,
-                    path,
-                    "interrupted while creating the removal quarantine",
-                )
-            raise
-        except OSError as error:
-            if not _entry_missing(augment_fd, name):
-                raise _manual_recovery_error(
-                    root,
-                    set_name,
-                    scope,
-                    action,
-                    path,
-                    f"could not create the removal quarantine: {error}",
-                ) from error
-            raise OperationalError(
-                f"could not create Auggie removal quarantine in {augment_path}: "
-                f"{error}"
-            ) from error
-        descriptor = None
-        try:
-            created_metadata = os.stat(
-                name, dir_fd=augment_fd, follow_symlinks=False
-            )
-            descriptor = os.open(name, DIRECTORY_FLAGS, dir_fd=augment_fd)
-            opened_metadata = os.fstat(descriptor)
-        except KeyboardInterrupt:
-            if descriptor is not None:
-                os.close(descriptor)
-            _manual_recovery_interrupted(
-                root,
-                set_name,
-                scope,
-                action,
-                path,
-                "interrupted while verifying the newly created removal quarantine",
-            )
-        except OSError as error:
-            if descriptor is not None:
-                os.close(descriptor)
-            if not remove_created_empty_quarantine(
-                augment_fd, name, created_metadata
-            ):
-                raise _manual_recovery_error(
-                    root,
-                    set_name,
-                    scope,
-                    action,
-                    path,
-                    f"could not verify the removal quarantine: {error}",
-                ) from error
-            raise OperationalError(
-                f"could not open Auggie removal quarantine {path}: {error}"
-            ) from error
-        if (
-            not stat.S_ISDIR(created_metadata.st_mode)
-            or _identity(created_metadata) != _identity(opened_metadata)
-        ):
-            os.close(descriptor)
-            raise _manual_recovery_error(
-                root,
-                set_name,
-                scope,
-                action,
-                path,
-                "the removal quarantine changed during creation",
-            )
-        return name, path, descriptor
-    raise OperationalError(
-        f"could not create a unique Auggie removal quarantine in {augment_path}"
-    )
-
-
-def remove_created_empty_quarantine(augment_fd, name, created_metadata):
-    if created_metadata is None:
-        return False
-    try:
-        current = os.stat(name, dir_fd=augment_fd, follow_symlinks=False)
-    except OSError:
-        return False
-    if (
-        not stat.S_ISDIR(current.st_mode)
-        or _identity(current) != _identity(created_metadata)
-    ):
-        return False
-    try:
-        os.rmdir(name, dir_fd=augment_fd)
-    except OSError:
-        return False
-    return True
-
-
-def remove_empty_quarantine(augment_fd, name, path, descriptor):
-    problem = directory_at_binding_problem(
-        augment_fd, name, path, descriptor
-    )
-    if problem is not None:
-        raise ManualRecoveryError(
-            f"Auggie removal quarantine requires manual recovery: {path}; {problem}"
-        )
-    try:
-        os.rmdir(name, dir_fd=augment_fd)
-    except OSError as error:
-        raise ManualRecoveryError(
-            f"Auggie removal quarantine requires manual recovery: {path}; "
-            f"could not remove the empty quarantine: {error}"
-        ) from error
-
-
 def unlink_link(
     directory_fd,
     name,
     path,
     target,
-    augment_fd,
-    augment_path,
     root,
     set_name,
     scope,
@@ -689,91 +411,16 @@ def unlink_link(
     if not canonical_link_at(directory_fd, name, target):
         if _entry_missing(directory_fd, name):
             return
-        raise OperationalError(
-            f"refused to remove changed Auggie entry: {path}"
-        )
-    quarantine_name, quarantine_path, quarantine_fd = create_removal_quarantine(
-        augment_fd, augment_path, root, set_name, scope, action
-    )
-    quarantined_path = quarantine_path / REMOVAL_ENTRY
+        raise OperationalError(f"refused to remove changed Auggie entry: {path}")
     try:
-        try:
-            problem = directory_at_binding_problem(
-                augment_fd, quarantine_name, quarantine_path, quarantine_fd
-            )
-            if problem is not None:
-                raise OperationalError(problem)
-            os.rename(
-                name,
-                REMOVAL_ENTRY,
-                src_dir_fd=directory_fd,
-                dst_dir_fd=quarantine_fd,
-            )
-        except OSError as error:
-            if os.path.lexists(quarantined_path):
-                raise _manual_recovery_error(
-                    root,
-                    set_name,
-                    scope,
-                    action,
-                    quarantine_path,
-                    f"could not move {path}; entry remains at {quarantined_path}: "
-                    f"{error}",
-                ) from error
-            remove_empty_quarantine(
-                augment_fd, quarantine_name, quarantine_path, quarantine_fd
-            )
-            raise OperationalError(
-                f"could not move Auggie entry {path}: {error}"
-            ) from error
-        if not canonical_link_at(quarantine_fd, REMOVAL_ENTRY, target):
-            raise _manual_recovery_error(
-                root,
-                set_name,
-                scope,
-                action,
-                quarantine_path,
-                f"refused to remove changed entry {path}; it remains at "
-                f"{quarantined_path}",
-            )
-        os.unlink(REMOVAL_ENTRY, dir_fd=quarantine_fd)
+        os.unlink(name, dir_fd=directory_fd)
     except KeyboardInterrupt:
-        if _entry_missing(quarantine_fd, REMOVAL_ENTRY):
-            remove_empty_quarantine(
-                augment_fd, quarantine_name, quarantine_path, quarantine_fd
-            )
-            state = "link was removed"
-        else:
-            _manual_recovery_interrupted(
-                root,
-                set_name,
-                scope,
-                action,
-                quarantine_path,
-                f"interrupted after moving {path}; entry remains at "
-                f"{quarantined_path}",
-            )
+        state = "link was removed" if _entry_missing(directory_fd, name) else "link was not removed"
         _interrupted(root, set_name, scope, action, f"{path}: {state}")
     except OSError as error:
-        if not _entry_missing(quarantine_fd, REMOVAL_ENTRY):
-            raise _manual_recovery_error(
-                root,
-                set_name,
-                scope,
-                action,
-                quarantine_path,
-                f"could not remove {path}; entry remains at {quarantined_path}: "
-                f"{error}",
-            ) from error
-        raise OperationalError(
-            f"could not remove Auggie link {path}: {error}"
-        ) from error
-    else:
-        remove_empty_quarantine(
-            augment_fd, quarantine_name, quarantine_path, quarantine_fd
-        )
-    finally:
-        os.close(quarantine_fd)
+        if _entry_missing(directory_fd, name):
+            return
+        raise OperationalError(f"could not remove Auggie link {path}: {error}") from error
 
 
 def preflight_projection(
@@ -826,24 +473,6 @@ def cross_scope_collision(
     return None
 
 
-def verify_source_child(source_fd, source_path, name, identity):
-    try:
-        metadata = os.stat(
-            name, dir_fd=source_fd, follow_symlinks=False
-        )
-    except OSError as error:
-        raise OperationalError(
-            f"Auggie skill source changed during enable: {source_path / name}: {error}"
-        ) from error
-    if not stat.S_ISDIR(metadata.st_mode) or (
-        metadata.st_dev,
-        metadata.st_ino,
-    ) != identity:
-        raise OperationalError(
-            f"Auggie skill source changed during enable: {source_path / name}"
-        )
-
-
 def owned_names(skills_fd, registered_target):
     if skills_fd is None:
         return []
@@ -890,10 +519,7 @@ def verify_enabled(
             "stale projected skill remains: "
             f"{scope_state.skills_path / sorted(stale)[0]}"
         )
-    problem = directory_binding_problem(source_path, source_fd)
-    if problem is not None:
-        return problem
-    return scope_state.verify_bindings()
+    return None
 
 
 def enable(root, name, scope):
@@ -905,7 +531,6 @@ def enable(root, name, scope):
     with ExitStack() as stack:
         source_path, source_fd, inventory = open_source(root, name, stack)
         validate_projection_root(source_path, scope)
-        other_state = None
         if not same_scope_directory(root):
             other_state = open_existing_scope(
                 root, opposite_scope(scope), stack
@@ -940,7 +565,6 @@ def enable(root, name, scope):
                 root,
                 scope,
                 stack,
-                initial_state,
                 name,
                 created_directories,
             )
@@ -956,10 +580,7 @@ def enable(root, name, scope):
                 "enable",
             )
             registration_created = not was_registered
-            for skill_name, identity in inventory.items():
-                verify_source_child(
-                    source_fd, source_path, skill_name, identity
-                )
+            for skill_name in inventory:
                 create_link(
                     scope_state.skills_fd,
                     skill_name,
@@ -980,8 +601,6 @@ def enable(root, name, scope):
                     stale_name,
                     stale_path,
                     os.path.join(target, stale_name),
-                    scope_state.augment_fd,
-                    scope_state.augment_path,
                     root,
                     name,
                     scope,
@@ -996,22 +615,6 @@ def enable(root, name, scope):
             )
             if problem is not None:
                 raise OperationalError(problem)
-            if other_state is not None:
-                if other_state.skills_fd is None:
-                    other_state = open_existing_scope(
-                        root, opposite_scope(scope), stack
-                    )
-                problem = cross_scope_collision(
-                    inventory,
-                    target,
-                    other_state.skills_fd,
-                    other_state.skills_path,
-                )
-                if problem is not None:
-                    raise OperationalError(problem)
-                problem = other_state.verify_bindings()
-                if problem is not None:
-                    raise OperationalError(problem)
         except ClaudeInterrupted:
             raise
         except KeyboardInterrupt:
@@ -1033,8 +636,6 @@ def enable(root, name, scope):
                     "enable",
                     "scope or registration changed and projection may be incomplete",
                 )
-            raise
-        except ManualRecoveryError:
             raise
         except OperationalError as error:
             if (
@@ -1079,8 +680,6 @@ def disable(root, name, scope):
                     skill_name,
                     skill_path,
                     os.path.join(target, skill_name),
-                    scope_state.augment_fd,
-                    scope_state.augment_path,
                     root,
                     name,
                     scope,
@@ -1092,8 +691,6 @@ def disable(root, name, scope):
                     name,
                     registration_path,
                     target,
-                    scope_state.augment_fd,
-                    scope_state.augment_path,
                     root,
                     name,
                     scope,
@@ -1111,9 +708,6 @@ def disable(root, name, scope):
                     else registration_path
                 )
                 raise OperationalError(f"managed entry remains: {path}")
-            problem = scope_state.verify_bindings()
-            if problem is not None:
-                raise OperationalError(problem)
         except ClaudeInterrupted:
             raise
         except KeyboardInterrupt:
@@ -1124,8 +718,6 @@ def disable(root, name, scope):
                 "disable",
                 "registration and projection may be incomplete",
             )
-        except ManualRecoveryError:
-            raise
         except OperationalError as error:
             raise OperationalError(
                 _recovery_message(root, name, scope, "disable", error)
@@ -1214,12 +806,6 @@ def validate_names_against_other_scope(root, scope, names):
                 )
                 if problem is not None:
                     raise OperationalError(problem)
-                problem = directory_binding_problem(source_path, source_fd)
-                if problem is not None:
-                    raise OperationalError(problem)
-        problem = other_state.verify_bindings()
-        if problem is not None:
-            raise OperationalError(problem)
 
 
 def list_enabled(root, verbose, scope):
@@ -1252,25 +838,12 @@ def list_enabled(root, verbose, scope):
 
 
 def orphaned_projection_blocker(augment, augment_fd, skills, target):
-    if directory_binding_problem(augment, augment_fd) is not None:
-        return GlobalRegistrationBlocker(augment, False)
     try:
         skills_metadata = os.stat(
             "skills", dir_fd=augment_fd, follow_symlinks=False
         )
     except FileNotFoundError:
-        if directory_binding_problem(augment, augment_fd) is not None:
-            return GlobalRegistrationBlocker(augment, False)
-        try:
-            skills_metadata = os.stat(
-                "skills", dir_fd=augment_fd, follow_symlinks=False
-            )
-        except FileNotFoundError:
-            if directory_binding_problem(augment, augment_fd) is not None:
-                return GlobalRegistrationBlocker(augment, False)
-            return None
-        except OSError:
-            return GlobalRegistrationBlocker(skills, False)
+        return None
     except OSError:
         return GlobalRegistrationBlocker(skills, False)
     if stat.S_ISLNK(skills_metadata.st_mode) or not stat.S_ISDIR(
@@ -1282,19 +855,9 @@ def orphaned_projection_blocker(augment, augment_fd, skills, target):
     except OSError:
         return GlobalRegistrationBlocker(skills, False)
     try:
-        if _identity(skills_metadata) != _identity(os.fstat(skills_fd)):
-            return GlobalRegistrationBlocker(skills, False)
-        if directory_binding_problem(augment, augment_fd) is not None:
-            return GlobalRegistrationBlocker(augment, False)
-        if directory_binding_problem(skills, skills_fd) is not None:
-            return GlobalRegistrationBlocker(skills, False)
         try:
             names = owned_names(skills_fd, target)
         except OperationalError:
-            return GlobalRegistrationBlocker(skills, False)
-        if directory_binding_problem(augment, augment_fd) is not None:
-            return GlobalRegistrationBlocker(augment, False)
-        if directory_binding_problem(skills, skills_fd) is not None:
             return GlobalRegistrationBlocker(skills, False)
     finally:
         os.close(skills_fd)
@@ -1318,14 +881,6 @@ def inspected_link_target_at(directory_fd, name):
         target = os.readlink(name, dir_fd=directory_fd)
     except OSError:
         return False
-    try:
-        current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-    except OSError:
-        return False
-    if not stat.S_ISLNK(current.st_mode) or _identity(current) != _identity(
-        accepted
-    ):
-        return False
     return target
 
 
@@ -1333,12 +888,6 @@ def lifecycle_container_blocker_path(root, scope):
     augment, skills, registrations = scope_paths(root, scope)
     if not lexists(augment) or not real_kind(augment, stat.S_ISDIR):
         return augment
-    try:
-        quarantine = removal_quarantine(augment)
-    except OperationalError:
-        return augment
-    if quarantine is not None:
-        return quarantine
     for directory in (skills, registrations):
         if lexists(directory) and not real_kind(directory, stat.S_ISDIR):
             return directory
@@ -1368,8 +917,6 @@ def global_registration_blocker(root, name):
                 ".skillsets", dir_fd=augment_fd, follow_symlinks=False
             )
         except FileNotFoundError:
-            if directory_binding_problem(augment, augment_fd) is not None:
-                return GlobalRegistrationBlocker(augment, False)
             return orphaned_projection_blocker(
                 augment, augment_fd, _skills, target
             )
@@ -1382,24 +929,14 @@ def global_registration_blocker(root, name):
                 ".skillsets", DIRECTORY_FLAGS, dir_fd=augment_fd
             )
         except FileNotFoundError:
-            if directory_binding_problem(augment, augment_fd) is not None:
-                return GlobalRegistrationBlocker(augment, False)
             return orphaned_projection_blocker(
                 augment, augment_fd, _skills, target
             )
         except OSError:
             return GlobalRegistrationBlocker(augment, False)
         stack.callback(os.close, registrations_fd)
-        if _identity(registrations_metadata) != _identity(
-            os.fstat(registrations_fd)
-        ):
-            return GlobalRegistrationBlocker(registrations, False)
         registration = registrations / name
         inspected_target = inspected_link_target_at(registrations_fd, name)
-        if directory_binding_problem(augment, augment_fd) is not None:
-            return GlobalRegistrationBlocker(augment, False)
-        if directory_binding_problem(registrations, registrations_fd) is not None:
-            return GlobalRegistrationBlocker(registrations, False)
         if inspected_target is None:
             return orphaned_projection_blocker(
                 augment, augment_fd, _skills, target

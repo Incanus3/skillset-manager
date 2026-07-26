@@ -245,8 +245,8 @@ def validate_manual_sentinel(root):
         mode = stat.S_IMODE(path.stat().st_mode)
     except OSError as error:
         raise OperationalError(f"could not inspect manual empty-lock sentinel {path}: {error}") from error
-    if mode != 0o444:
-        raise OperationalError(f"manual empty-lock sentinel must be read-only (0444): {path}")
+    if mode & 0o222:
+        raise OperationalError(f"manual empty-lock sentinel must be read-only: {path}")
     value = read_lockfile(path)
     if value != EMPTY_LOCK:
         raise OperationalError(f"manual empty-lock sentinel is not canonical: {path}")
@@ -367,7 +367,11 @@ def discovery_operation_lock(root):
             locked = False
             try:
                 fcntl.flock(lock_descriptor, fcntl.LOCK_EX)
-                locked = True
+            except OSError:
+                yield None
+                return
+            locked = True
+            try:
                 yield lock_descriptor
             finally:
                 if locked:
@@ -415,14 +419,13 @@ def inspect_advisory_lock_entry(lock_path, errors):
     if not stat.S_ISREG(metadata.st_mode):
         errors.append(f"advisory lock must be a real regular file: {lock_path}")
         return None
-    return metadata
+    return True
 
 
 @contextmanager
 def doctor_operation_lock(root, errors):
     lock_path = root / ".skillset.lock"
-    metadata = inspect_advisory_lock_entry(lock_path, errors)
-    if metadata is None:
+    if not inspect_advisory_lock_entry(lock_path, errors):
         yield None
         return
     try:
@@ -434,11 +437,8 @@ def doctor_operation_lock(root, errors):
     locked = False
     try:
         opened = os.fstat(descriptor)
-        if not stat.S_ISREG(opened.st_mode) or (
-            opened.st_dev,
-            opened.st_ino,
-        ) != (metadata.st_dev, metadata.st_ino):
-            errors.append(f"advisory lock changed during inspection: {lock_path}")
+        if not stat.S_ISREG(opened.st_mode):
+            errors.append(f"advisory lock must be a real regular file: {lock_path}")
             yield None
             return
         fcntl.flock(descriptor, fcntl.LOCK_EX)

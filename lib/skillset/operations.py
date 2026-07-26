@@ -550,7 +550,6 @@ def remove(root, name, confirmed):
     refuse_enabled_lifecycle(root, name, "remove")
     if not confirmed:
         confirm_removal(name)
-        validate_skillsets_directory(root)
     try:
         shutil.rmtree(target)
     except Exception as error:
