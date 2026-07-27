@@ -1,5 +1,7 @@
+import contextlib
 import errno
 import fcntl
+import io
 import json
 import os
 import re
@@ -10,6 +12,7 @@ import stat
 import struct
 import subprocess
 import tempfile
+import sys
 import termios
 import textwrap
 import time
@@ -18,6 +21,14 @@ from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+LIBRARY_ROOT = REPOSITORY_ROOT / "lib"
+sys.path.insert(0, str(LIBRARY_ROOT))
+
+from skillset import cli
+from skillset.cli import parser
+from skillset.errors import OperationalError
+from skillset.layout import validate_layout, validate_name
+
 SKILLSET = REPOSITORY_ROOT / "bin" / "skillset"
 EMPTY_LOCK = {"version": 3, "skills": {}, "dismissed": {}}
 
@@ -66,6 +77,102 @@ class SkillsetTests(unittest.TestCase):
             timeout=timeout,
             check=False,
         )
+
+    def run_cli_in_process(
+        self,
+        *arguments,
+        home=None,
+        cwd=None,
+        extra_environment=None,
+        input_text=None,
+    ):
+        original_environment = os.environ.copy()
+        original_directory = os.getcwd()
+        original_argv = sys.argv
+        original_stdin = sys.stdin
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        command = [str(SKILLSET), *arguments]
+        environment = self.environment(home, extra_environment)
+        try:
+            os.environ.clear()
+            os.environ.update(environment)
+            os.chdir(cwd or home or self.home)
+            sys.argv = ["skillset", *arguments]
+            sys.stdin = io.StringIO(input_text if input_text is not None else "")
+            sys.stdout = stdout
+            sys.stderr = stderr
+            try:
+                returncode = cli.main()
+            except SystemExit as error:
+                returncode = error.code
+            return subprocess.CompletedProcess(
+                command,
+                returncode,
+                stdout.getvalue(),
+                stderr.getvalue(),
+            )
+        finally:
+            os.environ.clear()
+            os.environ.update(original_environment)
+            os.chdir(original_directory)
+            sys.argv = original_argv
+            sys.stdin = original_stdin
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+
+    def run_import_probe(self, *arguments, home=None):
+        probe = r'''
+import contextlib
+import io
+import json
+import os
+import sys
+
+before_cli = set(sys.modules)
+from skillset import cli
+
+command = json.loads(os.environ["SKILLSET_IMPORT_PROBE_ARGUMENTS"])
+before = set(sys.modules)
+stdout = io.StringIO()
+stderr = io.StringIO()
+with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+    try:
+        sys.argv = ["skillset", *command]
+        returncode = cli.main()
+    except SystemExit as error:
+        returncode = error.code
+print(json.dumps({
+    "returncode": returncode,
+    "stdout": stdout.getvalue(),
+    "stderr": stderr.getvalue(),
+    "initial_modules": sorted(
+        name
+        for name in before - before_cli
+        if name.startswith("skillset.")
+    ),
+    "loaded_modules": sorted(
+        name
+        for name in set(sys.modules) - before
+        if name.startswith("skillset.")
+    ),
+}))
+'''
+        environment = self.environment(home)
+        environment["PYTHONPATH"] = str(LIBRARY_ROOT)
+        environment["SKILLSET_IMPORT_PROBE_ARGUMENTS"] = json.dumps(arguments)
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            cwd=home or self.home,
+            env=environment,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
 
     def run_cli_tty(
         self, *arguments, cwd=None, extra_environment=None, terminal_columns=None
@@ -347,6 +454,22 @@ class SkillsetTests(unittest.TestCase):
     def assert_refused(self, result):
         self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))
 
+    def assert_parser_rejects(self, arguments):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                parser().parse_args(list(arguments))
+        self.assertEqual(raised.exception.code, 2)
+
+    def assert_invalid_name(self, name):
+        with self.assertRaisesRegex(OperationalError, "invalid skillset name"):
+            validate_name(name)
+
+    def assert_invalid_layout_read_only(self, home):
+        before = self.filesystem_snapshot(home)
+        with self.assertRaises(OperationalError):
+            validate_layout(home / ".agents")
+        self.assertEqual(self.filesystem_snapshot(home), before)
+
     def doctor_findings(self, result, severity):
         prefix = f"skillset: {severity}:"
         self.assertNotIn(prefix, result.stdout)
@@ -416,6 +539,79 @@ class SkillsetTests(unittest.TestCase):
             },
         )
 
+    def test_in_process_cli_helper_restores_process_globals_after_parser_exit(self):
+        original_environment = os.environ.copy()
+        original_directory = os.getcwd()
+        original_argv = sys.argv
+        original_stdin = sys.stdin
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+
+        result = self.run_cli_in_process(
+            "unknown-command",
+            cwd=self.sandbox,
+            extra_environment={"SKILLSET_IN_PROCESS_TEST": "command"},
+        )
+
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("usage: skillset", result.stderr)
+        self.assertEqual(os.environ, original_environment)
+        self.assertEqual(os.getcwd(), original_directory)
+        self.assertIs(sys.argv, original_argv)
+        self.assertIs(sys.stdin, original_stdin)
+        self.assertIs(sys.stdout, original_stdout)
+        self.assertIs(sys.stderr, original_stderr)
+
+    def test_cli_module_imports_no_command_or_lock_modules(self):
+        result = self.run_import_probe("--help")
+
+        self.assertEqual(result["returncode"], 0)
+        self.assertFalse(
+            {
+                "skillset.augment",
+                "skillset.augment_discovery",
+                "skillset.claude",
+                "skillset.codex",
+                "skillset.completions",
+                "skillset.delegate",
+                "skillset.doctor",
+                "skillset.layout",
+                "skillset.metadata",
+                "skillset.operations",
+            }
+            & set(result["initial_modules"])
+        )
+
+    def test_help_and_parse_rejection_import_no_command_modules(self):
+        for arguments, expected_returncode in (
+            (("--help",), 0),
+            (("unknown",), 2),
+        ):
+            with self.subTest(arguments=arguments):
+                result = self.run_import_probe(*arguments)
+                self.assertEqual(result["returncode"], expected_returncode)
+                self.assertEqual(result["loaded_modules"], [])
+
+    def test_completions_imports_only_completion_emitter(self):
+        result = self.run_import_probe("completions", "bash")
+
+        self.assertEqual(result["returncode"], 0)
+        self.assertEqual(result["stderr"], "")
+        self.assertIn("complete", result["stdout"])
+        self.assertEqual(result["loaded_modules"], ["skillset.completions"])
+
+    def test_list_imports_only_list_implementation_and_lock_helpers(self):
+        self.initialize()
+
+        result = self.run_import_probe("list")
+
+        self.assertEqual(result["returncode"], 0)
+        self.assertEqual(result["stderr"], "")
+        self.assertEqual(
+            result["loaded_modules"],
+            ["skillset.layout", "skillset.metadata"],
+        )
+
     def test_scoped_command_help_describes_each_default(self):
         for integration, directory in (
             ("codex", ".codex"),
@@ -426,7 +622,7 @@ class SkillsetTests(unittest.TestCase):
                 with self.subTest(
                     integration=integration, command=command
                 ):
-                    result = self.run_cli(
+                    result = self.run_cli_in_process(
                         integration, command, "--help"
                     )
                     self.assertEqual(
@@ -437,7 +633,7 @@ class SkillsetTests(unittest.TestCase):
                         result.stdout,
                     )
             with self.subTest(integration=integration, command="list"):
-                result = self.run_cli(integration, "list", "--help")
+                result = self.run_cli_in_process(integration, "list", "--help")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn(f"~/{directory} directory", result.stdout)
                 self.assertNotIn(
@@ -477,8 +673,8 @@ class SkillsetTests(unittest.TestCase):
         before = self.filesystem_snapshot(self.home)
         for shell in ("bash", "zsh", "fish"):
             with self.subTest(shell=shell):
-                first = self.run_cli("completions", shell)
-                second = self.run_cli("completions", shell)
+                first = self.run_cli_in_process("completions", shell)
+                second = self.run_cli_in_process("completions", shell)
                 self.assertEqual(first.returncode, 0, first.stderr)
                 self.assertEqual(first.stderr, "")
                 self.assertEqual(first.stdout, second.stdout)
@@ -674,67 +870,7 @@ printf 'augment-skills-list-local:%s\n' "${COMPREPLY[*]}"'''
         generated = self.run_cli("completions", "fish")
         script = self.sandbox / "skillset.fish"
         script.write_text(generated.stdout, encoding="utf-8")
-        environment = self.environment(extra={
-            "PATH": f"{REPOSITORY_ROOT / 'bin'}:{os.environ.get('PATH', '')}"
-        })
-
-        def candidates(commandline):
-            result = subprocess.run(
-                [fish, "-c", "source $argv[1]; complete -C $argv[2]", str(script), commandline],
-                env=environment,
-                text=True,
-                capture_output=True,
-                check=False,
-            )
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(result.stderr, "")
-            return [line.split("\t", 1)[0] for line in result.stdout.splitlines()]
-
-        self.assertIn("show", candidates("skillset sh"))
-        self.assertEqual(candidates("skillset use d"), ["default", "demo"])
-        self.assertEqual(candidates("skillset create --from d"), ["default", "demo"])
-        self.assertIn("commandline -xpc", generated.stdout)
-        self.assertNotIn("commandline -opc", generated.stdout)
-        self.assertEqual(candidates("skillset rename default n"), [])
-        self.assertEqual(candidates("skillset skills l"), [])
-        self.assertEqual(
-            candidates("skillset codex "),
-            ["disable", "enable", "list", "-h", "--help"],
-        )
-        self.assertEqual(candidates("skillset codex e"), ["enable"])
-        self.assertEqual(candidates("skillset codex enable d"), ["default", "demo"])
-        self.assertEqual(candidates("skillset codex list --v"), ["--verbose"])
-        self.assertEqual(candidates("skillset claude e"), ["enable"])
-        self.assertEqual(candidates("skillset claude enable d"), ["default", "demo"])
-        self.assertEqual(candidates("skillset claude list --v"), ["--verbose"])
-        self.assertEqual(
-            candidates("skillset augment "),
-            ["disable", "enable", "list", "skills", "-h", "--help"],
-        )
-        self.assertEqual(candidates("skillset augment e"), ["enable"])
-        self.assertEqual(
-            candidates("skillset augment enable --local d"), ["default", "demo"]
-        )
-        self.assertEqual(
-            candidates("skillset augment disable --global d"), ["default", "demo"]
-        )
-        self.assertEqual(candidates("skillset augment enable --l"), ["--local"])
-        self.assertEqual(candidates("skillset augment list --v"), ["--verbose"])
-        self.assertEqual(candidates("skillset augment list --g"), ["--global"])
-        self.assertEqual(candidates("skillset augment list --l"), ["--local"])
-        self.assertEqual(
-            candidates("skillset augment skills "), ["list", "-h", "--help"]
-        )
-        self.assertEqual(candidates("skillset augment skills l"), ["list"])
-        self.assertEqual(
-            candidates("skillset augment skills list --v"), ["--verbose"]
-        )
-        self.assertEqual(
-            set(candidates("skillset augment skills list ")),
-            {"-h", "--help", "-v", "--verbose", "-g", "--global", "-l", "--local"},
-        )
-
-        for commandline, options in {
+        completion_option_cases = {
             "skillset ": ("-h", "--help"),
             "skillset init ": ("-h", "--help"),
             "skillset create ": ("-h", "--help", "-f", "--from", "--manual", "--use"),
@@ -760,9 +896,116 @@ printf 'augment-skills-list-local:%s\n' "${COMPREPLY[*]}"'''
             "skillset show ": ("-h", "--help"),
             "skillset doctor ": ("-h", "--help", "--fix"),
             "skillset completions ": ("-h", "--help"),
-        }.items():
+        }
+        stub_directory = self.sandbox / "completion-list-bin"
+        stub_directory.mkdir()
+        stub = stub_directory / "skillset"
+        stub.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = list ]; then\n"
+            "    printf '%s\\n' '* default' 'demo'\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        stub_environment = self.environment(extra={
+            "PATH": f"{stub_directory}:{os.environ.get('PATH', '')}",
+        })
+        real_environment = self.environment(extra={
+            "PATH": f"{REPOSITORY_ROOT / 'bin'}:{os.environ.get('PATH', '')}"
+        })
+
+        def batch_candidates(commandlines, environment):
+            driver = r'''source $argv[1]
+while read --local commandline
+    printf '\x1eBEGIN\x1e\n'
+    complete -C "$commandline"
+    printf '\x1eEND\x1e\n'
+end'''
+            result = subprocess.run(
+                [fish, "-c", driver, str(script)],
+                env=environment,
+                input="\n".join(commandlines) + "\n",
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stderr, "")
+            frame = re.compile(r"\x1eBEGIN\x1e\n(.*?)\x1eEND\x1e\n", re.DOTALL)
+            outputs = frame.findall(result.stdout)
+            self.assertEqual(frame.sub("", result.stdout), "", result.stdout)
+            self.assertEqual(len(outputs), len(commandlines), result.stdout)
+            return {
+                commandline: [line.split("\t", 1)[0] for line in output.splitlines()]
+                for commandline, output in zip(commandlines, outputs, strict=True)
+            }
+
+        static_commandlines = (
+            "skillset sh", "skillset use d", "skillset create --from d",
+            "skillset rename default n", "skillset skills l", "skillset codex ",
+            "skillset codex e", "skillset codex enable d", "skillset codex list --v",
+            "skillset claude e", "skillset claude enable d", "skillset claude list --v",
+            "skillset augment ", "skillset augment e",
+            "skillset augment disable --global d", "skillset augment enable --l",
+            "skillset augment list --v", "skillset augment list --g",
+            "skillset augment list --l", "skillset augment skills ",
+            "skillset augment skills l", "skillset augment skills list --v",
+            "skillset augment skills list ",
+            *completion_option_cases,
+        )
+        static_candidates = batch_candidates(static_commandlines, stub_environment)
+        real_candidates = batch_candidates(
+            ("skillset augment enable --local d",), real_environment
+        )
+
+        self.assertIn("show", static_candidates["skillset sh"])
+        self.assertEqual(static_candidates["skillset use d"], ["default", "demo"])
+        self.assertEqual(static_candidates["skillset create --from d"], ["default", "demo"])
+        self.assertIn("commandline -xpc", generated.stdout)
+        self.assertNotIn("commandline -opc", generated.stdout)
+        self.assertEqual(static_candidates["skillset rename default n"], [])
+        self.assertEqual(static_candidates["skillset skills l"], [])
+        self.assertEqual(
+            static_candidates["skillset codex "],
+            ["disable", "enable", "list", "-h", "--help"],
+        )
+        self.assertEqual(static_candidates["skillset codex e"], ["enable"])
+        self.assertEqual(static_candidates["skillset codex enable d"], ["default", "demo"])
+        self.assertEqual(static_candidates["skillset codex list --v"], ["--verbose"])
+        self.assertEqual(static_candidates["skillset claude e"], ["enable"])
+        self.assertEqual(static_candidates["skillset claude enable d"], ["default", "demo"])
+        self.assertEqual(static_candidates["skillset claude list --v"], ["--verbose"])
+        self.assertEqual(
+            static_candidates["skillset augment "],
+            ["disable", "enable", "list", "skills", "-h", "--help"],
+        )
+        self.assertEqual(static_candidates["skillset augment e"], ["enable"])
+        self.assertEqual(
+            real_candidates["skillset augment enable --local d"], ["default", "demo"]
+        )
+        self.assertEqual(
+            static_candidates["skillset augment disable --global d"], ["default", "demo"]
+        )
+        self.assertEqual(static_candidates["skillset augment enable --l"], ["--local"])
+        self.assertEqual(static_candidates["skillset augment list --v"], ["--verbose"])
+        self.assertEqual(static_candidates["skillset augment list --g"], ["--global"])
+        self.assertEqual(static_candidates["skillset augment list --l"], ["--local"])
+        self.assertEqual(
+            static_candidates["skillset augment skills "], ["list", "-h", "--help"]
+        )
+        self.assertEqual(static_candidates["skillset augment skills l"], ["list"])
+        self.assertEqual(
+            static_candidates["skillset augment skills list --v"], ["--verbose"]
+        )
+        self.assertEqual(
+            set(static_candidates["skillset augment skills list "]),
+            {"-h", "--help", "-v", "--verbose", "-g", "--global", "-l", "--local"},
+        )
+
+        for commandline, options in completion_option_cases.items():
             with self.subTest(commandline=commandline):
-                self.assertTrue(set(options).issubset(candidates(commandline)))
+                self.assertTrue(set(options).issubset(static_candidates[commandline]))
 
     def test_completion_name_lookup_discards_stdout_on_failure(self):
         stub_directory = self.sandbox / "failed-list-bin"
@@ -913,7 +1156,25 @@ _skillset'''
             generated.stdout, encoding="utf-8"
         )
 
-        def candidates(commandline, expected_output):
+        stub_directory = self.sandbox / "completion-list-bin"
+        stub_directory.mkdir()
+        stub = stub_directory / "skillset"
+        stub.write_text(
+            "#!/bin/sh\n"
+            "if [ \"$1\" = list ]; then\n"
+            "    printf '%s\\n' '* default' 'demo'\n"
+            "fi\n",
+            encoding="utf-8",
+        )
+        stub.chmod(0o755)
+        stub_environment = self.environment(extra={
+            "PATH": f"{stub_directory}:{os.environ.get('PATH', '')}",
+        })
+        real_environment = self.environment(extra={
+            "PATH": f"{REPOSITORY_ROOT / 'bin'}:{os.environ.get('PATH', '')}",
+        })
+
+        def batch_outputs(cases, environment):
             master, slave = os.openpty()
 
             def attach_controlling_terminal():
@@ -925,20 +1186,15 @@ _skillset'''
                 stdin=slave,
                 stdout=slave,
                 stderr=slave,
-                env=self.environment(extra={
-                    "PATH": f"{REPOSITORY_ROOT / 'bin'}:{os.environ.get('PATH', '')}",
-                }),
+                env=environment,
                 preexec_fn=attach_controlling_terminal,
             )
             os.close(slave)
-            self.addCleanup(
-                lambda: process.poll() is None and process.kill()
-            )
 
-            def read_until(marker):
+            def read_until(*markers):
                 output = b""
                 deadline = time.monotonic() + 5
-                while marker not in output:
+                while not any(marker in output for marker in markers):
                     ready, _write, _errors = select.select(
                         [master], [], [], max(0.0, deadline - time.monotonic())
                     )
@@ -946,6 +1202,7 @@ _skillset'''
                     output += os.read(master, 4096)
                 return output.decode("utf-8", "replace")
 
+            outputs = {}
             try:
                 setup = (
                     "PS1=$'\\x1e'\n"
@@ -955,19 +1212,27 @@ _skillset'''
                 )
                 os.write(master, setup.encode("utf-8"))
                 read_until(b"\x1e")
-                os.write(master, commandline.encode("utf-8") + b"\t\t")
-                output = read_until(expected_output.encode("utf-8"))
-                os.write(
-                    master,
-                    b"\x03exit\n",
-                )
+                for commandline, expected_output, _candidate in cases:
+                    os.write(master, commandline.encode("utf-8") + b"\t\t")
+                    outputs[commandline] = read_until(expected_output.encode("utf-8"))
+                    os.write(master, b"\x03")
+                    reset_output = read_until(b"\x07", b"\x1e")
+                    if "\x1e" not in reset_output:
+                        os.write(master, b"\n")
+                        read_until(b"\x1e")
+                os.write(master, b"exit 0\n")
             finally:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
                 os.close(master)
-                process.wait(timeout=5)
 
-            return output
+            self.assertEqual(process.returncode, 0)
+            return outputs
 
-        for commandline, expected_output, candidate in (
+        cases = (
             ("skillset augment e", "enable", "enable"),
             ("skillset augment --h", "--help", "--help"),
             ("skillset augment enable --local d", "default", "default"),
@@ -1001,9 +1266,22 @@ _skillset'''
                 None,
             ),
             ("skillset augment skills list -- --v", "\x07", None),
-        ):
+        )
+        real_cases = (
+            ("skillset augment enable --local d", "default", "default"),
+        )
+        static_cases = tuple(case for case in cases if case not in real_cases)
+        static_outputs = batch_outputs(static_cases, stub_environment)
+        real_outputs = batch_outputs(real_cases, real_environment)
+
+        for commandline, expected_output, candidate in cases:
             with self.subTest(commandline=commandline):
-                output = candidates(commandline, expected_output)
+                outputs = (
+                    real_outputs
+                    if commandline == "skillset augment enable --local d"
+                    else static_outputs
+                )
+                output = outputs[commandline]
                 if candidate is None:
                     self.assertNotIn("--verbose", output)
                 else:
@@ -1099,7 +1377,7 @@ _skillset'''
     def test_doctor_aggregates_pristine_home_without_creating_agents_root(self):
         before = self.filesystem_snapshot(self.home)
 
-        result = self.run_cli("doctor")
+        result = self.run_cli_in_process("doctor")
 
         self.assert_refused(result)
         self.assertEqual(result.stdout, "")
@@ -1111,7 +1389,7 @@ _skillset'''
         self.root.mkdir()
         before = self.filesystem_snapshot(self.home)
 
-        result = self.run_cli("doctor")
+        result = self.run_cli_in_process("doctor")
 
         self.assert_refused(result)
         self.assertEqual(result.stdout, "")
@@ -1596,7 +1874,7 @@ _skillset'''
         (self.root / ".skillset.lock").write_text("", encoding="utf-8")
         before = self.filesystem_snapshot(self.home)
 
-        result = self.run_cli("doctor")
+        result = self.run_cli_in_process("doctor")
 
         self.assert_refused(result)
         errors = "\n".join(self.doctor_findings(result, "error")).lower()
@@ -1633,7 +1911,7 @@ _skillset'''
         (skillsets / "linked").symlink_to(external, target_is_directory=True)
         before = self.filesystem_snapshot(self.home)
 
-        result = self.run_cli("doctor")
+        result = self.run_cli_in_process("doctor")
 
         self.assert_refused(result)
         error_lines = self.doctor_findings(result, "error")
@@ -1695,7 +1973,10 @@ _skillset'''
                     lock_path.mkdir()
                 before = self.filesystem_snapshot(home)
 
-                result = self.run_cli(
+                runner = (
+                    self.run_cli_in_process if kind == "directory" else self.run_cli
+                )
+                result = runner(
                     "doctor", home=home, extra_environment=fault
                 )
 
@@ -1753,7 +2034,7 @@ _skillset'''
                 mutate(root)
                 before = self.filesystem_snapshot(home)
 
-                result = self.run_cli("doctor", home=home)
+                result = self.run_cli_in_process("doctor", home=home)
 
                 self.assert_refused(result)
                 errors = "\n".join(
@@ -1797,7 +2078,7 @@ _skillset'''
         )
         before = self.filesystem_snapshot(self.home)
 
-        result = self.run_cli("doctor")
+        result = self.run_cli_in_process("doctor")
 
         self.assert_refused(result)
         errors = self.doctor_findings(result, "error")
@@ -1825,7 +2106,7 @@ _skillset'''
         )
         before = self.filesystem_snapshot(self.home)
 
-        result = self.run_cli("doctor")
+        result = self.run_cli_in_process("doctor")
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         self.assertEqual(self.doctor_findings(result, "error"), [])
@@ -1845,7 +2126,7 @@ _skillset'''
         self.make_set(self.root, unsafe_name)
         before = self.filesystem_snapshot(self.home)
 
-        result = self.run_cli("doctor")
+        result = self.run_cli_in_process("doctor")
 
         self.assert_refused(result)
         self.assertEqual(result.stdout, "")
@@ -1889,7 +2170,7 @@ _skillset'''
         )
         before = self.filesystem_snapshot(self.home)
 
-        result = self.run_cli("doctor")
+        result = self.run_cli_in_process("doctor")
 
         self.assert_refused(result)
         errors = "\n".join(self.doctor_findings(result, "error")).lower()
@@ -2046,7 +2327,7 @@ _skillset'''
         self.make_set(self.root, "zeta")
         self.make_set(self.root, "alpha")
 
-        result = self.run_cli("list")
+        result = self.run_cli_in_process("list")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "alpha\n* middle\nzeta\n")
@@ -2060,8 +2341,8 @@ _skillset'''
         (codex_skills / "unmanaged").mkdir()
 
         enabled = self.run_cli("codex", "enable", "personal")
-        listed = self.run_cli("codex", "list")
-        verbose = self.run_cli("codex", "list", "--verbose")
+        listed = self.run_cli_in_process("codex", "list")
+        verbose = self.run_cli_in_process("codex", "list", "--verbose")
 
         link = codex_skills / "personal"
         self.assertEqual(enabled.returncode, 0, enabled.stderr)
@@ -2077,10 +2358,10 @@ _skillset'''
             "  [g] personal | (no skills)\n",
         )
 
-        enabled_active = self.run_cli("codex", "enable", "default")
-        listed_active = self.run_cli("codex", "list")
-        disabled = self.run_cli("codex", "disable", "personal")
-        after_disable = self.run_cli("codex", "list")
+        enabled_active = self.run_cli_in_process("codex", "enable", "default")
+        listed_active = self.run_cli_in_process("codex", "list")
+        disabled = self.run_cli_in_process("codex", "disable", "personal")
+        after_disable = self.run_cli_in_process("codex", "list")
 
         self.assertEqual(enabled_active.returncode, 0, enabled_active.stderr)
         self.assertEqual(listed_active.stdout, "[g] default\n[g] personal\n")
@@ -2099,11 +2380,11 @@ _skillset'''
 
         for arguments in (("codex", "enable", "default"), ("codex", "disable", "default")):
             with self.subTest(arguments=arguments):
-                result = self.run_cli(*arguments)
+                result = self.run_cli_in_process(*arguments)
                 self.assert_refused(result)
                 self.assertEqual(self.filesystem_snapshot(self.home), before)
 
-        listed = self.run_cli("codex", "list")
+        listed = self.run_cli_in_process("codex", "list")
         self.assertEqual(listed.returncode, 0, listed.stderr)
         self.assertEqual(listed.stdout, "")
 
@@ -2114,8 +2395,8 @@ _skillset'''
         link = codex_skills / "default"
         link.symlink_to(str(self.root / "skillsets" / "default" / "skills") + "/")
 
-        listed = self.run_cli("codex", "list")
-        disabled = self.run_cli("codex", "disable", "default")
+        listed = self.run_cli_in_process("codex", "list")
+        disabled = self.run_cli_in_process("codex", "disable", "default")
 
         self.assertEqual(listed.returncode, 0, listed.stderr)
         self.assertEqual(listed.stdout, "[g] default\n")
@@ -2128,14 +2409,14 @@ _skillset'''
         project = self.sandbox / "project"
         project.mkdir()
 
-        global_enabled = self.run_cli("codex", "enable", "default")
-        local_enabled = self.run_cli(
+        global_enabled = self.run_cli_in_process("codex", "enable", "default")
+        local_enabled = self.run_cli_in_process(
             "codex", "enable", "-l", "personal", cwd=project
         )
-        global_list = self.run_cli("codex", "list", "-g")
-        local_list = self.run_cli("codex", "list", "-l", cwd=project)
-        combined_list = self.run_cli("codex", "list", cwd=project)
-        local_verbose = self.run_cli(
+        global_list = self.run_cli_in_process("codex", "list", "-g")
+        local_list = self.run_cli_in_process("codex", "list", "-l", cwd=project)
+        combined_list = self.run_cli_in_process("codex", "list", cwd=project)
+        local_verbose = self.run_cli_in_process(
             "codex", "list", "--local", "--verbose", cwd=project
         )
 
@@ -2152,7 +2433,7 @@ _skillset'''
             "  ---------|------------\n"
             "  personal | (no skills)\n",
         )
-        local_disabled = self.run_cli(
+        local_disabled = self.run_cli_in_process(
             "codex", "disable", "personal", "-l", cwd=project
         )
         self.assertEqual(local_disabled.returncode, 0, local_disabled.stderr)
@@ -2164,9 +2445,9 @@ _skillset'''
         self.make_set(self.root, "personal")
         project = self.sandbox / "project-colored"
         project.mkdir()
-        self.assertEqual(self.run_cli("codex", "enable", "default").returncode, 0)
+        self.assertEqual(self.run_cli_in_process("codex", "enable", "default").returncode, 0)
         self.assertEqual(
-            self.run_cli("codex", "enable", "personal", "-l", cwd=project).returncode,
+            self.run_cli_in_process("codex", "enable", "personal", "-l", cwd=project).returncode,
             0,
         )
 
@@ -2182,11 +2463,11 @@ _skillset'''
     def test_codex_enabled_skillsets_must_be_disabled_before_rename_or_remove(self):
         self.initialize()
         self.make_set(self.root, "personal")
-        self.assertEqual(self.run_cli("codex", "enable", "personal").returncode, 0)
+        self.assertEqual(self.run_cli_in_process("codex", "enable", "personal").returncode, 0)
         before = self.filesystem_snapshot(self.home)
 
-        renamed = self.run_cli("rename", "personal", "renamed")
-        removed = self.run_cli("remove", "personal", "--yes")
+        renamed = self.run_cli_in_process("rename", "personal", "renamed")
+        removed = self.run_cli_in_process("remove", "personal", "--yes")
 
         self.assert_refused(renamed)
         self.assert_refused(removed)
@@ -2205,8 +2486,8 @@ _skillset'''
         (skills / "ignored.txt").write_text("not a skill directory\n")
 
         enabled = self.run_cli("augment", "enable", "personal")
-        listed = self.run_cli("augment", "list")
-        verbose = self.run_cli("augment", "list", "--verbose")
+        listed = self.run_cli_in_process("augment", "list")
+        verbose = self.run_cli_in_process("augment", "list", "--verbose")
 
         augment = self.home / ".augment"
         registration = augment / ".skillsets" / "personal"
@@ -2236,8 +2517,8 @@ _skillset'''
         (skills / "ignored.txt").write_text("not a skill directory\n")
 
         enabled = self.run_cli("claude", "enable", "personal")
-        listed = self.run_cli("claude", "list")
-        verbose = self.run_cli("claude", "list", "--verbose")
+        listed = self.run_cli_in_process("claude", "list")
+        verbose = self.run_cli_in_process("claude", "list", "--verbose")
 
         claude = self.home / ".claude"
         registration = claude / ".skillsets" / "personal"
@@ -2269,7 +2550,9 @@ _skillset'''
         project = self.sandbox / "project-claude"
         project.mkdir()
 
-        first = self.run_cli("claude", "enable", "personal", "-l", cwd=project)
+        first = self.run_cli_in_process(
+            "claude", "enable", "personal", "-l", cwd=project
+        )
         local = project / ".claude"
         registration = local / ".skillsets" / "personal"
         alpha_link = local / "skills" / "alpha"
@@ -2278,7 +2561,7 @@ _skillset'''
             path: path.lstat().st_ino
             for path in (registration, alpha_link, beta_link)
         }
-        second = self.run_cli(
+        second = self.run_cli_in_process(
             "claude", "enable", "--local", "personal", cwd=project
         )
 
@@ -2294,12 +2577,16 @@ _skillset'''
             description: Gamma
         """)
         shutil.rmtree(beta)
-        reconciled = self.run_cli(
+        reconciled = self.run_cli_in_process(
             "claude", "enable", "personal", "--local", cwd=project
         )
-        global_list = self.run_cli("claude", "list", "--global", cwd=project)
-        local_list = self.run_cli("claude", "list", "--local", cwd=project)
-        combined = self.run_cli("claude", "list", cwd=project)
+        global_list = self.run_cli_in_process(
+            "claude", "list", "--global", cwd=project
+        )
+        local_list = self.run_cli_in_process(
+            "claude", "list", "--local", cwd=project
+        )
+        combined = self.run_cli_in_process("claude", "list", cwd=project)
 
         self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
         self.assertEqual(os.readlink(alpha_link), str(alpha))
@@ -2316,17 +2603,18 @@ _skillset'''
         project = self.sandbox / "claude-overlap"
         project.mkdir()
         self.assertEqual(
-            self.run_cli("claude", "enable", "default").returncode, 0
+            self.run_cli_in_process("claude", "enable", "default").returncode,
+            0,
         )
         self.assertEqual(
-            self.run_cli(
+            self.run_cli_in_process(
                 "claude", "enable", "default", "--local", cwd=project
             ).returncode,
             0,
         )
 
-        combined = self.run_cli("claude", "list", cwd=project)
-        from_home = self.run_cli("claude", "list", cwd=self.home)
+        combined = self.run_cli_in_process("claude", "list", cwd=project)
+        from_home = self.run_cli_in_process("claude", "list", cwd=self.home)
 
         self.assertEqual(
             combined.stdout, "[g] default\n[l] default\n"
@@ -2343,11 +2631,11 @@ _skillset'''
         root = self.initialize(home=alias_home)
         source = root / "skillsets" / "default" / "skills"
         self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
-        enabled = self.run_cli(
+        enabled = self.run_cli_in_process(
             "claude", "enable", "default", home=alias_home
         )
 
-        listed = self.run_cli(
+        listed = self.run_cli_in_process(
             "claude", "list", home=alias_home, cwd=physical_home
         )
 
@@ -2368,7 +2656,7 @@ _skillset'''
         global_root.symlink_to(local_root, target_is_directory=True)
         before = self.filesystem_snapshot(self.sandbox)
 
-        result = self.run_cli(
+        result = self.run_cli_in_process(
             "claude",
             "enable",
             "default",
@@ -2405,7 +2693,7 @@ _skillset'''
                 project = self.sandbox / f"claude-cross-scope-project-{index}"
                 project.mkdir()
                 if first_scope == "global":
-                    first = self.run_cli(
+                    first = self.run_cli_in_process(
                         "claude",
                         "enable",
                         "default",
@@ -2413,7 +2701,7 @@ _skillset'''
                         cwd=project,
                     )
                     before = self.filesystem_snapshot(home)
-                    refused = self.run_cli(
+                    refused = self.run_cli_in_process(
                         "claude",
                         "enable",
                         "project",
@@ -2426,7 +2714,7 @@ _skillset'''
                         self.filesystem_snapshot(home), before
                     )
                 else:
-                    first = self.run_cli(
+                    first = self.run_cli_in_process(
                         "claude",
                         "enable",
                         "project",
@@ -2435,7 +2723,7 @@ _skillset'''
                         cwd=project,
                     )
                     before = self.filesystem_snapshot(project)
-                    refused = self.run_cli(
+                    refused = self.run_cli_in_process(
                         "claude",
                         "enable",
                         "default",
@@ -2474,7 +2762,7 @@ _skillset'''
         elsewhere = self.sandbox / "claude-cross-scope-list-elsewhere"
         project.mkdir()
         elsewhere.mkdir()
-        local_enabled = self.run_cli(
+        local_enabled = self.run_cli_in_process(
             "claude",
             "enable",
             "project",
@@ -2482,7 +2770,7 @@ _skillset'''
             home=home,
             cwd=project,
         )
-        global_enabled = self.run_cli(
+        global_enabled = self.run_cli_in_process(
             "claude",
             "enable",
             "default",
@@ -2498,7 +2786,7 @@ _skillset'''
             ("claude", "list", "--local"),
         ):
             with self.subTest(arguments=arguments):
-                listed = self.run_cli(
+                listed = self.run_cli_in_process(
                     *arguments,
                     home=home,
                     cwd=project,
@@ -2534,7 +2822,9 @@ _skillset'''
                     collision.symlink_to("/tmp/unrelated")
                 before = self.filesystem_snapshot(home)
 
-                result = self.run_cli("claude", "enable", "default", home=home)
+                result = self.run_cli_in_process(
+                    "claude", "enable", "default", home=home
+                )
 
                 self.assert_refused(result)
                 self.assertEqual(self.filesystem_snapshot(home), before)
@@ -2549,7 +2839,7 @@ _skillset'''
         (source / "linked").symlink_to(self.sandbox)
         before = self.filesystem_snapshot(home)
 
-        result = self.run_cli("claude", "enable", "default", home=home)
+        result = self.run_cli_in_process("claude", "enable", "default", home=home)
 
         self.assert_refused(result)
         self.assertIn("must not be a symlink", result.stderr)
@@ -2570,7 +2860,7 @@ _skillset'''
                 working_directory = alpha if nested else source
                 before = self.filesystem_snapshot(home)
 
-                result = self.run_cli(
+                result = self.run_cli_in_process(
                     "claude",
                     "enable",
                     "default",
@@ -2605,7 +2895,7 @@ _skillset'''
         )
         before = self.filesystem_snapshot(physical_home)
 
-        result = self.run_cli(
+        result = self.run_cli_in_process(
             "claude",
             "enable",
             "default",
@@ -2629,15 +2919,15 @@ _skillset'''
             name: alpha
             description: Alpha
         """)
-        enabled = self.run_cli("claude", "enable", "default")
+        enabled = self.run_cli_in_process("claude", "enable", "default")
         self.assertEqual(enabled.returncode, 0, enabled.stderr)
         claude_skills = self.home / ".claude" / "skills"
         alias = claude_skills / "alpha-alias"
         alias.symlink_to(alpha)
 
         shutil.rmtree(alpha)
-        reconciled = self.run_cli("claude", "enable", "default")
-        disabled = self.run_cli("claude", "disable", "default")
+        reconciled = self.run_cli_in_process("claude", "enable", "default")
+        disabled = self.run_cli_in_process("claude", "disable", "default")
 
         self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
         self.assertFalse(os.path.lexists(claude_skills / "alpha"))
@@ -2661,7 +2951,7 @@ _skillset'''
         adopted.symlink_to(str(alpha) + "///")
         inode = adopted.lstat().st_ino
 
-        enabled = self.run_cli("claude", "enable", "default")
+        enabled = self.run_cli_in_process("claude", "enable", "default")
 
         self.assertEqual(enabled.returncode, 0, enabled.stderr)
         self.assertEqual(adopted.lstat().st_ino, inode)
@@ -2670,12 +2960,13 @@ _skillset'''
         )
 
         self.assertEqual(
-            self.run_cli("claude", "disable", "default").returncode, 0
+            self.run_cli_in_process("claude", "disable", "default").returncode,
+            0,
         )
         interior = claude_skills / "alpha"
         interior.symlink_to(str(source) + "/./alpha")
         before = self.filesystem_snapshot(self.home)
-        refused = self.run_cli("claude", "enable", "default")
+        refused = self.run_cli_in_process("claude", "enable", "default")
         self.assert_refused(refused)
         self.assertEqual(self.filesystem_snapshot(self.home), before)
 
@@ -2686,13 +2977,15 @@ _skillset'''
         self.write_skill(first, "alpha", "name: alpha\ndescription: Alpha")
         self.write_skill(second, "beta", "name: beta\ndescription: Beta")
         self.assertEqual(
-            self.run_cli("claude", "enable", "first").returncode, 0
+            self.run_cli_in_process("claude", "enable", "first").returncode,
+            0,
         )
         self.assertEqual(
-            self.run_cli("claude", "enable", "second").returncode, 0
+            self.run_cli_in_process("claude", "enable", "second").returncode,
+            0,
         )
         self.assertEqual(
-            self.run_cli("claude", "list").stdout,
+            self.run_cli_in_process("claude", "list").stdout,
             "[g] first\n[g] second\n",
         )
 
@@ -2701,7 +2994,7 @@ _skillset'''
             description: Conflicting directory name
         """)
         before = self.filesystem_snapshot(self.home / ".claude")
-        refused = self.run_cli("claude", "enable", "second")
+        refused = self.run_cli_in_process("claude", "enable", "second")
         self.assert_refused(refused)
         self.assertEqual(
             self.filesystem_snapshot(self.home / ".claude"), before
@@ -2714,11 +3007,12 @@ _skillset'''
         source = personal / "skills"
         self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
         self.assertEqual(
-            self.run_cli("claude", "enable", "personal").returncode, 0
+            self.run_cli_in_process("claude", "enable", "personal").returncode,
+            0,
         )
         shutil.rmtree(personal)
 
-        disabled = self.run_cli("claude", "disable", "personal")
+        disabled = self.run_cli_in_process("claude", "disable", "personal")
 
         self.assertEqual(disabled.returncode, 0, disabled.stderr)
         self.assertFalse(
@@ -3143,7 +3437,7 @@ _skillset'''
         (registrations / "Not-Ours").write_text("ignored\n")
         before = self.filesystem_snapshot(self.home)
 
-        result = self.run_cli("claude", "list")
+        result = self.run_cli_in_process("claude", "list")
 
         self.assert_refused(result)
         self.assertIn("noncanonical Claude Code registration", result.stderr)
@@ -3154,25 +3448,27 @@ _skillset'''
         self.initialize()
         self.make_set(self.root, "personal")
         self.assertEqual(
-            self.run_cli("claude", "enable", "personal").returncode, 0
+            self.run_cli_in_process("claude", "enable", "personal").returncode,
+            0,
         )
         before = self.filesystem_snapshot(self.home)
         for arguments in (
             ("rename", "personal", "renamed"),
             ("remove", "personal", "--yes"),
         ):
-            result = self.run_cli(*arguments)
+            result = self.run_cli_in_process(*arguments)
             self.assert_refused(result)
             self.assertIn("Claude Code-enabled", result.stderr)
             self.assertEqual(self.filesystem_snapshot(self.home), before)
 
         self.assertEqual(
-            self.run_cli("claude", "disable", "personal").returncode, 0
+            self.run_cli_in_process("claude", "disable", "personal").returncode,
+            0,
         )
         shutil.rmtree(self.home / ".claude")
         (self.home / ".claude").symlink_to(self.sandbox)
         before = self.filesystem_snapshot(self.home)
-        blocked = self.run_cli("rename", "personal", "renamed")
+        blocked = self.run_cli_in_process("rename", "personal", "renamed")
         self.assert_refused(blocked)
         self.assertIn("cannot be verified", blocked.stderr)
         self.assertEqual(self.filesystem_snapshot(self.home), before)
@@ -3198,7 +3494,7 @@ _skillset'''
                     ("rename", name, f"{name}-renamed"),
                     ("remove", name, "--yes"),
                 ):
-                    result = self.run_cli(*arguments)
+                    result = self.run_cli_in_process(*arguments)
                     self.assert_refused(result)
                     self.assertIn(
                         f"cannot be verified at {registration}",
@@ -3217,7 +3513,8 @@ _skillset'''
         self.initialize()
         self.make_set(self.root, "personal")
         self.assertEqual(
-            self.run_cli("codex", "enable", "personal").returncode, 0
+            self.run_cli_in_process("codex", "enable", "personal").returncode,
+            0,
         )
         registration = (
             self.home / ".claude" / ".skillsets" / "personal"
@@ -3230,7 +3527,7 @@ _skillset'''
             ("rename", "personal", "renamed"),
             ("remove", "personal", "--yes"),
         ):
-            result = self.run_cli(*arguments)
+            result = self.run_cli_in_process(*arguments)
             self.assert_refused(result)
             self.assertIn("Codex is enabled", result.stderr)
             self.assertIn(
@@ -3248,7 +3545,8 @@ _skillset'''
         self.initialize()
         self.make_set(self.root, "personal")
         self.assertEqual(
-            self.run_cli("claude", "enable", "personal").returncode, 0
+            self.run_cli_in_process("claude", "enable", "personal").returncode,
+            0,
         )
         claude = self.home / ".claude"
         registrations = claude / ".skillsets"
@@ -3320,7 +3618,7 @@ _skillset'''
         )
         for flag in ("-v", "--verbose"):
             with self.subTest(flag=flag):
-                result = self.run_cli("list", flag)
+                result = self.run_cli_in_process("list", flag)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout, expected)
                 self.assertEqual(result.stderr, "")
@@ -3347,7 +3645,7 @@ _skillset'''
         self.assertIn("\x1b[33m[invalid: missing description]\x1b[0m", colored.stdout)
         self.assertIn("\x1b[2m(no skills)\x1b[0m", colored.stdout)
 
-        plain = self.run_cli("list", "-v")
+        plain = self.run_cli_in_process("list", "-v")
         self.assertNotIn("\x1b", plain.stdout)
 
     def test_verbose_list_tty_escapes_controls_without_unapproved_sgr(self):
@@ -3393,7 +3691,7 @@ _skillset'''
             "valid",
             "name: alpha\ndescription: valid",
         )
-        plain = self.run_cli("list", "-v").stdout
+        plain = self.run_cli_in_process("list", "-v").stdout
         for extra_environment in ({"NO_COLOR": "1"}, {"TERM": "dumb"}):
             with self.subTest(environment=extra_environment):
                 result = self.run_cli_tty(
@@ -3422,7 +3720,7 @@ _skillset'''
         self.assertEqual(len(colored.stdout.splitlines()), 3)
         self.assertIn(declared, colored.stdout.splitlines()[2])
 
-        captured = self.run_cli("list", "-v")
+        captured = self.run_cli_in_process("list", "-v")
         self.assertEqual(captured.returncode, 0, captured.stderr)
         self.assertEqual(
             captured.stdout.splitlines()[1],
@@ -3434,7 +3732,7 @@ _skillset'''
         broken = self.make_set(self.root, "broken-only")
         self.write_skill(broken / "skills", "malformed", "name: hidden")
 
-        result = self.run_cli("list", "-v")
+        result = self.run_cli_in_process("list", "-v")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
@@ -3450,7 +3748,7 @@ _skillset'''
         self.write_skill(skills, "combining", f"name: {combining}\ndescription: valid")
         self.write_skill(skills, "wide", "name: 界界界\ndescription: valid")
 
-        result = self.run_cli("list", "-v")
+        result = self.run_cli_in_process("list", "-v")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines()[1], "  ---------|" + "-" * 15)
@@ -3468,7 +3766,7 @@ _skillset'''
         )
         before = self.filesystem_snapshot(self.home)
 
-        result = self.run_cli("list", "--verbose")
+        result = self.run_cli_in_process("list", "--verbose")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
@@ -3491,7 +3789,7 @@ _skillset'''
         directory = "broken\x1b\x7f\u202ename"
         (skills / directory).mkdir()
 
-        result = self.run_cli("list", "--verbose")
+        result = self.run_cli_in_process("list", "--verbose")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
@@ -3503,12 +3801,13 @@ _skillset'''
         )
 
     def test_current_prints_exact_active_name_before_and_after_use(self):
-        self.initialize("default")
+        initialized = self.run_cli_in_process("init", "default")
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
         self.make_set(self.root, "experiment")
 
-        before = self.run_cli("current")
-        switched = self.run_cli("use", "experiment")
-        after = self.run_cli("current")
+        before = self.run_cli_in_process("current")
+        switched = self.run_cli_in_process("use", "experiment")
+        after = self.run_cli_in_process("current")
 
         self.assertEqual(before.returncode, 0, before.stderr)
         self.assertEqual(before.stdout, "default\n")
@@ -3525,7 +3824,7 @@ _skillset'''
         (self.root / "active").symlink_to(unsafe_target)
         before = self.filesystem_snapshot(self.home)
 
-        result = self.run_cli("current")
+        result = self.run_cli_in_process("current")
 
         self.assert_refused(result)
         self.assertEqual(result.stdout, "")
@@ -3542,7 +3841,7 @@ _skillset'''
     def test_show_empty_set_prints_explanatory_message(self):
         self.initialize()
 
-        result = self.run_cli("show")
+        result = self.run_cli_in_process("show")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "No skills installed.\n")
@@ -3560,10 +3859,10 @@ _skillset'''
             alternate / "skills", "beta", "name: beta\ndescription: explicit"
         )
 
-        active = self.run_cli("show")
-        explicit = self.run_cli("show", "alternate")
-        switched = self.run_cli("use", "alternate")
-        new_active = self.run_cli("show")
+        active = self.run_cli_in_process("show")
+        explicit = self.run_cli_in_process("show", "alternate")
+        switched = self.run_cli_in_process("use", "alternate")
+        new_active = self.run_cli_in_process("show")
 
         self.assertIn("alpha", active.stdout)
         self.assertNotIn("beta", active.stdout)
@@ -3574,7 +3873,7 @@ _skillset'''
         self.assertNotIn("alpha", new_active.stdout)
 
     def test_show_help_marks_name_as_optional(self):
-        result = self.run_cli("show", "--help")
+        result = self.run_cli_in_process("show", "--help")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertRegex(result.stdout, r"usage: skillset show \[-h\] \[name\]")
@@ -3587,7 +3886,7 @@ _skillset'''
             skills, "long", "name: longer-name\ndescription: Longer description"
         )
 
-        result = self.run_cli("show")
+        result = self.run_cli_in_process("show")
 
         self.assertEqual(
             result.stdout,
@@ -3624,7 +3923,7 @@ _skillset'''
                 self.assertNotIn("\x1b", plain_tty.stdout)
                 self.assertIn(description, plain_tty.stdout)
 
-        captured = self.run_cli("show")
+        captured = self.run_cli_in_process("show")
 
         self.assertEqual(captured.returncode, 0, captured.stderr)
         self.assertEqual(
@@ -3653,7 +3952,7 @@ _skillset'''
             "\x1b[31m[invalid: missing SKILL.md]\x1b[0m", colored.stdout
         )
 
-        plain = self.run_cli("show")
+        plain = self.run_cli_in_process("show")
 
         self.assertNotIn("\x1b", plain.stdout)
 
@@ -3662,7 +3961,7 @@ _skillset'''
         skills = self.root / "skillsets/default/skills"
         self.write_skill(skills, "valid", "name: alpha\ndescription: valid")
         colored = self.run_cli_tty("show")
-        plain = self.run_cli("show").stdout
+        plain = self.run_cli_in_process("show").stdout
 
         self.assertEqual(colored.returncode, 0, colored.stderr)
         self.assertIn("\x1b[36malpha\x1b[0m", colored.stdout)
@@ -3715,7 +4014,7 @@ _skillset'''
             f"name: {combining}\ndescription: combining",
         )
 
-        result = self.run_cli("show")
+        result = self.run_cli_in_process("show")
 
         self.assertEqual(
             result.stdout,
@@ -3779,7 +4078,7 @@ _skillset'''
             description: "kept # hash" # ignored trailing comment
         """)
 
-        result = self.run_cli("show", "default")
+        result = self.run_cli_in_process("show", "default")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -3830,7 +4129,7 @@ _skillset'''
         )
         before = self.filesystem_snapshot(self.home)
 
-        result = self.run_cli("show", "default")
+        result = self.run_cli_in_process("show", "default")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
@@ -3851,7 +4150,7 @@ _skillset'''
         (skills / unsafe_directory).mkdir()
         before = self.filesystem_snapshot(self.home)
 
-        result = self.run_cli("show", "default")
+        result = self.run_cli_in_process("show", "default")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
@@ -3927,7 +4226,7 @@ _skillset'''
             description: remains visible
         """)
 
-        result = self.run_cli("show", "default")
+        result = self.run_cli_in_process("show", "default")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
@@ -3959,7 +4258,7 @@ _skillset'''
         linked_file.mkdir()
         linked_file.joinpath("SKILL.md").symlink_to(external / "SKILL.md")
 
-        result = self.run_cli("show", "default")
+        result = self.run_cli_in_process("show", "default")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
@@ -3975,11 +4274,11 @@ _skillset'''
         self.initialize()
         before = self.filesystem_snapshot(self.home)
 
-        missing = self.run_cli("show", "missing")
+        missing = self.run_cli_in_process("show", "missing")
         self.assert_refused(missing)
         for name in ("../escape", "Upper", ".hidden", "two words"):
             with self.subTest(name=name):
-                result = self.run_cli("show", name)
+                result = self.run_cli_in_process("show", name)
                 self.assert_refused(result)
 
         self.assertEqual(self.filesystem_snapshot(self.home), before)
@@ -3993,17 +4292,6 @@ _skillset'''
             ("current",),
             ("show", "default"),
         )
-        for index, arguments in enumerate(commands):
-            with self.subTest(layout="uninitialized", command=arguments[0]):
-                home = self.new_home(f"inspection-uninitialized-{index}")
-                root = home / ".agents"
-                root.mkdir()
-                (root / ".skillset.lock").write_text("", encoding="utf-8")
-                before = self.filesystem_snapshot(home)
-                result = self.run_cli(*arguments, home=home)
-                self.assert_refused(result)
-                self.assertEqual(self.filesystem_snapshot(home), before)
-
         def replace_link(path, target):
             path.unlink()
             path.symlink_to(target)
@@ -4025,15 +4313,33 @@ _skillset'''
                 root / "skillsets" / "default" / ".skill-lock.json"
             ).write_text("not json\n", encoding="utf-8"),
         }
-        case = 0
-        for label, mutate in mutations.items():
+        uninitialized = self.new_home("inspection-uninitialized-direct")
+        uninitialized_root = uninitialized / ".agents"
+        uninitialized_root.mkdir()
+        (uninitialized_root / ".skillset.lock").write_text("", encoding="utf-8")
+        self.assert_invalid_layout_read_only(uninitialized)
+
+        for index, (label, mutate) in enumerate(mutations.items()):
+            with self.subTest(direct_layout=label):
+                home = self.new_home(f"inspection-invalid-direct-{index}")
+                root = self.make_managed_layout(home)
+                (root / ".skillset.lock").write_text("", encoding="utf-8")
+                mutate(root)
+                self.assert_invalid_layout_read_only(home)
+
+        for label, home in (
+            ("uninitialized", self.new_home("inspection-uninitialized-executable")),
+            ("active-target", self.new_home("inspection-invalid-executable")),
+        ):
+            root = home / ".agents"
+            if label == "uninitialized":
+                root.mkdir()
+            else:
+                root = self.make_managed_layout(home)
+                mutations["active-target"](root)
+            (root / ".skillset.lock").write_text("", encoding="utf-8")
             for arguments in commands:
-                with self.subTest(layout=label, command=arguments[0]):
-                    home = self.new_home(f"inspection-invalid-{case}")
-                    case += 1
-                    root = self.make_managed_layout(home)
-                    (root / ".skillset.lock").write_text("", encoding="utf-8")
-                    mutate(root)
+                with self.subTest(executable_layout=label, command=arguments[0]):
                     before = self.filesystem_snapshot(home)
                     result = self.run_cli(*arguments, home=home)
                     self.assert_refused(result)
@@ -4067,7 +4373,17 @@ _skillset'''
             ("show", "default"),
         ):
             with self.subTest(arguments=arguments):
-                result = self.run_cli(*arguments)
+                result = (
+                    self.run_cli_in_process(*arguments)
+                    if arguments in (
+                        ("list",),
+                        ("list", "-v"),
+                        ("list", "--verbose"),
+                        ("current",),
+                        ("show", "default"),
+                    )
+                    else self.run_cli(*arguments)
+                )
                 self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
                 self.assertEqual(self.filesystem_snapshot(self.home), before)
 
@@ -4481,34 +4797,54 @@ _skillset'''
         ]
         for arguments in cases:
             with self.subTest(arguments=arguments):
+                self.assert_parser_rejects(arguments)
+
+        for arguments in (
+            (),
+            ("init", "default", "extra"),
+            ("create", "new", "--unknown"),
+            ("codex", "enable", "default", "--global", "--local"),
+        ):
+            with self.subTest(executable_arguments=arguments):
                 result = self.run_cli(*arguments)
                 self.assertEqual(result.returncode, 2, (result.stdout, result.stderr))
+                self.assertIn("usage: skillset", result.stderr)
+                self.assertIn("error:", result.stderr)
 
     def test_invalid_names_are_operational_errors_and_cannot_escape_skillsets(self):
         invalid_names = ["../escape", "a/b", ".hidden", "Upper", "two words", "-lead", "_lead"]
-        for index, name in enumerate(invalid_names):
-            home = self.new_home(f"invalid-init-{index}")
-            result = self.run_cli("init", name, home=home)
-            with self.subTest(command="init", name=name):
-                self.assert_refused(result)
-                candidate = home / ".agents" / "skillsets" / name
-                self.assertFalse(candidate.exists())
+        for name in invalid_names:
+            with self.subTest(validator_name=name):
+                self.assert_invalid_name(name)
+
+        init_home = self.new_home("invalid-init")
+        init_result = self.run_cli_in_process("init", "../escape", home=init_home)
+        self.assert_refused(init_result)
+        self.assertFalse((init_home / ".agents" / "skillsets").exists())
+        self.assertFalse((init_home / ".agents" / "escape").exists())
 
         self.initialize()
-        for command in ("create", "use"):
-            for name in invalid_names:
-                with self.subTest(command=command, name=name):
-                    result = self.run_cli(command, name)
-                    self.assert_refused(result)
-                    if command == "create":
-                        self.assertFalse((self.root / "skillsets" / name).exists())
-        renamed = self.run_cli("rename", "default", ".hidden")
-        self.assert_refused(renamed)
-        self.assertTrue((self.root / "skillsets" / "default").is_dir())
-        self.assertFalse(os.path.lexists(self.root / "skillsets" / ".hidden"))
-        result = self.run_cli("create", "copy", "--from", "../default")
-        self.assert_refused(result)
-        self.assertFalse((self.root / "skillsets" / "copy").exists())
+        for arguments, missing_path in (
+            (("create", "Upper"), self.root / "skillsets" / "Upper"),
+            (("use", "a/b"), None),
+            (("rename", "default", ".hidden"), self.root / "skillsets" / ".hidden"),
+            (("create", "copy", "--from", "../default"), self.root / "skillsets" / "copy"),
+        ):
+            with self.subTest(command=arguments[0], arguments=arguments):
+                before = self.filesystem_snapshot(self.home)
+                result = (
+                    self.run_cli_in_process(*arguments)
+                    if arguments in (
+                        ("create", "Upper"),
+                        ("use", "a/b"),
+                        ("rename", "default", ".hidden"),
+                    )
+                    else self.run_cli(*arguments)
+                )
+                self.assert_refused(result)
+                self.assertEqual(self.filesystem_snapshot(self.home), before)
+                if missing_path is not None:
+                    self.assertFalse(os.path.lexists(missing_path))
 
     def test_hidden_skillset_metadata_is_ignored(self):
         self.initialize()
@@ -4517,7 +4853,11 @@ _skillset'''
 
         for arguments in (("doctor",), ("list",), ("list", "--verbose")):
             with self.subTest(arguments=arguments):
-                result = self.run_cli(*arguments)
+                result = (
+                    self.run_cli_in_process(*arguments)
+                    if arguments in (("list",), ("list", "--verbose"))
+                    else self.run_cli(*arguments)
+                )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertNotIn(".git", result.stdout)
 
@@ -4534,11 +4874,11 @@ _skillset'''
         external.mkdir()
         self.write_config(self.home, external)
 
-        initialized = self.run_cli("init", "default")
-        created = self.run_cli("create", "experiment")
-        activated = self.run_cli("use", "experiment")
-        renamed = self.run_cli("rename", "default", "baseline")
-        removed = self.run_cli("remove", "baseline", "--yes")
+        initialized = self.run_cli_in_process("init", "default")
+        created = self.run_cli_in_process("create", "experiment")
+        activated = self.run_cli_in_process("use", "experiment")
+        renamed = self.run_cli_in_process("rename", "default", "baseline")
+        removed = self.run_cli_in_process("remove", "baseline", "--yes")
         codex_enabled = self.run_cli("codex", "enable", "experiment")
         codex_listed = self.run_cli("codex", "list")
         codex_disabled = self.run_cli("codex", "disable", "experiment")
@@ -4557,8 +4897,8 @@ _skillset'''
         self.assertEqual(os.readlink(self.root / "skillsets"), str(external))
         self.assert_empty_set(self.root, "experiment")
         self.assert_aliases(self.root, "experiment")
-        self.assertEqual(self.run_cli("current").stdout, "experiment\n")
-        self.assertEqual(self.run_cli("list").stdout, "* experiment\n")
+        self.assertEqual(self.run_cli_in_process("current").stdout, "experiment\n")
+        self.assertEqual(self.run_cli_in_process("list").stdout, "* experiment\n")
         self.assertFalse(os.path.lexists(external / "default"))
         self.assertFalse(os.path.lexists(external / "baseline"))
         self.assertTrue((external / "experiment").is_dir())
@@ -4577,7 +4917,7 @@ _skillset'''
         marker.write_bytes(b"unrelated")
         self.write_config(self.home, external)
 
-        initialized = self.run_cli("init", "default")
+        initialized = self.run_cli_in_process("init", "default")
 
         self.assertEqual(initialized.returncode, 0, initialized.stderr)
         self.assertEqual(marker.read_bytes(), b"unrelated")
@@ -4586,7 +4926,7 @@ _skillset'''
         other_home = self.new_home("configured-collision")
         self.write_config(other_home, external)
         before = self.tree_contract_snapshot(external)
-        collision = self.run_cli("init", "existing", home=other_home)
+        collision = self.run_cli_in_process("init", "existing", home=other_home)
 
         self.assert_refused(collision)
         self.assertEqual(self.tree_contract_snapshot(external), before)
@@ -4603,7 +4943,7 @@ _skillset'''
         home_before = self.filesystem_snapshot(self.home)
         external_before = self.filesystem_snapshot(external)
 
-        result = self.run_cli("init", "default")
+        result = self.run_cli_in_process("init", "default")
 
         self.assert_refused(result)
         self.assertIn(
@@ -4674,7 +5014,7 @@ _skillset'''
                 self.write_config(home, real_source, value, raw=raw)
                 before = self.tree_contract_snapshot(real_source)
 
-                result = self.run_cli("init", "default", home=home)
+                result = self.run_cli_in_process("init", "default", home=home)
 
                 self.assert_refused(result)
                 self.assertIn(expected, result.stdout + result.stderr)
@@ -4694,7 +5034,7 @@ _skillset'''
         )
         (symlink_root / "config.json").symlink_to(external_config)
 
-        result = self.run_cli("init", "default", home=symlink_home)
+        result = self.run_cli_in_process("init", "default", home=symlink_home)
 
         self.assert_refused(result)
         self.assertIn("config must be a real regular file", result.stdout + result.stderr)
@@ -4705,7 +5045,7 @@ _skillset'''
         nested_source.mkdir(parents=True)
         self.write_config(nested_home, nested_source)
 
-        result = self.run_cli("init", "default", home=nested_home)
+        result = self.run_cli_in_process("init", "default", home=nested_home)
 
         self.assert_refused(result)
         self.assertIn(
@@ -4723,7 +5063,7 @@ _skillset'''
         linked_source = root_alias / "external"
         self.write_config(linked_parent_home, linked_source)
 
-        result = self.run_cli("init", "default", home=linked_parent_home)
+        result = self.run_cli_in_process("init", "default", home=linked_parent_home)
 
         self.assert_refused(result)
         self.assertIn(
@@ -4806,7 +5146,7 @@ _skillset'''
         lock_text = '{\n  "version": 3,\n  "skills": {},\n  "dismissed": {}\n}\n'
         self.write_lock(self.root / ".skill-lock.json", raw=lock_text)
 
-        result = self.run_cli("init", "baseline")
+        result = self.run_cli_in_process("init", "baseline")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_aliases(self.root, "baseline")
@@ -4819,7 +5159,7 @@ _skillset'''
         (self.root / "skills" / "alpha").mkdir(parents=True)
         (self.root / "skills" / "alpha" / "SKILL.md").write_text("alpha\n", encoding="utf-8")
 
-        result = self.run_cli("init", "mixed")
+        result = self.run_cli_in_process("init", "mixed")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((self.root / "skills" / "alpha" / "SKILL.md").read_text(), "alpha\n")
@@ -4828,7 +5168,7 @@ _skillset'''
     def test_init_with_only_existing_lock_creates_empty_skills(self):
         self.write_lock(self.root / ".skill-lock.json")
 
-        result = self.run_cli("init", "mixed")
+        result = self.run_cli_in_process("init", "mixed")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(list((self.root / "skills").iterdir()), [])
@@ -4839,7 +5179,7 @@ _skillset'''
         lock = self.root / ".skill-lock.json"
         self.write_lock(lock, {"version": 2, "skills": {}, "dismissed": {}})
 
-        result = self.run_cli("init", "default")
+        result = self.run_cli_in_process("init", "default")
 
         self.assert_refused(result)
         self.assertTrue((self.root / "skills" / "alpha").is_dir())
@@ -4859,7 +5199,7 @@ _skillset'''
                 self.write_lock(external)
             (root / entry).symlink_to(external)
 
-            result = self.run_cli("init", "default", home=home)
+            result = self.run_cli_in_process("init", "default", home=home)
 
             with self.subTest(entry=entry):
                 self.assert_refused(result)
@@ -4877,7 +5217,7 @@ _skillset'''
             else:
                 (root / entry).symlink_to("skillsets/default")
 
-            result = self.run_cli("init", "default", home=home)
+            result = self.run_cli_in_process("init", "default", home=home)
 
             with self.subTest(entry=entry):
                 self.assert_refused(result)
@@ -4890,7 +5230,7 @@ _skillset'''
         staging.write_text("foreign staging data", encoding="utf-8")
         before = self.tree_contract_snapshot(self.root)
 
-        result = self.run_cli("init", "default")
+        result = self.run_cli_in_process("init", "default")
 
         self.assert_refused(result)
         self.assertIn(str(staging), result.stdout + result.stderr)
@@ -4902,21 +5242,22 @@ _skillset'''
         (self.root / "skillsets" / "default").mkdir(parents=True)
         marker = self.root / "skillsets" / "default" / "keep"
         marker.write_text("untouched", encoding="utf-8")
-        result = self.run_cli("init", "default")
+        result = self.run_cli_in_process("init", "default")
         self.assert_refused(result)
         self.assertEqual(marker.read_text(), "untouched")
 
         other_home = self.new_home("already-managed")
         self.initialize(home=other_home)
-        result = self.run_cli("init", "again", home=other_home)
+        result = self.run_cli_in_process("init", "again", home=other_home)
         self.assert_refused(result)
         self.assertFalse((other_home / ".agents" / "skillsets" / "again").exists())
 
     def test_create_empty_set_without_changing_active_set(self):
-        self.initialize()
+        initialized = self.run_cli_in_process("init", "default")
+        self.assertEqual(initialized.returncode, 0, initialized.stderr)
         active_before = os.readlink(self.root / "active")
 
-        result = self.run_cli("create", "experiment")
+        result = self.run_cli_in_process("create", "experiment")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_empty_set(self.root, "experiment")
@@ -4925,15 +5266,15 @@ _skillset'''
     def test_manual_skillset_creation_activation_and_display(self):
         self.initialize()
 
-        created = self.run_cli("create", "--manual", "personal")
+        created = self.run_cli_in_process("create", "--manual", "personal")
         self.assertEqual(created.returncode, 0, created.stderr)
         personal = self.root / "skillsets" / "personal"
         self.assertTrue((personal / "skills").is_dir())
         self.assertTrue((personal / ".skillset-manual").is_file())
         self.assertEqual((personal / ".skillset-manual").stat().st_size, 0)
         self.assertFalse(os.path.lexists(personal / ".skill-lock.json"))
-        self.assertEqual(self.run_cli("list").stdout, "* default\npersonal [m]\n")
-        verbose = self.run_cli("list", "--verbose")
+        self.assertEqual(self.run_cli_in_process("list").stdout, "* default\npersonal [m]\n")
+        verbose = self.run_cli_in_process("list", "--verbose")
         self.assertEqual(verbose.returncode, 0, verbose.stderr)
         verbose_lines = verbose.stdout.splitlines()
         self.assertIn("personal [m]", verbose.stdout)
@@ -4942,25 +5283,25 @@ _skillset'''
             {verbose_lines[0].index("|")},
         )
         self.assertEqual(
-            self.run_cli("show", "personal").stdout,
+            self.run_cli_in_process("show", "personal").stdout,
             "Manual skillset [m]: no upstream lock metadata.\nNo skills installed.\n",
         )
 
-        activated = self.run_cli("use", "personal")
+        activated = self.run_cli_in_process("use", "personal")
         self.assertEqual(activated.returncode, 0, activated.stderr)
         self.assertEqual(os.readlink(self.root / "active"), "skillsets/personal")
         self.assertEqual(os.readlink(self.root / ".skill-lock.json"), "../.skillset-manual-empty-lock.json")
         sentinel = self.home / ".skillset-manual-empty-lock.json"
         self.assertEqual(json.loads(sentinel.read_text(encoding="utf-8")), EMPTY_LOCK)
         self.assertEqual(stat.S_IMODE(sentinel.stat().st_mode), 0o444)
-        self.assertEqual(self.run_cli("list").stdout, "default\n* personal [m]\n")
+        self.assertEqual(self.run_cli_in_process("list").stdout, "default\n* personal [m]\n")
         tty = self.run_cli_tty("list")
         self.assertEqual(tty.returncode, 0, tty.stderr)
         self.assertIn("\x1b[33m[m]\x1b[0m", tty.stdout)
 
         sentinel.chmod(0o644)
         sentinel.unlink()
-        recreated = self.run_cli("use", "personal")
+        recreated = self.run_cli_in_process("use", "personal")
         self.assertEqual(recreated.returncode, 0, recreated.stderr)
         self.assertEqual(stat.S_IMODE(sentinel.stat().st_mode), 0o444)
 
@@ -4969,22 +5310,22 @@ _skillset'''
         repaired = self.run_cli("doctor", "--fix", input_text="yes\n")
         self.assertEqual(repaired.returncode, 0, repaired.stderr)
         self.assertEqual(stat.S_IMODE(sentinel.stat().st_mode), 0o444)
-        mutually_exclusive = self.run_cli(
+        mutually_exclusive = self.run_cli_in_process(
             "create", "--manual", "--from", "default", "invalid"
         )
         self.assertEqual(mutually_exclusive.returncode, 2)
 
     def test_manual_sentinel_accepts_nonwritable_modes_and_refuses_writable_mode(self):
         self.initialize()
-        self.assertEqual(self.run_cli("create", "--manual", "personal").returncode, 0)
-        self.assertEqual(self.run_cli("use", "personal").returncode, 0)
+        self.assertEqual(self.run_cli_in_process("create", "--manual", "personal").returncode, 0)
+        self.assertEqual(self.run_cli_in_process("use", "personal").returncode, 0)
         sentinel = self.home / ".skillset-manual-empty-lock.json"
         sentinel.chmod(0o400)
-        accepted = self.run_cli("list")
+        accepted = self.run_cli_in_process("list")
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
         self.assertEqual(accepted.stdout, "default\n* personal [m]\n")
         sentinel.chmod(0o644)
-        rejected = self.run_cli("list")
+        rejected = self.run_cli_in_process("list")
         self.assert_refused(rejected)
         self.assertIn("manual empty-lock sentinel must be read-only", rejected.stderr)
 
@@ -5006,7 +5347,7 @@ _skillset'''
                     external.touch()
                     (target / ".skillset-manual").symlink_to(external)
 
-                result = self.run_cli("use", "broken", home=home)
+                result = self.run_cli_in_process("use", "broken", home=home)
                 self.assert_refused(result)
                 self.assertEqual(os.readlink(root / "active"), "skillsets/default")
 
@@ -5069,7 +5410,7 @@ _skillset'''
         lock_bytes = b'{"version":3,"skills":{},"dismissed":{}}\n'
         (source / ".skill-lock.json").write_bytes(lock_bytes)
 
-        result = self.run_cli("create", "clone", "--from", "default")
+        result = self.run_cli_in_process("create", "clone", "--from", "default")
 
         self.assertEqual(result.returncode, 0, result.stderr)
         clone = self.root / "skillsets" / "clone"
@@ -5095,7 +5436,7 @@ _skillset'''
             (source / "skills" / "source-marker").write_bytes(b"source payload")
             lock_bytes = b'{"version":3,"skills":{},"dismissed":{}}\n'
             (source / ".skill-lock.json").write_bytes(lock_bytes)
-            result = self.run_cli(*arguments, home=home)
+            result = self.run_cli_in_process(*arguments, home=home)
             with self.subTest(arguments=arguments):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assert_aliases(root, name)
@@ -5114,7 +5455,7 @@ _skillset'''
         occupied = self.make_set(self.root, "occupied")
         marker = occupied / "skills" / "keep"
         marker.write_bytes(b"untouched")
-        result = self.run_cli("create", "occupied", "--use")
+        result = self.run_cli_in_process("create", "occupied", "--use")
         self.assert_refused(result)
         self.assertEqual(marker.read_bytes(), b"untouched")
         self.assert_aliases(self.root, "default")
@@ -5159,7 +5500,7 @@ _skillset'''
         self.assertTrue(os.path.lexists(self.root / ".skillset-use.staging"))
 
     def test_create_help_documents_create_options(self):
-        result = self.run_cli("create", "--help")
+        result = self.run_cli_in_process("create", "--help")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("-f SOURCE", result.stdout)
         self.assertIn("--from SOURCE", result.stdout)
@@ -5172,7 +5513,7 @@ _skillset'''
         regular = self.make_set(regular_root, "occupied")
         marker = regular / "skills" / "keep"
         marker.write_text("keep", encoding="utf-8")
-        result = self.run_cli("create", "occupied", home=regular_home)
+        result = self.run_cli_in_process("create", "occupied", home=regular_home)
         self.assert_refused(result)
         self.assertEqual(marker.read_text(), "keep")
 
@@ -5184,7 +5525,7 @@ _skillset'''
         marker = external / "skills" / "keep"
         marker.write_text("untouched", encoding="utf-8")
         (linked_root / "skillsets" / "linked").symlink_to(external)
-        result = self.run_cli("create", "linked", home=linked_home)
+        result = self.run_cli_in_process("create", "linked", home=linked_home)
         self.assert_refused(result)
         self.assertEqual(marker.read_text(encoding="utf-8"), "untouched")
 
@@ -5201,14 +5542,14 @@ _skillset'''
                 (root / "skillsets" / source).symlink_to(external)
             target = f"copy-{index}"
             with self.subTest(source=source):
-                result = self.run_cli("create", target, "--from", source, home=home)
+                result = self.run_cli_in_process("create", target, "--from", source, home=home)
                 self.assert_refused(result)
                 self.assertFalse((root / "skillsets" / target).exists())
 
     def test_create_and_use_refuse_before_initialization(self):
         for command, name in (("create", "new"), ("use", "new")):
             home = self.new_home(f"pre-init-{command}")
-            result = self.run_cli(command, name, home=home)
+            result = self.run_cli_in_process(command, name, home=home)
             with self.subTest(command=command):
                 self.assert_refused(result)
                 self.assertFalse((home / ".agents" / "skillsets" / "new").exists())
@@ -5244,7 +5585,7 @@ _skillset'''
             mutate(root)
             for command, name in (("create", "new"), ("use", "default")):
                 with self.subTest(layout=label, command=command):
-                    result = self.run_cli(command, name, home=home)
+                    result = self.run_cli_in_process(command, name, home=home)
                     self.assert_refused(result)
             self.assertFalse((root / "skillsets" / "new").exists())
 
@@ -5285,20 +5626,20 @@ _skillset'''
                     root / "skillsets" / "default" / ".skill-lock.json"
                 )
             with self.subTest(name=name):
-                result = self.run_cli("use", name, home=home)
+                result = self.run_cli_in_process("use", name, home=home)
                 self.assert_refused(result)
                 self.assertEqual(os.readlink(root / "active"), "skillsets/default")
 
     def test_use_atomically_changes_only_active_alias(self):
         self.initialize()
-        self.run_cli("create", "experiment")
+        self.run_cli_in_process("create", "experiment")
         stable = {
             name: ((self.root / name).lstat().st_ino, os.readlink(self.root / name))
             for name in ("skills", ".skill-lock.json")
         }
 
-        first = self.run_cli("use", "experiment")
-        second = self.run_cli("use", "default")
+        first = self.run_cli_in_process("use", "experiment")
+        second = self.run_cli_in_process("use", "default")
 
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(second.returncode, 0, second.stderr)
@@ -5308,7 +5649,7 @@ _skillset'''
 
     def test_failed_atomic_use_keeps_previous_active_set_and_aliases(self):
         self.initialize()
-        self.run_cli("create", "experiment")
+        self.run_cli_in_process("create", "experiment")
         root = str(self.root)
         fault = self.fault_environment(
             f"""
@@ -5360,7 +5701,7 @@ _skillset'''
             for name in ("active", "skills", ".skill-lock.json")
         }
 
-        result = self.run_cli("rename", "old", "new")
+        result = self.run_cli_in_process("rename", "old", "new")
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         self.assertFalse(os.path.lexists(source))
@@ -5384,9 +5725,9 @@ _skillset'''
             for name in ("skills", ".skill-lock.json")
         }
 
-        result = self.run_cli("rename", "old", "new")
-        current = self.run_cli("current")
-        listed = self.run_cli("list")
+        result = self.run_cli_in_process("rename", "old", "new")
+        current = self.run_cli_in_process("current")
+        listed = self.run_cli_in_process("list")
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         self.assertFalse(os.path.lexists(self.root / "skillsets" / "old"))
@@ -5408,7 +5749,7 @@ _skillset'''
         self.make_set(self.root, "old")
         before = self.tree_contract_snapshot(self.root / "skillsets")
 
-        missing = self.run_cli("rename", "missing", "new")
+        missing = self.run_cli_in_process("rename", "missing", "new")
         self.assert_refused(missing)
         invalid_cases = (
             ("../escape", "new"),
@@ -5419,7 +5760,7 @@ _skillset'''
         )
         for old, new in invalid_cases:
             with self.subTest(old=old, new=new):
-                result = self.run_cli("rename", old, new)
+                result = self.run_cli_in_process("rename", old, new)
                 self.assert_refused(result)
         self.assertEqual(
             self.tree_contract_snapshot(self.root / "skillsets"), before
@@ -5450,7 +5791,7 @@ _skillset'''
             )
 
             with self.subTest(kind=kind):
-                result = self.run_cli("rename", "old", "new", home=home)
+                result = self.run_cli_in_process("rename", "old", "new", home=home)
                 self.assert_refused(result)
                 self.assertEqual(self.tree_contract_snapshot(source), source_before)
                 self.assertEqual(
@@ -5466,7 +5807,7 @@ _skillset'''
             (("rename", "old", "new"), ("remove", "old", "--yes"))
         ):
             home = self.new_home(f"lifecycle-uninitialized-{index}")
-            result = self.run_cli(*arguments, home=home)
+            result = self.run_cli_in_process(*arguments, home=home)
             with self.subTest(layout="uninitialized", command=arguments[0]):
                 self.assert_refused(result)
 
@@ -5478,7 +5819,7 @@ _skillset'''
         before = self.tree_contract_snapshot(root)
         for arguments in (("rename", "old", "new"), ("remove", "old", "--yes")):
             with self.subTest(layout="invalid", command=arguments[0]):
-                result = self.run_cli(*arguments, home=root.parent)
+                result = self.run_cli_in_process(*arguments, home=root.parent)
                 self.assert_refused(result)
                 self.assertNotIn("Remove skillset", result.stderr)
                 self.assertEqual(self.tree_contract_snapshot(root), before)
@@ -5507,7 +5848,7 @@ _skillset'''
         )
         for arguments in symlink_cases:
             with self.subTest(arguments=arguments):
-                result = self.run_cli(*arguments, home=home)
+                result = self.run_cli_in_process(*arguments, home=home)
                 self.assert_refused(result)
                 self.assertNotIn("Remove skillset", result.stderr)
                 self.assertEqual(
@@ -5523,7 +5864,7 @@ _skillset'''
         )
         for arguments in traversal_cases:
             with self.subTest(arguments=arguments):
-                result = self.run_cli(*arguments, home=home)
+                result = self.run_cli_in_process(*arguments, home=home)
                 self.assert_refused(result)
                 self.assertNotIn("Remove skillset", result.stderr)
                 self.assertEqual(
@@ -5548,7 +5889,7 @@ _skillset'''
             before = self.tree_contract_snapshot(root)
 
             with self.subTest(label=label):
-                result = self.run_cli(*arguments, home=home)
+                result = self.run_cli_in_process(*arguments, home=home)
                 self.assert_refused(result)
                 self.assertIn(str(staging), result.stdout + result.stderr)
                 self.assertNotIn("Remove skillset", result.stderr)
@@ -5826,7 +6167,7 @@ _skillset'''
         self.initialize()
         victim = self.make_set(self.root, "victim")
 
-        result = self.run_cli("remove", "victim", "--yes")
+        result = self.run_cli_in_process("remove", "victim", "--yes")
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         self.assertNotIn("Remove skillset", result.stderr)
@@ -5927,7 +6268,7 @@ _skillset'''
         )
         external_before = self.tree_contract_snapshot(external)
 
-        result = self.run_cli("remove", "victim", "--yes")
+        result = self.run_cli_in_process("remove", "victim", "--yes")
 
         self.assertEqual(result.returncode, 0, (result.stdout, result.stderr))
         self.assertFalse(os.path.lexists(victim))
@@ -6231,7 +6572,7 @@ _skillset'''
         project = self.sandbox / "project-augment"
         project.mkdir()
 
-        first = self.run_cli("augment", "enable", "personal", "-l", cwd=project)
+        first = self.run_cli_in_process("augment", "enable", "personal", "-l", cwd=project)
         local = project / ".augment"
         registration = local / ".skillsets" / "personal"
         alpha_link = local / "skills" / "alpha"
@@ -6240,7 +6581,7 @@ _skillset'''
             path: path.lstat().st_ino
             for path in (registration, alpha_link, beta_link)
         }
-        second = self.run_cli(
+        second = self.run_cli_in_process(
             "augment", "enable", "--local", "personal", cwd=project
         )
 
@@ -6256,12 +6597,12 @@ _skillset'''
             description: Gamma
         """)
         shutil.rmtree(beta)
-        reconciled = self.run_cli(
+        reconciled = self.run_cli_in_process(
             "augment", "enable", "personal", "--local", cwd=project
         )
-        global_list = self.run_cli("augment", "list", "--global", cwd=project)
-        local_list = self.run_cli("augment", "list", "--local", cwd=project)
-        combined = self.run_cli("augment", "list", cwd=project)
+        global_list = self.run_cli_in_process("augment", "list", "--global", cwd=project)
+        local_list = self.run_cli_in_process("augment", "list", "--local", cwd=project)
+        combined = self.run_cli_in_process("augment", "list", cwd=project)
 
         self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
         self.assertEqual(os.readlink(alpha_link), str(alpha))
@@ -6278,17 +6619,17 @@ _skillset'''
         project = self.sandbox / "augment-overlap"
         project.mkdir()
         self.assertEqual(
-            self.run_cli("augment", "enable", "default").returncode, 0
+            self.run_cli_in_process("augment", "enable", "default").returncode, 0
         )
         self.assertEqual(
-            self.run_cli(
+            self.run_cli_in_process(
                 "augment", "enable", "default", "--local", cwd=project
             ).returncode,
             0,
         )
 
-        combined = self.run_cli("augment", "list", cwd=project)
-        from_home = self.run_cli("augment", "list", cwd=self.home)
+        combined = self.run_cli_in_process("augment", "list", cwd=project)
+        from_home = self.run_cli_in_process("augment", "list", cwd=self.home)
 
         self.assertEqual(
             combined.stdout, "[g] default\n[l] default\n"
@@ -6305,15 +6646,15 @@ _skillset'''
         root = self.initialize(home=alias_home)
         source = root / "skillsets" / "default" / "skills"
         self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
-        enabled = self.run_cli(
+        enabled = self.run_cli_in_process(
             "augment", "enable", "default", home=alias_home
         )
 
-        listed = self.run_cli(
+        listed = self.run_cli_in_process(
             "augment", "list", home=physical_home, cwd=physical_home
         )
-        disabled = self.run_cli("augment", "disable", "default", home=physical_home)
-        after_disable = self.run_cli("augment", "list", home=physical_home)
+        disabled = self.run_cli_in_process("augment", "disable", "default", home=physical_home)
+        after_disable = self.run_cli_in_process("augment", "list", home=physical_home)
 
         self.assertEqual(enabled.returncode, 0, enabled.stderr)
         self.assertEqual(listed.returncode, 0, listed.stderr)
@@ -6334,7 +6675,7 @@ _skillset'''
         global_root.symlink_to(local_root, target_is_directory=True)
         before = self.filesystem_snapshot(self.sandbox)
 
-        result = self.run_cli(
+        result = self.run_cli_in_process(
             "augment",
             "enable",
             "default",
@@ -6371,7 +6712,7 @@ _skillset'''
                 project = self.sandbox / f"augment-cross-scope-project-{index}"
                 project.mkdir()
                 if first_scope == "global":
-                    first = self.run_cli(
+                    first = self.run_cli_in_process(
                         "augment",
                         "enable",
                         "default",
@@ -6379,7 +6720,7 @@ _skillset'''
                         cwd=project,
                     )
                     before = self.filesystem_snapshot(home)
-                    refused = self.run_cli(
+                    refused = self.run_cli_in_process(
                         "augment",
                         "enable",
                         "project",
@@ -6392,7 +6733,7 @@ _skillset'''
                         self.filesystem_snapshot(home), before
                     )
                 else:
-                    first = self.run_cli(
+                    first = self.run_cli_in_process(
                         "augment",
                         "enable",
                         "project",
@@ -6401,7 +6742,7 @@ _skillset'''
                         cwd=project,
                     )
                     before = self.filesystem_snapshot(project)
-                    refused = self.run_cli(
+                    refused = self.run_cli_in_process(
                         "augment",
                         "enable",
                         "default",
@@ -6440,7 +6781,7 @@ _skillset'''
         elsewhere = self.sandbox / "augment-cross-scope-list-elsewhere"
         project.mkdir()
         elsewhere.mkdir()
-        local_enabled = self.run_cli(
+        local_enabled = self.run_cli_in_process(
             "augment",
             "enable",
             "project",
@@ -6448,7 +6789,7 @@ _skillset'''
             home=home,
             cwd=project,
         )
-        global_enabled = self.run_cli(
+        global_enabled = self.run_cli_in_process(
             "augment",
             "enable",
             "default",
@@ -6464,7 +6805,7 @@ _skillset'''
             ("augment", "list", "--local"),
         ):
             with self.subTest(arguments=arguments):
-                listed = self.run_cli(
+                listed = self.run_cli_in_process(
                     *arguments,
                     home=home,
                     cwd=project,
@@ -6500,7 +6841,7 @@ _skillset'''
                     collision.symlink_to("/tmp/unrelated")
                 before = self.filesystem_snapshot(home)
 
-                result = self.run_cli("augment", "enable", "default", home=home)
+                result = self.run_cli_in_process("augment", "enable", "default", home=home)
 
                 self.assert_refused(result)
                 self.assertEqual(self.filesystem_snapshot(home), before)
@@ -6515,7 +6856,7 @@ _skillset'''
         (source / "linked").symlink_to(self.sandbox)
         before = self.filesystem_snapshot(home)
 
-        result = self.run_cli("augment", "enable", "default", home=home)
+        result = self.run_cli_in_process("augment", "enable", "default", home=home)
 
         self.assert_refused(result)
         self.assertIn("must not be a symlink", result.stderr)
@@ -6552,7 +6893,7 @@ _skillset'''
             ("local", ("--local",), project / ".augment"),
         ):
             with self.subTest(scope=scope):
-                enabled = self.run_cli(
+                enabled = self.run_cli_in_process(
                     "augment", "enable", "default", *arguments, cwd=project
                 )
 
@@ -6563,7 +6904,7 @@ _skillset'''
                 for root in immutable_roots:
                     self.assertEqual(self.filesystem_snapshot(root), before[root])
 
-                disabled = self.run_cli(
+                disabled = self.run_cli_in_process(
                     "augment", "disable", "default", *arguments, cwd=project
                 )
 
@@ -6585,7 +6926,7 @@ _skillset'''
                 working_directory = alpha if nested else source
                 before = self.filesystem_snapshot(home)
 
-                result = self.run_cli(
+                result = self.run_cli_in_process(
                     "augment",
                     "enable",
                     "default",
@@ -6620,7 +6961,7 @@ _skillset'''
         )
         before = self.filesystem_snapshot(physical_home)
 
-        result = self.run_cli(
+        result = self.run_cli_in_process(
             "augment",
             "enable",
             "default",
@@ -6644,15 +6985,15 @@ _skillset'''
             name: alpha
             description: Alpha
         """)
-        enabled = self.run_cli("augment", "enable", "default")
+        enabled = self.run_cli_in_process("augment", "enable", "default")
         self.assertEqual(enabled.returncode, 0, enabled.stderr)
         augment_skills = self.home / ".augment" / "skills"
         alias = augment_skills / "alpha-alias"
         alias.symlink_to(alpha)
 
         shutil.rmtree(alpha)
-        reconciled = self.run_cli("augment", "enable", "default")
-        disabled = self.run_cli("augment", "disable", "default")
+        reconciled = self.run_cli_in_process("augment", "enable", "default")
+        disabled = self.run_cli_in_process("augment", "disable", "default")
 
         self.assertEqual(reconciled.returncode, 0, reconciled.stderr)
         self.assertFalse(os.path.lexists(augment_skills / "alpha"))
@@ -6676,7 +7017,7 @@ _skillset'''
         adopted.symlink_to(str(alpha) + "///")
         inode = adopted.lstat().st_ino
 
-        enabled = self.run_cli("augment", "enable", "default")
+        enabled = self.run_cli_in_process("augment", "enable", "default")
 
         self.assertEqual(enabled.returncode, 0, enabled.stderr)
         self.assertEqual(adopted.lstat().st_ino, inode)
@@ -6685,12 +7026,12 @@ _skillset'''
         )
 
         self.assertEqual(
-            self.run_cli("augment", "disable", "default").returncode, 0
+            self.run_cli_in_process("augment", "disable", "default").returncode, 0
         )
         interior = augment_skills / "alpha"
         interior.symlink_to(str(source) + "/./alpha")
         before = self.filesystem_snapshot(self.home)
-        refused = self.run_cli("augment", "enable", "default")
+        refused = self.run_cli_in_process("augment", "enable", "default")
         self.assert_refused(refused)
         self.assertEqual(self.filesystem_snapshot(self.home), before)
 
@@ -6701,13 +7042,13 @@ _skillset'''
         self.write_skill(first, "alpha", "name: alpha\ndescription: Alpha")
         self.write_skill(second, "beta", "name: beta\ndescription: Beta")
         self.assertEqual(
-            self.run_cli("augment", "enable", "first").returncode, 0
+            self.run_cli_in_process("augment", "enable", "first").returncode, 0
         )
         self.assertEqual(
-            self.run_cli("augment", "enable", "second").returncode, 0
+            self.run_cli_in_process("augment", "enable", "second").returncode, 0
         )
         self.assertEqual(
-            self.run_cli("augment", "list").stdout,
+            self.run_cli_in_process("augment", "list").stdout,
             "[g] first\n[g] second\n",
         )
 
@@ -6716,7 +7057,7 @@ _skillset'''
             description: Conflicting directory name
         """)
         before = self.filesystem_snapshot(self.home / ".augment")
-        refused = self.run_cli("augment", "enable", "second")
+        refused = self.run_cli_in_process("augment", "enable", "second")
         self.assert_refused(refused)
         self.assertEqual(
             self.filesystem_snapshot(self.home / ".augment"), before
@@ -6729,11 +7070,11 @@ _skillset'''
         source = personal / "skills"
         self.write_skill(source, "alpha", "name: alpha\ndescription: Alpha")
         self.assertEqual(
-            self.run_cli("augment", "enable", "personal").returncode, 0
+            self.run_cli_in_process("augment", "enable", "personal").returncode, 0
         )
         shutil.rmtree(personal)
 
-        disabled = self.run_cli("augment", "disable", "personal")
+        disabled = self.run_cli_in_process("augment", "disable", "personal")
 
         self.assertEqual(disabled.returncode, 0, disabled.stderr)
         self.assertFalse(
@@ -7189,7 +7530,7 @@ _skillset'''
         (registrations / "Not-Ours").write_text("ignored\n")
         before = self.filesystem_snapshot(self.home)
 
-        result = self.run_cli("augment", "list")
+        result = self.run_cli_in_process("augment", "list")
 
         self.assert_refused(result)
         self.assertIn("noncanonical Auggie registration", result.stderr)
@@ -7200,25 +7541,25 @@ _skillset'''
         self.initialize()
         self.make_set(self.root, "personal")
         self.assertEqual(
-            self.run_cli("augment", "enable", "personal").returncode, 0
+            self.run_cli_in_process("augment", "enable", "personal").returncode, 0
         )
         before = self.filesystem_snapshot(self.home)
         for arguments in (
             ("rename", "personal", "renamed"),
             ("remove", "personal", "--yes"),
         ):
-            result = self.run_cli(*arguments)
+            result = self.run_cli_in_process(*arguments)
             self.assert_refused(result)
             self.assertIn("Auggie-enabled", result.stderr)
             self.assertEqual(self.filesystem_snapshot(self.home), before)
 
         self.assertEqual(
-            self.run_cli("augment", "disable", "personal").returncode, 0
+            self.run_cli_in_process("augment", "disable", "personal").returncode, 0
         )
         shutil.rmtree(self.home / ".augment")
         (self.home / ".augment").symlink_to(self.sandbox)
         before = self.filesystem_snapshot(self.home)
-        blocked = self.run_cli("rename", "personal", "renamed")
+        blocked = self.run_cli_in_process("rename", "personal", "renamed")
         self.assert_refused(blocked)
         self.assertIn("cannot be verified", blocked.stderr)
         self.assertEqual(self.filesystem_snapshot(self.home), before)
@@ -7243,7 +7584,7 @@ _skillset'''
                     "alpha",
                     "name: alpha\ndescription: alpha",
                 )
-                enabled = self.run_cli(
+                enabled = self.run_cli_in_process(
                     "augment", "enable", "personal", home=home
                 )
                 self.assertEqual(enabled.returncode, 0, enabled.stderr)
@@ -7254,7 +7595,7 @@ _skillset'''
                     registration.parent.rmdir()
                 before = self.filesystem_snapshot(home)
 
-                result = self.run_cli(*arguments, home=home)
+                result = self.run_cli_in_process(*arguments, home=home)
 
                 self.assert_refused(result)
                 self.assertIn("incomplete Auggie projection", result.stderr)
@@ -7283,7 +7624,7 @@ _skillset'''
                 unrelated.symlink_to(external, target_is_directory=True)
                 before_external = self.filesystem_snapshot(external)
 
-                result = self.run_cli(*arguments, home=home)
+                result = self.run_cli_in_process(*arguments, home=home)
 
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(unrelated.is_symlink())
@@ -7315,7 +7656,7 @@ _skillset'''
                     ("rename", "personal", "renamed"),
                     ("remove", "personal", "--yes"),
                 ):
-                    result = self.run_cli(*arguments, home=home)
+                    result = self.run_cli_in_process(*arguments, home=home)
 
                     self.assert_refused(result)
                     self.assertIn(
@@ -7347,7 +7688,7 @@ _skillset'''
                     ("rename", name, f"{name}-renamed"),
                     ("remove", name, "--yes"),
                 ):
-                    result = self.run_cli(*arguments)
+                    result = self.run_cli_in_process(*arguments)
                     self.assert_refused(result)
                     self.assertIn(
                         f"cannot be verified at {registration}",
@@ -7366,7 +7707,7 @@ _skillset'''
         self.initialize()
         self.make_set(self.root, "personal")
         self.assertEqual(
-            self.run_cli("codex", "enable", "personal").returncode, 0
+            self.run_cli_in_process("codex", "enable", "personal").returncode, 0
         )
         registration = self.home / ".augment" / ".skillsets" / "personal"
         registration.parent.mkdir(parents=True)
@@ -7377,7 +7718,7 @@ _skillset'''
             ("rename", "personal", "renamed"),
             ("remove", "personal", "--yes"),
         ):
-            result = self.run_cli(*arguments)
+            result = self.run_cli_in_process(*arguments)
             self.assert_refused(result)
             self.assertIn("Codex is enabled", result.stderr)
             self.assertIn(
@@ -7394,7 +7735,7 @@ _skillset'''
         self.initialize()
         self.make_set(self.root, "personal")
         self.assertEqual(
-            self.run_cli("augment", "enable", "personal").returncode, 0
+            self.run_cli_in_process("augment", "enable", "personal").returncode, 0
         )
         augment = self.home / ".augment"
         registrations = augment / ".skillsets"
@@ -7529,7 +7870,7 @@ _skillset'''
         self.write_skill(
             local_skills, "local", "name: local\ndescription: local"
         )
-        plain = self.run_cli("augment", "skills", "list", cwd=project)
+        plain = self.run_cli_in_process("augment", "skills", "list", cwd=project)
         colored = self.run_cli_tty("augment", "skills", "list", cwd=project)
 
         self.assertEqual(plain.returncode, 0, plain.stderr)
@@ -7586,7 +7927,7 @@ _skillset'''
         before_home = self.filesystem_snapshot(self.home)
         before_project = self.filesystem_snapshot(project)
 
-        plain = self.run_cli("augment", "skills", "list", "--verbose", cwd=project)
+        plain = self.run_cli_in_process("augment", "skills", "list", "--verbose", cwd=project)
         colored = self.run_cli_tty(
             "augment", "skills", "list", "--verbose", cwd=project
         )
@@ -7704,7 +8045,7 @@ _skillset'''
                 before_home = self.filesystem_snapshot(home)
                 before_project = self.filesystem_snapshot(project)
 
-                result = self.run_cli(
+                result = self.run_cli_in_process(
                     "augment", "skills", "list", home=home, cwd=project
                 )
 
@@ -7761,7 +8102,7 @@ _skillset'''
         before_project = self.filesystem_snapshot(project)
         before_external = self.filesystem_snapshot(external)
 
-        result = self.run_cli("augment", "skills", "list", cwd=project)
+        result = self.run_cli_in_process("augment", "skills", "list", cwd=project)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(result.stdout.startswith("SKILL"))
@@ -7798,8 +8139,8 @@ _skillset'''
         before_project = self.filesystem_snapshot(project)
         before_targets = self.filesystem_snapshot(targets)
 
-        first = self.run_cli("augment", "skills", "list", cwd=project)
-        second = self.run_cli("augment", "skills", "list", cwd=project)
+        first = self.run_cli_in_process("augment", "skills", "list", cwd=project)
+        second = self.run_cli_in_process("augment", "skills", "list", cwd=project)
 
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(second.returncode, 0, second.stderr)
@@ -7834,7 +8175,7 @@ _skillset'''
         before_home = self.filesystem_snapshot(self.home)
         before_project = self.filesystem_snapshot(project)
 
-        result = self.run_cli("augment", "skills", "list", cwd=project)
+        result = self.run_cli_in_process("augment", "skills", "list", cwd=project)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertLess(str(user_directory), str(workspace_directory))
@@ -7862,8 +8203,8 @@ _skillset'''
         before_home = self.filesystem_snapshot(self.home)
         before_project = self.filesystem_snapshot(project)
 
-        normal = self.run_cli("augment", "skills", "list", cwd=project)
-        verbose = self.run_cli("augment", "skills", "list", "--verbose", cwd=project)
+        normal = self.run_cli_in_process("augment", "skills", "list", cwd=project)
+        verbose = self.run_cli_in_process("augment", "skills", "list", "--verbose", cwd=project)
 
         self.assertEqual(normal.returncode, 0, normal.stderr)
         normal_directory = f"~/.augment/skills/{displayed}"
@@ -7925,7 +8266,7 @@ _skillset'''
         self.write_skill(skills, combining, "name: combining\ndescription: combining")
         self.write_skill(skills, "界界界", "name: wide\ndescription: wide")
 
-        result = self.run_cli("augment", "skills", "list", cwd=project)
+        result = self.run_cli_in_process("augment", "skills", "list", cwd=project)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
@@ -7948,7 +8289,7 @@ _skillset'''
         before_home = self.filesystem_snapshot(self.home)
         before_project = self.filesystem_snapshot(project)
 
-        result = self.run_cli("augment", "skills", "list", cwd=project)
+        result = self.run_cli_in_process("augment", "skills", "list", cwd=project)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         directory = "~/.augment/skills/valid"
@@ -8066,7 +8407,7 @@ _skillset'''
         before_home = self.filesystem_snapshot(self.home)
         before_project = self.filesystem_snapshot(project)
 
-        result = self.run_cli("augment", "skills", "list", cwd=project)
+        result = self.run_cli_in_process("augment", "skills", "list", cwd=project)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         directory = "~/.augment/skills/external"
@@ -8366,9 +8707,9 @@ _skillset'''
         before_home = self.filesystem_snapshot(self.home)
         before_project = self.filesystem_snapshot(project)
 
-        global_result = self.run_cli("augment", "skills", "list", "--global", cwd=project)
-        local_result = self.run_cli("augment", "skills", "list", "--local", cwd=project)
-        verbose = self.run_cli("augment", "skills", "list", "--verbose", cwd=project)
+        global_result = self.run_cli_in_process("augment", "skills", "list", "--global", cwd=project)
+        local_result = self.run_cli_in_process("augment", "skills", "list", "--local", cwd=project)
+        verbose = self.run_cli_in_process("augment", "skills", "list", "--verbose", cwd=project)
 
         self.assertEqual(global_result.returncode, 0, global_result.stderr)
         self.assertTrue(global_result.stdout.startswith("SKILL"))
@@ -8417,7 +8758,7 @@ _skillset'''
         before_home = self.filesystem_snapshot(self.home)
         before_project = self.filesystem_snapshot(project)
 
-        result = self.run_cli("augment", "skills", "list", cwd=project)
+        result = self.run_cli_in_process("augment", "skills", "list", cwd=project)
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
@@ -8434,7 +8775,7 @@ _skillset'''
         before_home = self.filesystem_snapshot(self.home)
         before_project = self.filesystem_snapshot(project)
 
-        result = self.run_cli("augment", "skills", "list", cwd=project)
+        result = self.run_cli_in_process("augment", "skills", "list", cwd=project)
 
         self.assert_refused(result)
         self.assertIn("could not inspect Auggie skill root", result.stderr)

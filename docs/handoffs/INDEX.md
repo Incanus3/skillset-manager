@@ -1,5 +1,4 @@
 # Workstream Handoffs
 
-| Slug | Status | Objective | Linked issue |
+| Slug | Status | Objective | Resume |
 | --- | --- | --- | --- |
-| _No active handoffs._ | — | — | — |

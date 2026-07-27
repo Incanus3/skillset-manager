@@ -4,23 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .augment import disable as augment_disable
-from .augment import enable as augment_enable
-from .augment import list_enabled as list_augment_enabled
-from .augment_discovery import list_effective_skills
-from .claude import disable as claude_disable
-from .claude import enable as claude_enable
-from .claude import list_enabled as list_claude_enabled
-from .completions import emit_completions
-from .codex import disable as codex_disable
-from .codex import enable as codex_enable
-from .codex import list_enabled as list_codex_enabled
-from .delegate import delegate_skills
-from .doctor import doctor
 from .errors import ClaudeInterrupted, OperationalError
-from .layout import discovery_operation_lock, operation_lock, stable_home_lock
-from .metadata import current, list_sets, printable_text, show
-from .operations import create, init, remove, rename, use
 
 
 class SkillsetArgumentParser(argparse.ArgumentParser):
@@ -261,54 +245,74 @@ def add_scope_options(
 
 def dispatch_locked_command(root, arguments, home_lock, lock_file, command_parser):
     if arguments.command == "init":
+        from .operations import init
+
         init(root, arguments.name)
     elif arguments.command == "create":
+        from .operations import create, use
+
         create(root, arguments.name, arguments.source, arguments.manual)
         if arguments.activate:
             use(root, arguments.name)
     elif arguments.command == "use":
+        from .operations import use
+
         use(root, arguments.name)
     elif arguments.command == "rename":
+        from .operations import rename
+
         rename(root, arguments.old, arguments.new)
     elif arguments.command == "remove":
+        from .operations import remove
+
         remove(root, arguments.name, arguments.yes)
     elif arguments.command == "list":
+        from .metadata import list_sets
+
         list_sets(root, arguments.verbose)
     elif arguments.command == "codex":
+        from . import codex
+
         if arguments.codex_command == "enable":
-            codex_enable(root, arguments.name, arguments.codex_scope)
+            codex.enable(root, arguments.name, arguments.codex_scope)
         elif arguments.codex_command == "disable":
-            codex_disable(root, arguments.name, arguments.codex_scope)
+            codex.disable(root, arguments.name, arguments.codex_scope)
         elif arguments.codex_command == "list":
-            list_codex_enabled(root, arguments.verbose, arguments.codex_scope)
+            codex.list_enabled(root, arguments.verbose, arguments.codex_scope)
         else:
             raise OperationalError(
                 f"unsupported Codex command: {arguments.codex_command}"
             )
     elif arguments.command == "claude":
+        from . import claude
+
         if arguments.claude_command == "enable":
-            claude_enable(root, arguments.name, arguments.claude_scope)
+            claude.enable(root, arguments.name, arguments.claude_scope)
         elif arguments.claude_command == "disable":
-            claude_disable(root, arguments.name, arguments.claude_scope)
+            claude.disable(root, arguments.name, arguments.claude_scope)
         elif arguments.claude_command == "list":
-            list_claude_enabled(
-                root, arguments.verbose, arguments.claude_scope
-            )
+            claude.list_enabled(root, arguments.verbose, arguments.claude_scope)
         else:
             raise OperationalError(
                 f"unsupported Claude Code command: {arguments.claude_command}"
             )
     elif arguments.command == "augment":
         if arguments.augment_command == "enable":
-            augment_enable(root, arguments.name, arguments.augment_scope)
+            from .augment import enable
+
+            enable(root, arguments.name, arguments.augment_scope)
         elif arguments.augment_command == "disable":
-            augment_disable(root, arguments.name, arguments.augment_scope)
+            from .augment import disable
+
+            disable(root, arguments.name, arguments.augment_scope)
         elif arguments.augment_command == "list":
-            list_augment_enabled(
-                root, arguments.verbose, arguments.augment_scope
-            )
+            from .augment import list_enabled
+
+            list_enabled(root, arguments.verbose, arguments.augment_scope)
         elif arguments.augment_command == "skills":
             if arguments.augment_skills_command == "list":
+                from .augment_discovery import list_effective_skills
+
                 list_effective_skills(
                     root,
                     arguments.verbose,
@@ -324,10 +328,16 @@ def dispatch_locked_command(root, arguments, home_lock, lock_file, command_parse
                 f"unsupported Auggie command: {arguments.augment_command}"
             )
     elif arguments.command == "current":
+        from .metadata import current
+
         current(root)
     elif arguments.command == "show":
+        from .metadata import show
+
         show(root, arguments.name)
     elif arguments.command == "skills":
+        from .delegate import delegate_skills
+
         delegate_skills(
             root,
             arguments.arguments,
@@ -352,8 +362,16 @@ def run_managed_command(root, arguments, command_parser):
     ) or (
         arguments.command == "augment" and arguments.augment_command == "list"
     ) or augment_discovery
+    from .layout import (
+        discovery_operation_lock,
+        operation_lock,
+        stable_home_lock,
+    )
+
     with stable_home_lock(root) as home_lock:
         if arguments.command == "doctor":
+            from .doctor import doctor
+
             return doctor(root, fix=arguments.fix)
         if augment_discovery:
             with discovery_operation_lock(root) as lock_file:
@@ -369,6 +387,8 @@ def run_managed_command(root, arguments, command_parser):
 
 
 def format_command_error(command, error, unexpected=False):
+    from .metadata import printable_text
+
     if command == "doctor":
         message = f"doctor inspection failed: {error}" if unexpected else error
         return f"skillset: error: {printable_text(message)}"
@@ -380,12 +400,16 @@ def main():
     command_parser = parser()
     arguments = command_parser.parse_args()
     if arguments.command == "completions":
+        from .completions import emit_completions
+
         emit_completions(arguments.shell)
         return 0
     root = Path.home() / ".agents"
     try:
         return run_managed_command(root, arguments, command_parser)
     except ClaudeInterrupted as error:
+        from .metadata import printable_text
+
         print(
             f"skillset: interrupted: {printable_text(error.message)}",
             file=sys.stderr,
