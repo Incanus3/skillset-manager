@@ -253,6 +253,8 @@ def doctor_skillset_entries(skillsets, errors, warnings):
         ):
             errors.append(f"stale create staging path must be recovered: {entry}")
             continue
+        if entry.name.startswith("."):
+            continue
         if not NAME_PATTERN.fullmatch(entry.name):
             errors.append(
                 f"invalid skillset name {entry.name!r} at {entry}; "

@@ -390,7 +390,9 @@ def list_scoped_sets(root, scoped_names, verbose, output=None):
 
 def list_sets(root, verbose, output=None):
     skillsets = validate_skillsets_directory(root)
-    names = sorted(entry.name for entry in skillsets.iterdir())
+    names = sorted(
+        entry.name for entry in skillsets.iterdir() if not entry.name.startswith(".")
+    )
     return list_named_sets(root, names, verbose, output)
 
 

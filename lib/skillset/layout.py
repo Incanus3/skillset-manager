@@ -219,6 +219,8 @@ def validate_skillset_entries(skillsets):
             raise OperationalError(
                 f"stale create staging path must be recovered: {entry}"
             )
+        if entry.name.startswith("."):
+            continue
         validate_name(entry.name)
         skillset_mode(entry)
 

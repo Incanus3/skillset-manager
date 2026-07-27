@@ -4502,9 +4502,24 @@ _skillset'''
                     self.assert_refused(result)
                     if command == "create":
                         self.assertFalse((self.root / "skillsets" / name).exists())
+        renamed = self.run_cli("rename", "default", ".hidden")
+        self.assert_refused(renamed)
+        self.assertTrue((self.root / "skillsets" / "default").is_dir())
+        self.assertFalse(os.path.lexists(self.root / "skillsets" / ".hidden"))
         result = self.run_cli("create", "copy", "--from", "../default")
         self.assert_refused(result)
         self.assertFalse((self.root / "skillsets" / "copy").exists())
+
+    def test_hidden_skillset_metadata_is_ignored(self):
+        self.initialize()
+        self.make_set(self.root, "extra")
+        (self.root / "skillsets" / ".git").mkdir()
+
+        for arguments in (("doctor",), ("list",), ("list", "--verbose")):
+            with self.subTest(arguments=arguments):
+                result = self.run_cli(*arguments)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn(".git", result.stdout)
 
     def test_init_from_empty_state_creates_exact_layout(self):
         result = self.run_cli("init", "default")
