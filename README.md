@@ -585,12 +585,15 @@ use `~`; paths outside it remain absolute:
 | 5 | `User/.agents` | `~/.agents/skills` |
 | 6 | `Workspace/.agents` | `$PWD/.agents/skills` |
 
-Only direct child directories containing `SKILL.md` are candidates. The first
-candidate for a skill-directory name wins; lower-precedence duplicates are
-omitted. Effective winners print first in lexicographic concise source-label
-order, then in canonical resolved skill-directory order. On eligible TTY output, headers are bold, dividers are
-dim, skill names and `~/...` sources are cyan, and `./...` sources are green.
-Captured output and TTY output with `NO_COLOR` set or `TERM=dumb` remain plain.
+Only direct child directories containing `SKILL.md` are healthy candidates.
+Dangling direct child symlinks remain visible as `[broken: missing target]`
+rows rather than aborting discovery. The first candidate for a skill-directory
+name wins; lower-precedence duplicates are omitted. Effective winners print
+first in lexicographic concise source-label order, then in canonical resolved
+skill-directory order. On eligible TTY output, headers are bold, dividers are
+dim, healthy skill names and `~/...` sources are cyan, `./...` sources are
+green, and broken rows are red. Captured output and TTY output with `NO_COLOR`
+set or `TERM=dumb` remain plain.
 `--verbose` instead retains its non-tabular diagnostic blocks: its first line
 uses bracketed concise source labels, followed by unchanged resolved-directory
 and `SKILL.md` detail lines. The command resolves all six roots before
