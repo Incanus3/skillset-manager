@@ -140,8 +140,10 @@ directory between independently locked installations is unsupported.
 - accepts the exact configured link and then diagnoses named sets normally;
 - never creates or rewrites `config.json` or the configured source.
 
-`doctor --fix` retains its current narrow repair scope. It does not create a
-missing configured source or guess a configured link.
+`doctor --fix` does not create or rewrite the configured source. It can restore
+a missing configured link from the exact configured path. When runtime aliases
+are also missing, it asks the user to choose a valid named skillset before
+recreating the canonical aliases; it never guesses the active set.
 
 ## Migration
 

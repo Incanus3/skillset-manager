@@ -6,6 +6,7 @@ import json
 from .errors import OperationalError
 from .layout import (
     NAME_PATTERN,
+    configured_skillsets_directory,
     doctor_operation_lock,
     ensure_manual_sentinel,
     lexists,
@@ -16,6 +17,7 @@ from .layout import (
     read_lockfile,
     real_kind,
     set_mode,
+    skillset_mode,
     USE_STAGING,
     validate_manual_sentinel,
     validate_skillsets_directory,
@@ -433,8 +435,50 @@ def doctor_findings(root):
     return errors, warnings
 
 
-def safe_repair_candidates(root):
-    """Return missing files that can be recreated without guessing metadata."""
+def repairable_active_names(root):
+    """Return valid configured skillsets that can be selected interactively."""
+    try:
+        skillsets = configured_skillsets_directory(root)
+    except OperationalError:
+        return []
+    if skillsets is None:
+        return []
+    link = root / "skillsets"
+    if lexists(link):
+        try:
+            validate_skillsets_directory(root)
+        except OperationalError:
+            return []
+    try:
+        entries = sorted(skillsets.iterdir(), key=lambda path: path.name)
+    except OSError:
+        return []
+    names = []
+    for entry in entries:
+        if not NAME_PATTERN.fullmatch(entry.name):
+            continue
+        try:
+            skillset_mode(entry)
+        except OperationalError:
+            continue
+        names.append(entry.name)
+    return names
+
+
+def select_active_repair(root):
+    names = repairable_active_names(root)
+    if not names:
+        return None
+    print("Select the active skillset to restore:", file=sys.stderr)
+    for name in names:
+        print(f"  {name}", file=sys.stderr)
+    print("Active skillset (blank to cancel): ", end="", file=sys.stderr, flush=True)
+    selected = sys.stdin.readline().strip()
+    return selected if selected in names else None
+
+
+def safe_repair_candidates(root, active_name=None):
+    """Return missing entries that can be recreated without guessing metadata."""
     if not real_kind(root, stat.S_ISDIR):
         return []
 
@@ -444,29 +488,54 @@ def safe_repair_candidates(root):
 
     candidates = []
     if not lexists(advisory_lock):
-        candidates.append(advisory_lock)
+        candidates.append((advisory_lock, None))
 
+    skillsets_link = root / "skillsets"
     try:
-        skillsets = validate_skillsets_directory(root)
+        configured = configured_skillsets_directory(root)
     except OperationalError:
         return candidates
+    if configured is not None and not lexists(skillsets_link):
+        skillsets = configured
+        candidates.append((skillsets_link, os.fspath(configured)))
+    else:
+        try:
+            skillsets = validate_skillsets_directory(root)
+        except OperationalError:
+            return candidates
     try:
         entries = sorted(skillsets.iterdir(), key=lambda path: path.name)
     except OSError:
         return candidates
     active = root / "active"
-    if active.is_symlink():
+    if active_name is None and active.is_symlink():
         try:
             target = os.readlink(active)
             prefix = "skillsets/"
             active_name = target[len(prefix) :] if target.startswith(prefix) else ""
             if target == prefix + active_name and NAME_PATTERN.fullmatch(active_name):
-                if set_mode(root, active_name) == "manual":
-                    sentinel = manual_sentinel_path(root)
-                    if not lexists(sentinel):
-                        candidates.append(sentinel)
+                skillset_mode(skillsets / active_name)
         except (OSError, OperationalError):
-            pass
+            active_name = None
+    if active_name is not None:
+        try:
+            mode = skillset_mode(skillsets / active_name)
+        except OperationalError:
+            active_name = None
+        else:
+            if not lexists(active):
+                candidates.append((active, f"skillsets/{active_name}"))
+            skills_alias = root / "skills"
+            if not lexists(skills_alias):
+                candidates.append((skills_alias, "active/skills"))
+            lock_alias = root / ".skill-lock.json"
+            lock_target = MANUAL_SENTINEL if mode == "manual" else "active/.skill-lock.json"
+            if not lexists(lock_alias):
+                candidates.append((lock_alias, lock_target))
+            if mode == "manual":
+                sentinel = manual_sentinel_path(root)
+                if not lexists(sentinel):
+                    candidates.append((sentinel, None))
     for entry in entries:
         if not NAME_PATTERN.fullmatch(entry.name) or not real_kind(entry, stat.S_ISDIR):
             continue
@@ -484,21 +553,32 @@ def safe_repair_candidates(root):
                 continue
         except OSError:
             continue
-        candidates.append(lockfile)
+        candidates.append((lockfile, None))
     return candidates
 
 
 def confirm_repairs(candidates):
     print("Create these safe replacement files?", file=sys.stderr)
-    for candidate in candidates:
+    for candidate, _target in candidates:
         print(f"  {candidate}", file=sys.stderr)
     print("Proceed? [y/N] ", end="", file=sys.stderr, flush=True)
     return sys.stdin.readline().strip().lower() in {"y", "yes"}
 
 
-def repair_empty_lockfiles(root):
+def repair_candidates(root, active_name):
     repaired = []
-    for candidate in safe_repair_candidates(root):
+    for candidate, target in safe_repair_candidates(root, active_name):
+        if target is not None:
+            try:
+                os.symlink(target, candidate)
+            except FileExistsError:
+                continue
+            except OSError as error:
+                raise OperationalError(
+                    f"could not create replacement alias {candidate}: {error}"
+                ) from error
+            repaired.append(candidate)
+            continue
         if candidate == manual_sentinel_path(root):
             try:
                 ensure_manual_sentinel(root)
@@ -544,15 +624,22 @@ def doctor(root, fix=False):
             recover_staged_use(root)
         errors, warnings = doctor_findings(root)
 
-    candidates = safe_repair_candidates(root)
+    active_name = None
+    if not lexists(root / "active"):
+        active_name = select_active_repair(root)
+        if active_name is None:
+            emit_findings(errors, warnings)
+            return 1 if errors else 0
+
+    candidates = safe_repair_candidates(root, active_name)
     if not candidates or not confirm_repairs(candidates):
         emit_findings(errors, warnings)
         return 1 if errors else 0
 
     advisory_lock = root / ".skillset.lock"
-    advisory_was_missing = advisory_lock in candidates
+    advisory_was_missing = any(candidate == advisory_lock for candidate, _ in candidates)
     with operation_lock(root, create=True):
-        repaired = repair_empty_lockfiles(root)
+        repaired = repair_candidates(root, active_name)
         errors = []
         warnings = []
         doctor_inspection(root, errors, warnings)
