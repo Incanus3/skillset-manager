@@ -7568,6 +7568,20 @@ _skillset'''
         self.assertIn(str(registrations / "default"), result.stderr)
         self.assertEqual(self.filesystem_snapshot(self.home), before)
 
+    def test_augment_list_ignores_an_unmanaged_skills_symlink_without_registrations(self):
+        self.initialize()
+        augment = self.home / ".augment"
+        augment.mkdir()
+        skills = augment / "skills"
+        skills.symlink_to(self.root / "skills", target_is_directory=True)
+        before = self.filesystem_snapshot(self.home)
+
+        result = self.run_cli_in_process("augment", "list")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+
     def test_augment_global_registration_and_malformed_containers_block_lifecycle(self):
         self.initialize()
         self.make_set(self.root, "personal")
