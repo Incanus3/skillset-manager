@@ -188,6 +188,12 @@ def same_scope_directory(root):
     return same_directory(global_root, local_root)
 
 
+def same_list_scope_directory(root):
+    global_root, _global_skills, _global_registrations = scope_paths(root, "global")
+    local_root, _local_skills, _local_registrations = scope_paths(root, "local")
+    return same_directory(global_root, local_root)
+
+
 def create_scope_directory(
     path,
     create,
@@ -724,7 +730,30 @@ def disable(root, name, scope):
             ) from error
 
 
+def registered_names(root, scope):
+    augment, _skills, registrations = scope_paths(root, scope)
+    if not lexists(augment):
+        return []
+    if not real_kind(augment, stat.S_ISDIR):
+        _container_error(augment)
+    if not lexists(registrations):
+        return []
+    if not real_kind(registrations, stat.S_ISDIR):
+        _container_error(registrations)
+    label = "global" if scope == "global" else "local"
+    try:
+        entries = sorted(registrations.iterdir(), key=lambda path: path.name)
+    except OSError as error:
+        raise OperationalError(
+            f"could not inspect Auggie registrations in {label} "
+            f"scope at {registrations}: {error}"
+        ) from error
+    return [entry.name for entry in entries if NAME_PATTERN.fullmatch(entry.name)]
+
+
 def synchronized_names(root, scope):
+    if not registered_names(root, scope):
+        return []
     with ExitStack() as stack:
         scope_state = open_existing_scope(root, scope, stack)
         if scope_state.registrations_fd is None:
@@ -814,7 +843,7 @@ def list_enabled(root, verbose, scope):
         global_names = synchronized_names(root, "global")
         local_names = (
             []
-            if same_scope_directory(root)
+            if same_list_scope_directory(root)
             else synchronized_names(root, "local")
         )
         validate_names_against_other_scope(root, "global", global_names)
