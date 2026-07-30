@@ -1374,6 +1374,37 @@ _skillset'''
         self.assertIn(f"skillset: repaired: created {advisory_lock}", result.stderr)
         self.assertTrue(advisory_lock.is_file())
 
+    def test_doctor_fix_restores_missing_configured_aliases_after_active_selection(self):
+        external = self.sandbox / "configured-skillsets"
+        (external / "default" / "skills").mkdir(parents=True)
+        self.write_lock(external / "default" / ".skill-lock.json")
+        (external / "personal" / "skills").mkdir(parents=True)
+        self.write_lock(external / "personal" / ".skill-lock.json")
+        self.write_config(self.home, external)
+
+        result = self.run_cli("doctor", "--fix", input_text="personal\nyes\n")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Select the active skillset to restore:", result.stderr)
+        self.assertIn("  personal", result.stderr)
+        self.assertIn("Create these safe replacement files?", result.stderr)
+        self.assertEqual(os.readlink(self.root / "skillsets"), str(external))
+        self.assert_aliases(self.root, "personal")
+        self.assertEqual(self.run_cli("doctor").returncode, 0)
+
+    def test_doctor_fix_keeps_missing_configured_aliases_when_active_selection_is_cancelled(self):
+        external = self.sandbox / "configured-skillsets"
+        (external / "default" / "skills").mkdir(parents=True)
+        self.write_lock(external / "default" / ".skill-lock.json")
+        self.write_config(self.home, external)
+        before = self.filesystem_snapshot(self.home)
+
+        result = self.run_cli("doctor", "--fix", input_text="\n")
+
+        self.assert_refused(result)
+        self.assertIn("Select the active skillset to restore:", result.stderr)
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+
     def test_doctor_aggregates_pristine_home_without_creating_agents_root(self):
         before = self.filesystem_snapshot(self.home)
 

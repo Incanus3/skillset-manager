@@ -644,8 +644,10 @@ them. When an error names recovery paths:
 5. Run `skillset doctor` again after manual recovery.
 
 `doctor --fix` can repair a deliberately small set of lossless omissions after
-an interactive `y` or `yes` confirmation. It may create a missing advisory lock
-and a missing version-3 empty lockfile only when that skillset's `skills`
-directory is empty. It does not overwrite existing files. Each created file is
-reported as `skillset: repaired:`. Resolve every other finding manually after
-preserving the data it identifies.
+an interactive confirmation. It may create a missing advisory lock and a
+missing version-3 empty lockfile only when that skillset's `skills` directory is
+empty. For a configured external directory with missing runtime aliases, it can
+restore the configured `skillsets` link and asks which valid named skillset to
+make active before recreating the canonical aliases. It does not overwrite
+existing files. Each created entry is reported as `skillset: repaired:`. Resolve
+every other finding manually after preserving the data it identifies.
