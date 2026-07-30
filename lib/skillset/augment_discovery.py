@@ -21,6 +21,7 @@ class EffectiveSkill:
     name: str
     source: DiscoveryRoot
     path: Path
+    reason: str | None = None
 
 
 def discovery_roots(root):
@@ -61,6 +62,11 @@ def skill_candidates(source):
     for entry in entries:
         try:
             metadata = entry.stat()
+        except FileNotFoundError:
+            candidates.append(
+                EffectiveSkill(entry.name, source, entry, "missing target")
+            )
+            continue
         except OSError as error:
             raise OperationalError(
                 f"could not inspect Auggie skill candidate {entry}: {error}"
@@ -149,20 +155,37 @@ def render_skill_table(rows, output):
     if terminal_width is not None:
         separator = separator[:terminal_width]
     print(metadata.styled(separator, metadata.DIM, colored), file=output)
-    for skill, source, directory in rows:
-        skill_cell = metadata.styled(skill, metadata.CYAN, colored)
+    for skill, source, directory, reason in rows:
+        color = metadata.RED if reason is not None else metadata.CYAN
+        skill_cell = metadata.styled(skill, color, colored)
         skill_cell += metadata.pad_display(
             "", widths[0] - metadata.display_width(skill)
         )
-        source_cell = style_source(source, colored)
+        source_cell = (
+            metadata.styled(source, metadata.RED, colored)
+            if reason is not None
+            else style_source(source, colored)
+        )
         source_cell += metadata.pad_display(
             "", widths[1] - metadata.display_width(source)
         )
-        print(f"{skill_cell} {divider} {source_cell} {divider} {directory}", file=output)
+        directory_cell = (
+            metadata.styled(directory, metadata.RED, colored)
+            if reason is not None
+            else directory
+        )
+        print(
+            f"{skill_cell} {divider} {source_cell} {divider} {directory_cell}",
+            file=output,
+        )
 
 
-def render_verbose_skill_line(skill, source, directory, colored):
+def render_verbose_skill_line(skill, source, directory, reason, colored):
     source_label = f"[{source}]"
+    if reason is not None:
+        return metadata.styled(
+            f"{skill} {source_label} {directory}", metadata.RED, colored
+        )
     return (
         f"{metadata.styled(skill, metadata.CYAN, colored)} "
         f"{style_source(source_label, colored)} {directory}"
@@ -172,7 +195,7 @@ def render_verbose_skill_line(skill, source, directory, colored):
 def list_effective_skills(root, verbose, scope, output=None):
     output = sys.stdout if output is None else output
     skills = [
-        (skill, skill.path.resolve())
+        (skill, skill.path if skill.reason is not None else skill.path.resolve())
         for skill in effective_skills(root)
         if scope == "all" or skill.source.scope == scope
     ]
@@ -183,23 +206,30 @@ def list_effective_skills(root, verbose, scope, output=None):
         key=lambda item: (display_source_label(item[0].source.label), str(item[1])),
     ):
         skill_file = skill.path / "SKILL.md"
-        displayed_directory = display_skill_path(directory, home)
+        displayed_directory = metadata.printable_text(display_skill_path(directory, home))
+        if skill.reason is not None:
+            displayed_directory = f"[broken: {skill.reason}] {displayed_directory}"
         rows.append(
             (
                 metadata.printable_text(skill.name),
                 display_source_label(skill.source.label),
-                metadata.printable_text(displayed_directory),
+                displayed_directory,
                 directory,
                 skill_file,
+                skill.reason,
             )
         )
     if not verbose:
-        render_skill_table(tuple(row[:3] for row in rows), output)
+        render_skill_table(
+            tuple((row[0], row[1], row[2], row[5]) for row in rows), output
+        )
         return
     colored = metadata.color_enabled(output)
-    for skill, source, displayed_directory, directory, skill_file in rows:
+    for skill, source, displayed_directory, directory, skill_file, reason in rows:
         print(
-            render_verbose_skill_line(skill, source, displayed_directory, colored),
+            render_verbose_skill_line(
+                skill, source, displayed_directory, reason, colored
+            ),
             file=output,
         )
         print(

@@ -8355,6 +8355,46 @@ _skillset'''
         self.assertEqual(self.filesystem_snapshot(self.home), before_home)
         self.assertEqual(self.filesystem_snapshot(project), before_project)
 
+    def test_augment_skills_list_reports_dangling_candidate_symlinks(self):
+        self.initialize()
+        project = self.sandbox / "augment-discovery-dangling-candidate-project"
+        project.mkdir()
+        skills = self.home / ".claude" / "skills"
+        skills.mkdir(parents=True)
+        (skills / "missing").symlink_to(self.sandbox / "missing-skill")
+        before_home = self.filesystem_snapshot(self.home)
+        before_project = self.filesystem_snapshot(project)
+
+        result = self.run_cli_in_process("augment", "skills", "list", cwd=project)
+        tty = self.run_cli_tty("augment", "skills", "list", cwd=project)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        directory = "[broken: missing target] ~/.claude/skills/missing"
+        self.assertEqual(
+            result.stdout,
+            "".join(
+                (
+                    "SKILL".ljust(len("missing"))
+                    + " | SOURCE".ljust(len(" | ~/.claude"))
+                    + " | "
+                    + "DIRECTORY".ljust(len(directory))
+                    + "\n",
+                    "-" * (len("missing") + 1)
+                    + "|"
+                    + "-" * (len("~/.claude") + 2)
+                    + "|"
+                    + "-" * (len(directory) + 1)
+                    + "\n",
+                    f"missing | ~/.claude | {directory}\n",
+                )
+            ),
+        )
+        self.assertEqual(tty.returncode, 0, tty.stderr)
+        self.assertIn("\x1b[31mmissing\x1b[0m", tty.stdout)
+        self.assertIn(f"\x1b[31m{directory}\x1b[0m", tty.stdout)
+        self.assertEqual(self.filesystem_snapshot(self.home), before_home)
+        self.assertEqual(self.filesystem_snapshot(project), before_project)
+
     def test_augment_skills_list_reports_candidate_inspection_failures_without_mutation(self):
         self.initialize()
         project = self.sandbox / "augment-discovery-candidate-failure-project"
