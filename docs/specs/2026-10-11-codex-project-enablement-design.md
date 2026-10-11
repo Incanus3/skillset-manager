@@ -1,7 +1,7 @@
 # Codex enablement across a clone's worktrees
 
 Date: 2026-10-11
-Status: Proposed specification; implementation is not authorized
+Status: Approved design and implementation plan; execution pending resumption
 Workstream: `codex-project-enablement`
 
 ## Enable once, then discover the collection in every worktree
@@ -13,25 +13,25 @@ clones of the same remote remain independent.
 
 The operator accepted separate project scope, retaining `--local` and the
 global default, and requiring Git 2.54+ for native config-based hooks. The
-operator requested the simpler solution for existing local links. This design
-therefore proposes ordinary canonical links with no origin ledger: project
-disable removes matching links, including ones enabled locally beforehand.
-That consequence is part of the review scope, not a separately confirmed
-operator choice.
+operator requested the simpler solution for existing local links. The operator accepted ordinary canonical links with no origin ledger:
+project disable removes matching links, including ones enabled locally
+beforehand (D3).
 
-## Decisions requiring review
+<a id="decisions-requiring-review"></a>
+
+## Accepted design decisions
 
 | ID | Status | Choice | Concrete cost | Contract |
 | --- | --- | --- | --- | --- |
-| D3 | Proposed | Treat every matching link as an ordinary local link | Project disable also removes pre-existing local links | [Link semantics](#ordinary-links-have-no-origin-ledger) |
-| D4 | Proposed | Store one registration in the Git common directory, bound to one home | Another home cannot manage the same registration | [Shared state](#one-registration-belongs-to-the-git-common-directory) |
-| D5 | Proposed | Keep registration until disable finishes; recover by repeating commands | A failed disable can be undone by a later checkout while registration remains | [Recovery](#partial-operations-retain-registration-for-retry) |
-| D6 | Proposed | Bind the hook to the invoking executable and home; swallow its ordinary failures | Moving the executable requires disable/re-enable; failed setup can leave a worktree without skills | [Hook contract](#the-named-hook-reconciles-only-the-invoking-worktree) |
-| D7 | Proposed | Keep unscoped list unchanged; make project listing a read-only health check | Unscoped list does not show the clone registration itself | [Listing](#project-list-reports-registration-and-reconciliation-errors) |
-| D8 | Proposed | Do not index projects globally or extend collection lifecycle blockers | Users must disable project registrations before collection rename/removal | [Source lifecycle](#source-lifecycle-and-worktree-moves) |
-| D9 | Proposed | Leave ignore rules under operator control | Generated links can appear as untracked files | [Ignored state](#generated-links-are-not-repository-content) |
 | D1 | Accepted | Add `--project`; preserve existing scopes and defaults | One additional scope flag | [CLI](#cli-scopes-remain-explicit) |
-| D2 | Accepted | Require Git 2.54+ and use native named hooks | Project scope is unavailable with older Git | [Hook ownership](#native-hooks-preserve-existing-hook-ownership) |
+| D2 | Accepted | Require Git 2.54+ and use one shared native named hook | Project scope is unavailable with older Git | [Hook ownership](#native-hooks-preserve-existing-hook-ownership) |
+| D3 | Accepted | Treat every matching link as an ordinary local link | Project disable also removes pre-existing local links | [Link semantics](#ordinary-links-have-no-origin-ledger) |
+| D4 | Accepted | Store one shared names list for all harnesses in clone registration; use inherited HOME and PATH | Hook setup depends on the invoking environment | [Shared state](#one-registration-belongs-to-the-git-common-directory) |
+| D5 | Accepted | Keep registration until disable finishes; recover by repeating commands | A failed disable can be undone by a later checkout while registration remains | [Recovery](#partial-operations-retain-registration-for-retry) |
+| D6 | Accepted | Warn and return zero after ordinary hook failures | Failed setup can leave a worktree without skills | [Hook contract](#the-named-hook-reconciles-only-the-invoking-worktree) |
+| D7 | Accepted | Include `[p]` registration rows in unscoped list; reserve full health checking for `--project` | One collection can appear under both `[l]` and `[p]` | [Listing](#project-list-reports-registration-and-reconciliation-errors) |
+| D8 | Accepted | Do not index projects globally or extend collection lifecycle blockers | Users must disable project registrations before collection rename/removal | [Source lifecycle](#source-lifecycle-and-worktree-moves) |
+| D9 | Accepted | Leave ignore rules under operator control | Generated links can appear as untracked files | [Ignored state](#generated-links-are-not-repository-content) |
 
 Inherited requirements: clone-wide automation must include ordinary Orca
 worktree creation without an Orca setup-script call; preserve unrelated
@@ -48,7 +48,7 @@ flowchart LR
     Enable["Explicit project enable"] --> Registry["Shared clone registration"]
     Enable --> All["Reconcile existing worktrees"]
     Checkout["Git or Orca checkout"] --> Hook["Native named hook"]
-    Registry -->|"desired names and home"| Hook
+    Registry -->|"desired names"| Hook
     Hook --> One["Reconcile invoking worktree"]
     All --> Links["Ordinary local links"]
     One --> Links
@@ -56,6 +56,16 @@ flowchart LR
 
 Registration records desired clone-wide enablement. The hook reads it;
 ordinary links carry no separate scope or origin metadata.
+
+The project infrastructure is harness-neutral: one shared names list, one
+named Git hook and one internal dispatcher. Git discovery, persistence, hook
+ownership and recovery belong to that shared layer. Harness-specific code
+owns destination paths and link reconciliation. Current scope exposes project
+operations only through Codex subcommands and reconciles only Codex links.
+Later harness support will consume the same selection and hook, without
+separate registrations or named hooks. No other harness integration or generic
+plugin framework is implemented in this feature.
+
 
 ## Observable scenarios
 
@@ -89,15 +99,17 @@ skillset codex list --project --verbose
   and `-l`/`--local` on Codex enable, disable and list. Conflicting flags are
   argparse usage errors, exit 2, before any mutation.
 - Enable and disable retain global scope as their default. Unscoped list
-  retains the existing global plus exact-current-directory local view.
+  retains the global and exact-current-directory local views and adds enclosing
+  clone registration with `[p]` markers.
 - `--local` retains its exact current-directory behavior, including outside
   Git and beneath a worktree root. It does not resolve a repository root.
 - Project scope resolves the enclosing Git worktree, including from a
   subdirectory or detached HEAD. A submodule is its own repository. A bare
   repository directory is refused; a linked non-bare worktree of a bare
   repository is supported, with the bare entry excluded from projection.
-- Only project scope requires Git 2.54+. Existing scopes and other command
-  groups acquire no new Git dependency or scope flags.
+- Only project scope requires Git 2.54+. Explicit global/local scopes and other command groups acquire no new Git
+  dependency or scope flags. Unscoped list opportunistically uses Git for
+  registration discovery; it still works when Git is unavailable.
 - Successful enable/disable remain silent and return 0. Operational errors
   use the existing `skillset: MESSAGE` convention and return 1. Ctrl+C in
   explicit commands retains the CLI's interrupt convention and exit 130.
@@ -108,7 +120,7 @@ A projected entry is exactly the existing Codex collection link:
 
 ```text
 <worktree>/.codex/skills/<name>
-  -> <registered-home>/.agents/skillsets/<name>/skills
+  -> <current-home>/.agents/skillsets/<name>/skills
 ```
 
 Use the existing absolute-target comparison: an absolute target whose
@@ -157,10 +169,11 @@ error; do not prune or unlock it automatically. The operator restores it or
 uses Git's worktree maintenance commands before retrying. No worktree-path
 cache is needed; Git's current worktree inventory remains authoritative.
 
-The single new persistent file is:
+The single new persistent file is harness-neutral; this feature only implements
+Codex project enablement:
 
 ```text
-<git-common-dir>/skillset-codex.json
+<git-common-dir>/project-skillsets.json
 ```
 
 Example schema, containing exactly these keys:
@@ -168,23 +181,25 @@ Example schema, containing exactly these keys:
 ```json
 {
   "version": 1,
-  "home": "/home/alice",
-  "executable": "/home/alice/.local/bin/skillset",
   "names": ["obra", "personal"]
 }
 ```
 
-- `version` is integer 1. Home and executable are nonempty normalized absolute
-  paths. `names` is a nonempty, sorted list of unique valid skillset names.
-- Home is the normalized absolute home used for the explicit enable. Targets
-  keep the stable `.agents/skillsets` spelling, including when configured
-  storage lives elsewhere. Do not store the active set or upstream lock data.
-- Preserve the invoking executable's absolute path, including a stable symlink;
-  resolve a PATH-only invocation with `shutil.which`. Do not resolve it into a
-  movable source checkout unnecessarily. Require an executable regular-file
-  target at enable time. In-process tests must supply a deliberate entry point.
-- A different invoking home is refused for project management; disabling with
-  the recorded home then enabling with another home is the migration path.
+- `version` is integer 1. `names` is a nonempty, sorted list of unique valid
+  skillset names. The top-level keys are exactly `version` and `names`. Do not
+  store home, executable, active set or upstream lock data.
+- The list is shared across harnesses, not keyed by harness. Current product
+  functionality consumes it only through Codex project subcommands; future
+  harness implementations will use this same selection. This feature adds no
+  project commands, links or hooks for other harnesses.
+- Commands resolve collections using their normal inherited home. Targets keep
+  the stable `.agents/skillsets` spelling, including when configured storage
+  lives elsewhere. The hook resolves `skillset` through standard `PATH` precedence.
+- The operator rejected persistent home/executable binding: changing `HOME` and
+  sharing one clone between users are outside the intended workflow. Recording
+  names is sufficient for that workflow and avoids executable migration rules.
+  Environment changes are not detected or migrated; existing absolute links
+  continue to be compared against the current home's expected targets.
 - The file must be a real regular UTF-8 JSON file. Malformed or unsupported
   state is refused unchanged, with its path and reason. Missing state is
   unregistered. Empty state is not a supported on-disk schema.
@@ -208,17 +223,16 @@ remains best effort.
 The command owns only these two keys in the common repository config:
 
 ```text
-hook.skillset-codex-project.command
-hook.skillset-codex-project.event = post-checkout
+hook.skillset-project.command
+hook.skillset-project.event = post-checkout
 ```
 
 Use Git config commands with explicit repository-local scope, not a text
-rewrite of config. The stored command is generated deterministically from the
-registered home and executable. No hook file, `core.hooksPath`, other named
+rewrite of config. The stored command is a fixed shell wrapper using inherited `HOME` and `PATH`. No hook file, `core.hooksPath`, other named
 hook, worktree-specific config or global Git config is modified.
 
 Preflight checks all occurrences and effective values of the reserved hook
-subsection in the invoking and other accessible worktrees. Without a valid
+subsection in the invoking and other accessible worktrees. Without valid
 registration, any reserved subsection is a conflict. With registration, owned
 keys may be missing after interruption or match the generated command and
 single event; additional keys, duplicate values, inherited occurrences or
@@ -248,25 +262,24 @@ been runtime-tested.
 
 ## The named hook reconciles only the invoking worktree
 
-Add an internal Codex subcommand `_project-hook` taking Git's old HEAD, new
-HEAD and checkout flag. It is omitted from user help and completion. It has no
+Add a hidden top-level command `skillset _project-hook` taking Git's old HEAD,
+new HEAD and checkout flag. It is omitted from user help and completion. It has no
 scope/name flags and is not a supported user entry point.
 
-The configured shell command calls the stored executable with the recorded
-home in its child environment, forwards the three arguments and returns zero
+The configured shell command invokes `skillset` through standard `PATH`
+precedence, inherits `HOME`, forwards the three arguments and returns zero
 after any ordinary invocation failure. Use a shell function so Git's appended
-arguments reach the invocation, with both filesystem paths quoted using
-`shlex.quote`. A representative template is:
+arguments reach the invocation. A representative template is:
 
 ```sh
-skillset_codex_hook() {
-  if HOME='/home/alice' '/home/alice/.local/bin/skillset' codex _project-hook "$@"; then
+skillset_project_hook() {
+  if skillset _project-hook "$@"; then
     :
   else
     printf '%s\n' 'skillset: project hook failed; rerun project enable or inspect project list' >&2
   fi
   return 0
-}; skillset_codex_hook
+}; skillset_project_hook
 ```
 
 Generate one shell line for Git config; pass that line as one subprocess
@@ -280,9 +293,13 @@ This adds no persistent launcher file.
 - Discover the common directory afresh; do not embed its absolute path in the
   hook command. Missing registration is a quiet no-op. Unsupported state is
   reported and preserved.
-- Use the recorded home, validate each registered source independently and
+- Use the inherited home, validate each registered source independently and
   preserve existing canonical links. Missing/invalid sources produce errors
   without creating new dangling links; other valid names still reconcile.
+- The shared dispatcher invokes the supported harness reconciler for this
+  worktree; currently this is Codex only. Future harness implementations reuse
+  this dispatcher and shared selection, rather than adding harness-specific
+  Git hook keys or entry points.
 - Reconcile only this worktree, not every worktree. It must not invoke Git
   checkout or recurse into its own hook. It never changes registration/config.
 - Normal success has no output. Detailed failures go to stderr, never stdout;
@@ -291,15 +308,12 @@ This adds no persistent launcher file.
   killed process, unavailable shell, or invalid externally edited Git config.
 - No Orca setup script or Orca-specific product code is involved.
 
-Binding to the invoking executable avoids relying on a GUI's PATH to find
-`skillset`. Python 3 and Git must still be available in the hook environment.
-The executable binding remains fixed for the lifetime of a registration.
-Calling enable through another entry point retains that binding and requires
-the recorded executable to remain usable. To change its location, disable all
-registered names using the recorded home, then enable them from the new
-installation. Disable does not require the recorded executable to exist. This
-avoids a second migration state for interrupted executable/config updates.
-No self-contained copy of the implementation is installed in Git metadata.
+The hook environment must provide `skillset`, Python 3 and Git through `PATH`.
+A different `skillset` installation earlier in `PATH` is used normally. Moving
+an installation needs no registration update if `PATH` still resolves it.
+A missing executable produces the wrapper warning; environment repair followed
+by checkout or repeated project enable is the recovery path. No self-contained
+copy of the implementation is installed in Git metadata.
 
 Git documents that branch checkout, switch and ordinary worktree add trigger
 `post-checkout`; bare `--no-checkout` creation does not. The installed Orca
@@ -316,8 +330,7 @@ version; SSH/WSL execution is not yet verified.
    existing registration and hook ownership. Build the desired name union.
 2. Preflight every desired source, worktree and destination. A known collision
    or missing worktree refuses the requested change before mutation.
-3. Atomically write registration, keeping its existing home/executable binding
-   or recording the invoking binding for a new registration.
+3. Atomically write registration containing the desired name union.
 4. Install/reconcile the owned command key, then the event key.
 5. Reconcile desired links across existing worktrees. Continue across ordinary
    per-worktree errors to report every affected path; return 1 if any fail.
@@ -330,7 +343,7 @@ keys remain conflicts.
 
 ### Disable removes registration last
 
-1. Require valid same-home registration containing NAME; do not require that
+1. Require valid registration containing NAME; do not require that
    collection still exists. Preflight inventory, container shapes and owned
    config before mutation. Missing registered worktrees are errors.
 2. If NAME is the last registration, remove the owned event key before link
@@ -357,8 +370,25 @@ removes an unrelated command merely to finish cleanup.
 
 ## Project list reports registration and reconciliation errors
 
+Unscoped `codex list` renders scope groups in order `[g]`, `[p]`, `[l]`,
+with names sorted within each group. `[l]` reports a canonical physical link in
+the exact current directory; `[p]` reports desired clone registration. Both
+rows may appear for the same collection. Local disable removes the `[l]` row
+but retains `[p]`; from a subdirectory `[p]` is still discovered at clone scope.
+Retain manual markers and verbose inventory conventions for all groups;
+invalid registered sources remain visible with the same invalid annotations
+as project-only listing.
+
+Discover project registration read-only when Git is available and the current
+directory belongs to a non-bare worktree. Outside Git, in a bare directory or
+without Git, omit the project group and preserve existing listing behavior.
+This overview reads registration and source inventory; it does not inspect
+all worktrees or effective hook health. Malformed/unreadable registration is
+reported with exit 1 after rendering available global/local rows. Full project
+health inspection remains explicit through `--project`.
+
 `codex list --project` is read-only and does not install hooks or repair links.
-No registration and no reserved config produces empty stdout and exit 0.
+No registration and no reserved hook config produces empty stdout and exit 0.
 Orphan reserved config or malformed state produces an error and exit 1.
 
 For valid registration, print sorted registered names without scope/active
@@ -366,7 +396,8 @@ markers, retaining `[m]` for healthy manual collections. Missing or invalid
 sources remain visible as `NAME [invalid: REASON]`. Verbose output uses the
 existing inventory table conventions; an uninspectable source has an invalid
 annotation in its SKILLS cell. Healthy sources retain normal skill inventory
-and TTY styling. No new status table or scope color is needed.
+and TTY styling. No new status table is needed. Unscoped `[p]` uses the existing scoped rendering
+with a textual marker; global/local styling retains its existing meaning.
 
 After rendering registration, check every source, the effective hook and all
 registered worktree projections. Report each problem on stderr and return 1
@@ -382,14 +413,13 @@ applicable, are:
 ```text
 skillset: project scope requires Git 2.54 or newer
 skillset: project scope requires a Git worktree
-skillset: project registration belongs to another home: PATH
-skillset: invalid Codex project registration PATH: REASON
-skillset: Codex project hook configuration conflicts: KEY
-skillset: Codex project hook is incomplete; rerun project enable
+skillset: invalid project registration PATH: REASON
+skillset: project hook configuration conflicts: KEY
+skillset: project hook is incomplete; rerun project enable
 skillset: cannot inspect registered worktree PATH: REASON
 skillset: Codex skillset entry already exists: PATH
-skillset: Codex project link is missing: PATH
-skillset: skillset is not project Codex-enabled: 'NAME'
+skillset: project link is missing: PATH
+skillset: skillset is not project-enabled: 'NAME'
 ```
 
 Reuse terminal-safe escaping for paths and errors. Do not hide desired names
@@ -412,9 +442,8 @@ dangling links. Do not silently rename registration or delete unrelated links.
 be migrated. Git's inventory must be repaired using Git when a worktree is moved
 manually. `git worktree remove` removes its links with the checkout. The next
 inventory excludes removed/pruned entries. Moving the clone does not invalidate
-the generated hook command because it embeds only the home and executable,
-not the common-directory path. Moving the home requires disable/re-enable
-rather than silently rewriting targets.
+the generated hook command because it embeds no filesystem paths. Home changes are outside the intended
+workflow; no automatic rewriting of existing absolute link targets is provided.
 
 ## Generated links are not repository content
 
@@ -443,9 +472,9 @@ and manual collections share `skills/`; configured storage is exposed through
 
 | Owner | Responsibility |
 | --- | --- |
-| `lib/skillset/codex.py` | Reuse container and canonical-link behavior with an explicit destination path; preserve existing scopes |
-| New `lib/skillset/codex_project.py` | Git discovery, registration validation/writes, owned hook config, reconciliation and project inspection |
-| `lib/skillset/cli.py` | Codex-only scope flag, internal hook parsing, dispatch and existing lock/error conventions |
+| `lib/skillset/codex.py` | Codex destination/container/canonical-link reconciliation at an explicit worktree root; preserve existing scopes and bridge Codex project commands to the shared layer |
+| New `lib/skillset/project.py` | Shared Git discovery, registration validation/writes, named hook ownership, operation/recovery ordering and hook dispatch; call the current Codex reconciler |
+| `lib/skillset/cli.py` | Codex-only public scope flag, hidden top-level hook parsing, dispatch and existing lock/error conventions |
 | `lib/skillset/completions.py` | `--project` in Bash, Zsh and Fish; scope mutual exclusion; no internal-hook completion |
 | `lib/skillset/metadata.py` | Reuse rendering; narrowly support registered names whose source cannot be inspected |
 | `tests/test_skillset.py` | Isolated CLI contracts and real Git/hook process tests |
@@ -464,10 +493,12 @@ filesystem protocol is introduced.
 Use isolated temporary homes and clones, never live runtime layouts. Apply
 [in-process/subprocess test selection](../guides/in-process-cli-test-selection.md):
 ordinary validation can run in-process; Git-triggered behavior, environment
-binding and shell forwarding need real processes.
+lookup and shell forwarding need real processes.
 
 1. Existing global/local Codex behavior and scope defaults remain covered,
-   including exact-directory local behavior and non-Git use. Codex-only scope
+   including exact-directory local behavior and non-Git use. Unscoped listing
+   covers `[g]`/`[p]`/`[l]` ordering, duplicate names, local disable retaining
+   `[p]`, subdirectory discovery and operation without Git. Codex-only scope
    conflict/usage tests and all three completion grammars cover `--project`.
 2. Real Git tests cover main and linked worktrees, subdirectory invocation,
    detached HEAD, a bare common repository with non-bare linked worktrees,
@@ -478,8 +509,8 @@ binding and shell forwarding need real processes.
    can be disabled; hook processing continues for other valid sources.
 4. Native hooks run during ordinary worktree add and later checkout after
    `--no-checkout`. Verify all three forwarded arguments, no-op file checkout,
-   GUI-like restricted PATH, alternate-home binding and paths with spaces and
-   shell metacharacters. Missing executable and ordinary reconciliation errors
+   standard PATH precedence between installations, inherited temporary HOME,
+   and worktree/home/PATH entries with spaces and shell metacharacters. Missing executable and ordinary reconciliation errors
    return zero to Git with stderr evidence; another hook's status is preserved.
 5. Existing traditional hooks and configured `core.hooksPath` retain their
    files, values, invocation and arguments. Include the inspected GitButler
@@ -493,8 +524,12 @@ binding and shell forwarding need real processes.
 7. Move/remove worktrees and move a clone; verify dynamic inventory and absence
    of embedded common-directory paths. Missing/inaccessible registered
    worktrees produce actionable errors rather than successful reconciliation.
-8. Validate schema, read-only project list, invalid source rendering, no Git
-   dependency added to existing commands, no ignore-file changes, and no
+8. Validate harness-neutral file/config keys and the hidden top-level hook
+   entry point, without adding public project flags or side effects to other
+   harnesses. Validate the shared names-only schema, including
+   last-name cleanup deleting the registration file. Verify read-only project
+   list, invalid source rendering, no Git
+   dependency added to explicit existing scopes, no ignore-file changes, and no
    mutations of unrelated runtime metadata. Compare directory/config snapshots
    where preservation is the assertion.
 9. Run focused tests, then `python3 -m unittest discover -s tests -v`. Search
@@ -511,22 +546,16 @@ Git 2.54 documentation/tests, without depending on newer hook controls.
 
 ## Approval scope and next-session checklist
 
-Review particularly:
+The operator approved this design after individual review of D1–D9 and the
+subsequent harness-neutral naming and listing-order revisions. Approval covers
+the specified behavior and trade-offs for implementation planning. It does not
+authorize implementation or installation into real repositories. The
+[implementation plan](../plans/2026-10-11-codex-project-enablement-implementation.md)
+is approved; execution follows the clean-session boundary.
 
-- **D3:** accept removal of pre-existing canonical local links on project disable?
-- **D5–D6:** accept repeat-command recovery and warning-only hook failures,
-  including temporarily incomplete discovery and recreation after failed disable?
-- **D7–D9:** accept separate project inspection, operator-managed source
-  lifecycle across clones and ignore rules?
-
-Approval accepts the proposed behavior and trade-offs for implementation
-planning. It does not authorize implementation or installation into real
-repositories. D1 and D2 retain their existing acceptance; other decisions stay
-proposed until reviewed. No implementation plan has been requested or approved.
-
-After review, resolve requested changes in this specification, update decision
-statuses and the indexed handoff, and prepare an implementation plan if
-requested. Read the full specification before planning or implementing. After
+Review the plan against this specification; preserve accepted decisions and
+update the indexed handoff when the continuation state changes. Read the full
+specification before planning or implementing. After
 plan approval, follow the repository's clean-session boundary and execution
 selection policy. Preserve the handoff until the operator confirms the
 workstream is complete.

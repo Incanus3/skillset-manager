@@ -1,0 +1,618 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Full specification snapshot — Codex project enablement</title><link rel="stylesheet" href="review.css"><style>
+.diagram-wrap{margin:24px 0;border:1px solid var(--line);background:#10161c;border-radius:7px;overflow-x:auto;padding:16px 0}.diagram-wrap svg{display:block;width:100%}.node{fill:#141b22;stroke:#40515e;stroke-width:1.3}.focal{stroke:#9ee2c0;fill:#16251e}.node-name{font:600 16px system-ui;fill:#e4ebef}.node-detail{font:12px ui-monospace,monospace;fill:#a9b7c2}.connector{fill:none;stroke:#a9cfff;stroke-width:1.6}.reference{stroke:#9eafbc;stroke-dasharray:5 4}.zone{fill:#101b18;stroke:#496154;stroke-dasharray:5 4}.zone-label{font:600 11px system-ui;fill:#9ee2c0;letter-spacing:.08em}.label-mask{fill:#10161c}.edge-label{font:600 10px system-ui;fill:#a9cfff;letter-spacing:.05em}.legend{font:12px system-ui;fill:#a9b7c2}.subhead{margin-top:28px}.decision-table th:first-child{width:42px}.decision-table td:first-child{width:auto}.decision-table td:nth-child(2){width:110px}.decision-table .status{margin:0}.comparison th[scope=row]{font-size:14px;letter-spacing:normal;text-transform:none;color:var(--ink);font-weight:600;width:22%}.decision-table th[scope=row]{width:42px}.hash{overflow-wrap:anywhere}.source-document{max-width:1100px;margin:auto;padding:40px}.source-document pre{white-space:pre-wrap;background:var(--panel);padding:16px;border:1px solid var(--line)}.source-document table{border-collapse:collapse;width:100%;font-size:14px}.source-document td,.source-document th{padding:12px;border:1px solid var(--line);text-align:left;vertical-align:top}.source-document h2{margin-top:48px}.source-document h1{max-width:100%}.source-document ul,.source-document ol{padding-left:24px}.source-document .toc{font-size:13px}.source-document code{overflow-wrap:anywhere}@media print{.diagram-wrap{background:white}.node-name{fill:#17212a}.node-detail,.legend{fill:#364552}.node,.focal,.label-mask{fill:white}.zone{fill:#f1f3f5}}
+</style></head><body><main class="source-document"><p><a href="index.html">← Review companion</a> · <a href="specification.md">Unchanged Markdown snapshot</a></p><div class="callout boundary-note">Faithful HTML rendering of the Markdown specification, working-tree snapshot 2026-10-11.<br>Base commit <code>6eda5ed4399e16994fab7e2a5f34697758b35c55</code>.<br>SHA-256 <code class="hash">cfd27277a3dc9a9e8d93f105186f789f992adfe97111cc65867b253575375b06</code>.<br>The <a href="../2026-10-11-codex-project-enablement-design.md">canonical Markdown</a> remains authoritative; this snapshot does not imply approval.</div><h1 id="codex-enablement-across-a-clones-worktrees">Codex enablement across a clone's worktrees</h1>
+<p>Date: 2026-10-11
+Status: Approved design and implementation plan; execution pending resumption
+Workstream: <code>codex-project-enablement</code></p>
+<h2 id="enable-once-then-discover-the-collection-in-every-worktree">Enable once, then discover the collection in every worktree</h2>
+<p><code>skillset codex enable obra --project</code> registers the collection for one Git
+clone, creates ordinary <code>.codex/skills/obra</code> links in its existing worktrees,
+and configures a named <code>post-checkout</code> hook for future worktrees. Independent
+clones of the same remote remain independent.</p>
+<p>The operator accepted separate project scope, retaining <code>--local</code> and the
+global default, and requiring Git 2.54+ for native config-based hooks. The
+operator requested the simpler solution for existing local links. The operator accepted ordinary canonical links with no origin ledger:
+project disable removes matching links, including ones enabled locally
+beforehand (D3).</p>
+<p><a id="decisions-requiring-review"></a></p>
+<h2 id="accepted-design-decisions">Accepted design decisions</h2>
+<table>
+<thead>
+<tr>
+<th>ID</th>
+<th>Status</th>
+<th>Choice</th>
+<th>Concrete cost</th>
+<th>Contract</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>D1</td>
+<td>Accepted</td>
+<td>Add <code>--project</code>; preserve existing scopes and defaults</td>
+<td>One additional scope flag</td>
+<td><a href="#cli-scopes-remain-explicit">CLI</a></td>
+</tr>
+<tr>
+<td>D2</td>
+<td>Accepted</td>
+<td>Require Git 2.54+ and use one shared native named hook</td>
+<td>Project scope is unavailable with older Git</td>
+<td><a href="#native-hooks-preserve-existing-hook-ownership">Hook ownership</a></td>
+</tr>
+<tr>
+<td>D3</td>
+<td>Accepted</td>
+<td>Treat every matching link as an ordinary local link</td>
+<td>Project disable also removes pre-existing local links</td>
+<td><a href="#ordinary-links-have-no-origin-ledger">Link semantics</a></td>
+</tr>
+<tr>
+<td>D4</td>
+<td>Accepted</td>
+<td>Store one shared names list for all harnesses in clone registration; use inherited HOME and PATH</td>
+<td>Hook setup depends on the invoking environment</td>
+<td><a href="#one-registration-belongs-to-the-git-common-directory">Shared state</a></td>
+</tr>
+<tr>
+<td>D5</td>
+<td>Accepted</td>
+<td>Keep registration until disable finishes; recover by repeating commands</td>
+<td>A failed disable can be undone by a later checkout while registration remains</td>
+<td><a href="#partial-operations-retain-registration-for-retry">Recovery</a></td>
+</tr>
+<tr>
+<td>D6</td>
+<td>Accepted</td>
+<td>Warn and return zero after ordinary hook failures</td>
+<td>Failed setup can leave a worktree without skills</td>
+<td><a href="#the-named-hook-reconciles-only-the-invoking-worktree">Hook contract</a></td>
+</tr>
+<tr>
+<td>D7</td>
+<td>Accepted</td>
+<td>Include <code>[p]</code> registration rows in unscoped list; reserve full health checking for <code>--project</code></td>
+<td>One collection can appear under both <code>[l]</code> and <code>[p]</code></td>
+<td><a href="#project-list-reports-registration-and-reconciliation-errors">Listing</a></td>
+</tr>
+<tr>
+<td>D8</td>
+<td>Accepted</td>
+<td>Do not index projects globally or extend collection lifecycle blockers</td>
+<td>Users must disable project registrations before collection rename/removal</td>
+<td><a href="#source-lifecycle-and-worktree-moves">Source lifecycle</a></td>
+</tr>
+<tr>
+<td>D9</td>
+<td>Accepted</td>
+<td>Leave ignore rules under operator control</td>
+<td>Generated links can appear as untracked files</td>
+<td><a href="#generated-links-are-not-repository-content">Ignored state</a></td>
+</tr>
+</tbody>
+</table>
+<p>Inherited requirements: clone-wide automation must include ordinary Orca
+worktree creation without an Orca setup-script call; preserve unrelated
+entries, hooks and <code>core.hooksPath</code>; use trusted-local-CLI reliability rather
+than adversarial filesystem hardening. The selected
+<a href="../../handoffs/codex-project-enablement.md">handoff</a> records the operator's
+requested scope; <a href="../../guides/local-cli-reliability.md">local CLI policy</a>
+governs failure handling.</p>
+<h2 id="registration-and-links-have-separate-responsibilities">Registration and links have separate responsibilities</h2>
+<pre><code class="language-mermaid">flowchart LR
+    Enable[&quot;Explicit project enable&quot;] --&gt; Registry[&quot;Shared clone registration&quot;]
+    Enable --&gt; All[&quot;Reconcile existing worktrees&quot;]
+    Checkout[&quot;Git or Orca checkout&quot;] --&gt; Hook[&quot;Native named hook&quot;]
+    Registry --&gt;|&quot;desired names&quot;| Hook
+    Hook --&gt; One[&quot;Reconcile invoking worktree&quot;]
+    All --&gt; Links[&quot;Ordinary local links&quot;]
+    One --&gt; Links
+</code></pre>
+<p>Registration records desired clone-wide enablement. The hook reads it;
+ordinary links carry no separate scope or origin metadata.</p>
+<p>The project infrastructure is harness-neutral: one shared names list, one
+named Git hook and one internal dispatcher. Git discovery, persistence, hook
+ownership and recovery belong to that shared layer. Harness-specific code
+owns destination paths and link reconciliation. Current scope exposes project
+operations only through Codex subcommands and reconciles only Codex links.
+Later harness support will consume the same selection and hook, without
+separate registrations or named hooks. No other harness integration or generic
+plugin framework is implemented in this feature.</p>
+<h2 id="observable-scenarios">Observable scenarios</h2>
+<p>Assume a healthy collection <code>obra</code> and worktrees A and B of one clone.</p>
+<table>
+<thead>
+<tr>
+<th>Input or event</th>
+<th>Result</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Enable from <code>A/src</code> with <code>--project</code></td>
+<td>Register once; link at A's and B's worktree roots, not beneath <code>src</code></td>
+</tr>
+<tr>
+<td>Enable again from B</td>
+<td>Reconcile missing links; preserve exact canonical links</td>
+</tr>
+<tr>
+<td>Create C with ordinary <code>git worktree add</code> or Orca creation</td>
+<td>Hook adds registered links in C before checkout returns</td>
+</tr>
+<tr>
+<td>A already has a canonical local <code>obra</code> link</td>
+<td>Enable accepts it; no origin information is recorded</td>
+</tr>
+<tr>
+<td>Disable <code>obra --project</code></td>
+<td>Remove canonical <code>obra</code> links from A, B and C, including A's pre-existing link; remove registration for <code>obra</code> last</td>
+</tr>
+<tr>
+<td>B has a real directory or different-target <code>obra</code> link during enable</td>
+<td>Refuse before recording the requested change or changing links</td>
+</tr>
+<tr>
+<td>B's <code>obra</code> was replaced with an unrelated entry before disable</td>
+<td>Preserve that entry; remove other canonical links and registration</td>
+</tr>
+<tr>
+<td>Enable encounters an ordinary I/O error after mutation starts</td>
+<td>Exit 1; retain registration and completed links; repeat enable or disable</td>
+</tr>
+<tr>
+<td>A locally disables a project-registered link</td>
+<td>Local command succeeds as before; a later branch checkout or repeated project enable recreates it</td>
+</tr>
+<tr>
+<td>Create C with <code>--no-checkout</code>, with no later checkout</td>
+<td>No hook runs; repeat project enable to reconcile C</td>
+</tr>
+<tr>
+<td>Run project scope outside a Git worktree</td>
+<td>Exit 1 without creating managed state</td>
+</tr>
+<tr>
+<td>Operate in a separate clone of the same remote</td>
+<td>No effect on A, B or C</td>
+</tr>
+</tbody>
+</table>
+<h2 id="cli-scopes-remain-explicit">CLI scopes remain explicit</h2>
+<pre><code class="language-sh">skillset codex enable NAME --project
+skillset codex disable NAME --project
+skillset codex list --project
+skillset codex list --project --verbose
+</code></pre>
+<ul>
+<li><code>--project</code> has no short alias. It is mutually exclusive with <code>-g</code>/<code>--global</code>
+  and <code>-l</code>/<code>--local</code> on Codex enable, disable and list. Conflicting flags are
+  argparse usage errors, exit 2, before any mutation.</li>
+<li>Enable and disable retain global scope as their default. Unscoped list
+  retains the global and exact-current-directory local views and adds enclosing
+  clone registration with <code>[p]</code> markers.</li>
+<li><code>--local</code> retains its exact current-directory behavior, including outside
+  Git and beneath a worktree root. It does not resolve a repository root.</li>
+<li>Project scope resolves the enclosing Git worktree, including from a
+  subdirectory or detached HEAD. A submodule is its own repository. A bare
+  repository directory is refused; a linked non-bare worktree of a bare
+  repository is supported, with the bare entry excluded from projection.</li>
+<li>Only project scope requires Git 2.54+. Explicit global/local scopes and other command groups acquire no new Git
+  dependency or scope flags. Unscoped list opportunistically uses Git for
+  registration discovery; it still works when Git is unavailable.</li>
+<li>Successful enable/disable remain silent and return 0. Operational errors
+  use the existing <code>skillset: MESSAGE</code> convention and return 1. Ctrl+C in
+  explicit commands retains the CLI's interrupt convention and exit 130.</li>
+</ul>
+<h2 id="ordinary-links-have-no-origin-ledger">Ordinary links have no origin ledger</h2>
+<p>A projected entry is exactly the existing Codex collection link:</p>
+<pre><code class="language-text">&lt;worktree&gt;/.codex/skills/&lt;name&gt;
+  -&gt; &lt;current-home&gt;/.agents/skillsets/&lt;name&gt;/skills
+</code></pre>
+<p>Use the existing absolute-target comparison: an absolute target whose
+normalized spelling equals the expected target is canonical. A relative link,
+different target, directory or regular file is unrelated. Containers must be
+real directories, as in the existing Codex implementation.</p>
+<p>Enable accepts a canonical entry without replacing it, and creates a missing
+entry. Disable removes a canonical entry without requiring the target to
+exist. It preserves unrelated entries and regards absent/unrelated entries as
+already cleared for that name. It never removes <code>.codex</code> or <code>skills</code> containers.
+Only named links at registered worktree roots are covered; nested local links
+are outside project scope.</p>
+<p>A provenance ledger could preserve local enablement during project disable,
+but would add per-worktree bookkeeping, move handling and rules for changing
+ownership through local commands. The recommended ordinary-link model matches
+the operator's request for simplicity. Its cost is deliberate: to keep a local
+link after project disable, run local enable again afterward. Local commands
+retain their existing semantics and do not edit project registration.</p>
+<h2 id="one-registration-belongs-to-the-git-common-directory">One registration belongs to the Git common directory</h2>
+<p>Use Git, rather than remote URL or primary-checkout path, to discover identity:</p>
+<pre><code class="language-text">git rev-parse --path-format=absolute --git-common-dir
+git rev-parse --show-toplevel
+git worktree list --porcelain -z
+</code></pre>
+<p>Resolve the common directory to a normalized absolute path. Parse NUL-separated
+worktree records, exclude bare records, and process paths in deterministic
+lexicographic order. Confirm each accessible worktree resolves to the same
+common directory before projecting into it. When inspecting another worktree,
+clear repository-location environment variables reported by
+<code>git rev-parse --local-env-vars</code> in that child environment, then use <code>git -C</code>.
+Do not clear the caller's environment globally. Git documents shared config
+and worktree inventory in the <a href="https://git-scm.com/docs/git-worktree">worktree manual</a>;
+the <a href="https://git-scm.com/docs/githooks">hook manual</a> documents clearing repository
+environment when inspecting a different worktree.</p>
+<p>Inventory includes non-bare locked and detached worktrees. A missing,
+inaccessible or mismatched registered worktree is an explicit reconciliation
+error; do not prune or unlock it automatically. The operator restores it or
+uses Git's worktree maintenance commands before retrying. No worktree-path
+cache is needed; Git's current worktree inventory remains authoritative.</p>
+<p>The single new persistent file is harness-neutral; this feature only implements
+Codex project enablement:</p>
+<pre><code class="language-text">&lt;git-common-dir&gt;/project-skillsets.json
+</code></pre>
+<p>Example schema, containing exactly these keys:</p>
+<pre><code class="language-json">{
+  &quot;version&quot;: 1,
+  &quot;names&quot;: [&quot;obra&quot;, &quot;personal&quot;]
+}
+</code></pre>
+<ul>
+<li><code>version</code> is integer 1. <code>names</code> is a nonempty, sorted list of unique valid
+  skillset names. The top-level keys are exactly <code>version</code> and <code>names</code>. Do not
+  store home, executable, active set or upstream lock data.</li>
+<li>The list is shared across harnesses, not keyed by harness. Current product
+  functionality consumes it only through Codex project subcommands; future
+  harness implementations will use this same selection. This feature adds no
+  project commands, links or hooks for other harnesses.</li>
+<li>Commands resolve collections using their normal inherited home. Targets keep
+  the stable <code>.agents/skillsets</code> spelling, including when configured storage
+  lives elsewhere. The hook resolves <code>skillset</code> through standard <code>PATH</code> precedence.</li>
+<li>The operator rejected persistent home/executable binding: changing <code>HOME</code> and
+  sharing one clone between users are outside the intended workflow. Recording
+  names is sufficient for that workflow and avoids executable migration rules.
+  Environment changes are not detected or migrated; existing absolute links
+  continue to be compared against the current home's expected targets.</li>
+<li>The file must be a real regular UTF-8 JSON file. Malformed or unsupported
+  state is refused unchanged, with its path and reason. Missing state is
+  unregistered. Empty state is not a supported on-disk schema.</li>
+<li>Write with a same-directory temporary file and atomic replacement. Clean up
+  the temporary file after ordinary write failures. This is serial reliability,
+  not a new journal or adversarial staging protocol.</li>
+</ul>
+<p>Keeping registration and hook config with the clone means removing the clone
+also removes its registration. A global project index would create another
+source of truth and stale-path maintenance; it is excluded by D8. Existing
+runtime roots, aliases, upstream metadata and locks under <code>~/.agents</code> remain
+unchanged. All project commands and the internal hook reuse the stable home
+lock and non-creating discovery lock path. They do not create a missing <code>.agents</code> root
+or advisory lock merely to discover Git or clean up project links. Enable
+still requires a valid managed layout; list and disable can diagnose or clean
+up links when a registered inactive source is absent. Concurrent mutation
+remains best effort.</p>
+<h2 id="native-hooks-preserve-existing-hook-ownership">Native hooks preserve existing hook ownership</h2>
+<p>The command owns only these two keys in the common repository config:</p>
+<pre><code class="language-text">hook.skillset-project.command
+hook.skillset-project.event = post-checkout
+</code></pre>
+<p>Use Git config commands with explicit repository-local scope, not a text
+rewrite of config. The stored command is a fixed shell wrapper using inherited <code>HOME</code> and <code>PATH</code>. No hook file, <code>core.hooksPath</code>, other named
+hook, worktree-specific config or global Git config is modified.</p>
+<p>Preflight checks all occurrences and effective values of the reserved hook
+subsection in the invoking and other accessible worktrees. Without valid
+registration, any reserved subsection is a conflict. With registration, owned
+keys may be missing after interruption or match the generated command and
+single event; additional keys, duplicate values, inherited occurrences or
+changed values are refused. Do not silently overwrite external edits. A
+missing command key or event key is owned recovery state only while valid
+registration exists. Inherited or worktree-specific settings that disable this named hook are also refused
+for enable and reported by list; disable may clean up owned local keys while
+preserving those settings. Inspect effective hook listing and supported
+enabled controls, including event-wide disabling on Git versions that support
+it; key presence alone does not prove the hook is enabled. Do not write these
+controls. Future configuration overrides cannot be prevented; project list is
+the diagnostic path.</p>
+<p>Read-only inspection found GitButler owns this repository's traditional
+<code>post-checkout</code> file and can restore or remove it. Git's native named hook runs
+before the traditional hook and has a separate lifecycle, avoiding a wrapper
+whose file another manager may rewrite. The alternative file-hook integration
+would support older Git at the cost of separate chaining and uninstall rules;
+the operator explicitly accepted D2 instead.</p>
+<p>Evidence: <a href="https://github.com/git/git/blob/v2.54.0/Documentation/RelNotes/2.54.0.adoc">Git 2.54 release notes</a>
+introduce config-based hooks; the <a href="https://git-scm.com/docs/git-hook/2.54.0">2.54 hook manual</a>
+defines named hook commands and traditional-hook ordering. Installed Git is
+2.56.0. <a href="../../research/codex-worktree-hook-compatibility.md">Compatibility research</a>
+records the existing hook and Orca probe. Native-hook coexistence has not yet
+been runtime-tested.</p>
+<h2 id="the-named-hook-reconciles-only-the-invoking-worktree">The named hook reconciles only the invoking worktree</h2>
+<p>Add a hidden top-level command <code>skillset _project-hook</code> taking Git's old HEAD,
+new HEAD and checkout flag. It is omitted from user help and completion. It has no
+scope/name flags and is not a supported user entry point.</p>
+<p>The configured shell command invokes <code>skillset</code> through standard <code>PATH</code>
+precedence, inherits <code>HOME</code>, forwards the three arguments and returns zero
+after any ordinary invocation failure. Use a shell function so Git's appended
+arguments reach the invocation. A representative template is:</p>
+<pre><code class="language-sh">skillset_project_hook() {
+  if skillset _project-hook &quot;$@&quot;; then
+    :
+  else
+    printf '%s\n' 'skillset: project hook failed; rerun project enable or inspect project list' &gt;&amp;2
+  fi
+  return 0
+}; skillset_project_hook
+</code></pre>
+<p>Generate one shell line for Git config; pass that line as one subprocess
+argument. The template is illustrative; the quoting, forwarding and zero-exit
+behavior are normative. The internal command reports its own detailed errors;
+the wrapper also covers a missing executable or failure before CLI startup.
+This adds no persistent launcher file.</p>
+<ul>
+<li>Flag 0 (file checkout) does nothing. Flag 1 reconciles all registered names
+  at this worktree root. Malformed arguments report an error without mutation.</li>
+<li>Discover the common directory afresh; do not embed its absolute path in the
+  hook command. Missing registration is a quiet no-op. Unsupported state is
+  reported and preserved.</li>
+<li>Use the inherited home, validate each registered source independently and
+  preserve existing canonical links. Missing/invalid sources produce errors
+  without creating new dangling links; other valid names still reconcile.</li>
+<li>The shared dispatcher invokes the supported harness reconciler for this
+  worktree; currently this is Codex only. Future harness implementations reuse
+  this dispatcher and shared selection, rather than adding harness-specific
+  Git hook keys or entry points.</li>
+<li>Reconcile only this worktree, not every worktree. It must not invoke Git
+  checkout or recurse into its own hook. It never changes registration/config.</li>
+<li>Normal success has no output. Detailed failures go to stderr, never stdout;
+  the wrapper returns 0 so skillset failure does not alter Git's exit status.
+  This does not suppress another hook's failure or promise recovery from a
+  killed process, unavailable shell, or invalid externally edited Git config.</li>
+<li>No Orca setup script or Orca-specific product code is involved.</li>
+</ul>
+<p>The hook environment must provide <code>skillset</code>, Python 3 and Git through <code>PATH</code>.
+A different <code>skillset</code> installation earlier in <code>PATH</code> is used normally. Moving
+an installation needs no registration update if <code>PATH</code> still resolves it.
+A missing executable produces the wrapper warning; environment repair followed
+by checkout or repeated project enable is the recovery path. No self-contained
+copy of the implementation is installed in Git metadata.</p>
+<p>Git documents that branch checkout, switch and ordinary worktree add trigger
+<code>post-checkout</code>; bare <code>--no-checkout</code> creation does not. The installed Orca
+1.4.223 probe verified the trigger with setup scripts skipped, using a
+traditional hook, not this implementation. Sparse/prepared Orca paths have
+source evidence only. Remote Linux hosts need their own installation and Git
+version; SSH/WSL execution is not yet verified.</p>
+<h2 id="partial-operations-retain-registration-for-retry">Partial operations retain registration for retry</h2>
+<h3 id="enable-records-intent-before-creating-links">Enable records intent before creating links</h3>
+<ol>
+<li>Validate Git version, worktree identity, managed layout, requested source,
+   existing registration and hook ownership. Build the desired name union.</li>
+<li>Preflight every desired source, worktree and destination. A known collision
+   or missing worktree refuses the requested change before mutation.</li>
+<li>Atomically write registration containing the desired name union.</li>
+<li>Install/reconcile the owned command key, then the event key.</li>
+<li>Reconcile desired links across existing worktrees. Continue across ordinary
+   per-worktree errors to report every affected path; return 1 if any fail.</li>
+</ol>
+<p>After step 3, a failure leaves the recorded name union and completed changes
+in place. Repeat enable to finish; disable can cancel a recorded name. There is
+no all-worktree rollback, copied link tree, or per-link ownership record. A
+repeated enable also repairs missing owned hook keys, while changed/unrelated
+keys remain conflicts.</p>
+<h3 id="disable-removes-registration-last">Disable removes registration last</h3>
+<ol>
+<li>Require valid registration containing NAME; do not require that
+   collection still exists. Preflight inventory, container shapes and owned
+   config before mutation. Missing registered worktrees are errors.</li>
+<li>If NAME is the last registration, remove the owned event key before link
+   cleanup so ordinary later checkout will not immediately recreate links.
+   Remove the owned command key next. Missing owned keys are acceptable.</li>
+<li>Remove canonical links for NAME from all registered non-bare worktrees.
+   Continue across ordinary unlink errors; preserve unrelated entries.</li>
+<li>Only after successful cleanup, atomically remove NAME from registration,
+   or unlink the registration file when no names remain.</li>
+</ol>
+<p>Failure retains NAME in registration. Other names and links are unaffected.
+When disabling the last name, a failure may leave the hook absent while the
+registration remains. Repeat disable to finish or enable to restore the hook
+and links. When other names remain, their hook stays installed; a later
+checkout can recreate NAME until disable succeeds. This is an explicit failed
+operation, not successful disable. A removal-intent journal would avoid that
+window but adds a second registration state; D5 chooses retry simplicity.</p>
+<p>If NAME is not registered, disable returns 1 without removing arbitrary local
+links. Successful disable is not idempotent, matching existing disable behavior.
+For externally edited reserved hook config, restore the recorded owned values
+or remove conflicting settings deliberately before retrying; the CLI never
+removes an unrelated command merely to finish cleanup.</p>
+<h2 id="project-list-reports-registration-and-reconciliation-errors">Project list reports registration and reconciliation errors</h2>
+<p>Unscoped <code>codex list</code> renders scope groups in order <code>[g]</code>, <code>[p]</code>, <code>[l]</code>,
+with names sorted within each group. <code>[l]</code> reports a canonical physical link in
+the exact current directory; <code>[p]</code> reports desired clone registration. Both
+rows may appear for the same collection. Local disable removes the <code>[l]</code> row
+but retains <code>[p]</code>; from a subdirectory <code>[p]</code> is still discovered at clone scope.
+Retain manual markers and verbose inventory conventions for all groups;
+invalid registered sources remain visible with the same invalid annotations
+as project-only listing.</p>
+<p>Discover project registration read-only when Git is available and the current
+directory belongs to a non-bare worktree. Outside Git, in a bare directory or
+without Git, omit the project group and preserve existing listing behavior.
+This overview reads registration and source inventory; it does not inspect
+all worktrees or effective hook health. Malformed/unreadable registration is
+reported with exit 1 after rendering available global/local rows. Full project
+health inspection remains explicit through <code>--project</code>.</p>
+<p><code>codex list --project</code> is read-only and does not install hooks or repair links.
+No registration and no reserved hook config produces empty stdout and exit 0.
+Orphan reserved config or malformed state produces an error and exit 1.</p>
+<p>For valid registration, print sorted registered names without scope/active
+markers, retaining <code>[m]</code> for healthy manual collections. Missing or invalid
+sources remain visible as <code>NAME [invalid: REASON]</code>. Verbose output uses the
+existing inventory table conventions; an uninspectable source has an invalid
+annotation in its SKILLS cell. Healthy sources retain normal skill inventory
+and TTY styling. No new status table is needed. Unscoped <code>[p]</code> uses the existing scoped rendering
+with a textual marker; global/local styling retains its existing meaning.</p>
+<p>After rendering registration, check every source, the effective hook and all
+registered worktree projections. Report each problem on stderr and return 1
+when any exist. A locally deleted link is incomplete while project registration
+remains. Unrelated destination entries are conflicts. Collection metadata
+inventory annotations retain their existing meaning; only errors preventing
+source/project reconciliation make this command fail. A dangling canonical
+link cannot make a missing source appear healthy.</p>
+<p>Representative stable diagnostic messages, with paths/reasons appended where
+applicable, are:</p>
+<pre><code class="language-text">skillset: project scope requires Git 2.54 or newer
+skillset: project scope requires a Git worktree
+skillset: invalid project registration PATH: REASON
+skillset: project hook configuration conflicts: KEY
+skillset: project hook is incomplete; rerun project enable
+skillset: cannot inspect registered worktree PATH: REASON
+skillset: Codex skillset entry already exists: PATH
+skillset: project link is missing: PATH
+skillset: skillset is not project-enabled: 'NAME'
+</code></pre>
+<p>Reuse terminal-safe escaping for paths and errors. Do not hide desired names
+merely because projection or source health is incomplete. Existing global and
+local list semantics remain unchanged.</p>
+<h2 id="source-lifecycle-and-worktree-moves">Source lifecycle and worktree moves</h2>
+<p>Project registrations are not globally indexed. Existing global Codex,
+Claude and Auggie lifecycle blockers remain unchanged. Before renaming or
+removing a project-enabled collection, disable it in every known registered
+clone. Running lifecycle commands from another directory cannot promise to
+find those clones, just as existing local links are not indexed.</p>
+<p>If a source is moved or removed externally, project list reports it and the
+hook skips creating new links for it. Disable remains able to clean canonical
+dangling links. Do not silently rename registration or delete unrelated links.</p>
+<p><code>git worktree move</code> preserves the ordinary projected links; no cached path must
+be migrated. Git's inventory must be repaired using Git when a worktree is moved
+manually. <code>git worktree remove</code> removes its links with the checkout. The next
+inventory excludes removed/pruned entries. Moving the clone does not invalidate
+the generated hook command because it embeds no filesystem paths. Home changes are outside the intended
+workflow; no automatic rewriting of existing absolute link targets is provided.</p>
+<h2 id="generated-links-are-not-repository-content">Generated links are not repository content</h2>
+<p>Do not modify <code>.gitignore</code>, shared <code>info/exclude</code>, or global ignore settings.
+Automatic per-name excludes would require another ownership/cleanup mechanism;
+ignoring all <code>.codex</code> content could conceal intentionally committed skills.
+The README must explain that these absolute machine-specific links are
+uncommitted runtime state. If desired, add narrow rules such as
+<code>/.codex/skills/obra</code> to clone-local <code>info/exclude</code> instead of ignoring all
+hand-authored content. Find that file with
+<code>git rev-parse --git-path info/exclude</code>.</p>
+<p>Tracked or unrelated destination entries are never overwritten by enable.
+As ordinary local links have no provenance, a tracked canonical link is
+indistinguishable by target and is removed by project disable; document that
+generated canonical links must not be committed. This design does not add an
+index inspection subsystem to reinterpret existing canonical-link ownership.</p>
+<h2 id="implementation-boundaries-and-compatibility">Implementation boundaries and compatibility</h2>
+<p>Observed baseline: Linux-only Python 3 standard-library CLI; upstream-managed
+and manual collections share <code>skills/</code>; configured storage is exposed through
+<code>~/.agents/skillsets</code>. Installed <code>skillset</code> resolves to this repository's
+<code>bin/skillset</code>. GitButler is initialized; the inspected upstream base is
+<code>bb7e9152fe6c9f7976586380cd2956b9bf6e92c1</code>. No product implementation exists.</p>
+<table>
+<thead>
+<tr>
+<th>Owner</th>
+<th>Responsibility</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>lib/skillset/codex.py</code></td>
+<td>Codex destination/container/canonical-link reconciliation at an explicit worktree root; preserve existing scopes and bridge Codex project commands to the shared layer</td>
+</tr>
+<tr>
+<td>New <code>lib/skillset/project.py</code></td>
+<td>Shared Git discovery, registration validation/writes, named hook ownership, operation/recovery ordering and hook dispatch; call the current Codex reconciler</td>
+</tr>
+<tr>
+<td><code>lib/skillset/cli.py</code></td>
+<td>Codex-only public scope flag, hidden top-level hook parsing, dispatch and existing lock/error conventions</td>
+</tr>
+<tr>
+<td><code>lib/skillset/completions.py</code></td>
+<td><code>--project</code> in Bash, Zsh and Fish; scope mutual exclusion; no internal-hook completion</td>
+</tr>
+<tr>
+<td><code>lib/skillset/metadata.py</code></td>
+<td>Reuse rendering; narrowly support registered names whose source cannot be inspected</td>
+</tr>
+<tr>
+<td><code>tests/test_skillset.py</code></td>
+<td>Isolated CLI contracts and real Git/hook process tests</td>
+</tr>
+<tr>
+<td><code>README.md</code></td>
+<td>Scope examples, disable consequence, repeat-command recovery, dependencies and ignore guidance</td>
+</tr>
+</tbody>
+</table>
+<p>Project parsing/discovery must run through the non-creating lock path before
+any mutation; a non-Git invocation cannot initialize <code>.agents</code> as a side
+effect. Do not refactor unrelated integrations. There is no automatic migration
+of existing local links or registration: project enable is the explicit opt-in.
+No active-set changes, upstream <code>skills</code> calls, Orca setup configuration,
+global project index, persistent hook launcher, watcher, or adversarial
+filesystem protocol is introduced.</p>
+<h2 id="acceptance-evidence-required-before-implementation-completion">Acceptance evidence required before implementation completion</h2>
+<p>Use isolated temporary homes and clones, never live runtime layouts. Apply
+<a href="../../guides/in-process-cli-test-selection.md">in-process/subprocess test selection</a>:
+ordinary validation can run in-process; Git-triggered behavior, environment
+lookup and shell forwarding need real processes.</p>
+<ol>
+<li>Existing global/local Codex behavior and scope defaults remain covered,
+   including exact-directory local behavior and non-Git use. Unscoped listing
+   covers <code>[g]</code>/<code>[p]</code>/<code>[l]</code> ordering, duplicate names, local disable retaining
+   <code>[p]</code>, subdirectory discovery and operation without Git. Codex-only scope
+   conflict/usage tests and all three completion grammars cover <code>--project</code>.</li>
+<li>Real Git tests cover main and linked worktrees, subdirectory invocation,
+   detached HEAD, a bare common repository with non-bare linked worktrees,
+   multiple collections and independent clones.</li>
+<li>Canonical pre-existing links are accepted and removed by project disable;
+   different-target entries survive. Enable preflights all worktrees before a
+   collision can record new intent. Missing sources remain list-visible and
+   can be disabled; hook processing continues for other valid sources.</li>
+<li>Native hooks run during ordinary worktree add and later checkout after
+   <code>--no-checkout</code>. Verify all three forwarded arguments, no-op file checkout,
+   standard PATH precedence between installations, inherited temporary HOME,
+   and worktree/home/PATH entries with spaces and shell metacharacters. Missing executable and ordinary reconciliation errors
+   return zero to Git with stderr evidence; another hook's status is preserved.</li>
+<li>Existing traditional hooks and configured <code>core.hooksPath</code> retain their
+   files, values, invocation and arguments. Include the inspected GitButler
+   restoration/removal lifecycle in a disposable reproduction. Effective named
+   hook conflicts, disabled hooks and interrupted/missing owned keys are
+   diagnosed without overwriting unrelated config.</li>
+<li>Ordinary registry/config/link failures and Ctrl+C retain the documented
+   repeat-enable/disable recovery paths. Include partial last-name disable and
+   partial disable with another registered name still active. No concurrency
+   timing matrix or syscall fault-injection suite is required.</li>
+<li>Move/remove worktrees and move a clone; verify dynamic inventory and absence
+   of embedded common-directory paths. Missing/inaccessible registered
+   worktrees produce actionable errors rather than successful reconciliation.</li>
+<li>Validate harness-neutral file/config keys and the hidden top-level hook
+   entry point, without adding public project flags or side effects to other
+   harnesses. Validate the shared names-only schema, including
+   last-name cleanup deleting the registration file. Verify read-only project
+   list, invalid source rendering, no Git
+   dependency added to explicit existing scopes, no ignore-file changes, and no
+   mutations of unrelated runtime metadata. Compare directory/config snapshots
+   where preservation is the assertion.</li>
+<li>Run focused tests, then <code>python3 -m unittest discover -s tests -v</code>. Search
+   implementation-facing files for leaked planning terminology. Runtime
+   native-hook verification with installed Orca remains an acceptance check;
+   use disposable resources and the existing research reproduction, not this
+   repository's live hooks. Sparse/prepared/remote paths remain explicitly
+   unverified unless separately exercised.</li>
+</ol>
+<p>Design evidence so far is repository/source inspection and the prior Orca
+trigger probe. No product tests or native-hook runtime probe have been run in
+this design session. The minimum-version contract must be checked against
+Git 2.54 documentation/tests, without depending on newer hook controls.</p>
+<h2 id="approval-scope-and-next-session-checklist">Approval scope and next-session checklist</h2>
+<p>The operator approved this design after individual review of D1–D9 and the
+subsequent harness-neutral naming and listing-order revisions. Approval covers
+the specified behavior and trade-offs for implementation planning. It does not
+authorize implementation or installation into real repositories. The
+<a href="../../plans/2026-10-11-codex-project-enablement-implementation.md">implementation plan</a>
+is approved; execution follows the clean-session boundary.</p>
+<p>Review the plan against this specification; preserve accepted decisions and
+update the indexed handoff when the continuation state changes. Read the full
+specification before planning or implementing. After
+plan approval, follow the repository's clean-session boundary and execution
+selection policy. Preserve the handoff until the operator confirms the
+workstream is complete.</p></main></body></html>

@@ -12,10 +12,12 @@ clones remain independent. The approved design and six-task plan have been
 implemented after the clean-session boundary with separate implementation and
 verification agents. Do not restart implementation or request another boundary.
 
-Implementation branch: `codex-project-enablement`, checkpoint `5254e50` (product fixes at `71b0587`, followed by a test-only guard).
-Design/documentation branch: `codex-project-enablement-design`, checkpoint
-`827647a` plus final evidence/handoff updates. Preserve the independent stacks;
-no push, merge, publication or live hook installation is authorized.
+Implementation branch: `codex-project-enablement`, stacked above
+`codex-project-enablement-design` at the operator's request. The verified test
+guard checkpoint has stable GitButler change ID
+`rrmtqlrskmovyonwswvsvpwrkoynzrqn`; commit hashes below describe pre-stack
+verification checkpoints. Stacking preserved implementation contents.
+No push, merge, publication or live hook installation is authorized.
 
 Task reviews are complete within their evidence limits. Final feature review
 identified three defects: first-enable event-wide disable preflight, ordinary
@@ -46,8 +48,8 @@ Orca, SSH and WSL remain unverified; versioned sources support the Git floor.
 Runtime state belongs to `~/.agents`; tests used disposable layouts. Keep the
 unrelated Beads recovery separate: no open task was found and sync still
 reported newer JSONL/import recommended. No explicit import/export or task
-mutation was performed. Preserve the operator's existing spec/review-companion
-and Beads changes.
+mutation was performed. The approved specification and matching review
+companion are now included in the design checkpoint.
 
 ## Continue in order
 
@@ -55,7 +57,7 @@ and Beads changes.
    acceptance gap. Product and test review findings are resolved; implementation
    is verified within the recorded limits.
 2. Any further live-runtime testing, publication, merging or live hook
-   installation requires separate authorization. Preserve the independent
-   implementation/documentation branches and existing unrelated changes.
+   installation requires separate authorization. Preserve the implementation
+   branch stacked above its design/documentation parent.
 3. Keep this handoff until the operator explicitly confirms the workstream is
    complete. If accepted, capture remaining decisions before retiring it.
