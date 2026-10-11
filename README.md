@@ -371,16 +371,115 @@ link and refuses to replace any other entry. It creates only missing real
 `.codex` and `skills` directories.
 
 Use `-l` or `--local` to manage a `.codex/skills` directory beneath the current
-working directory instead. The target remains an absolute path derived from the
-current user's home directory:
+working directory instead, including outside Git or in a worktree subdirectory.
+This scope uses the exact current directory; it does not find a repository root.
+The target remains an absolute path derived from the current user's home directory:
 
 ```sh
 skillset codex enable personal --local
 ```
 
 `-g`/`--global` explicitly selects `~/.codex` and is the default for `enable`
-and `disable`. The scope flags are mutually exclusive and are available on
-`enable`, `disable`, and `list`.
+and `disable`. Codex `enable`, `disable`, and `list` also support `--project`
+(no short alias). The scope flags are mutually exclusive.
+
+### Enable across a Git clone
+
+Register a collection for every existing worktree of the enclosing clone,
+including when invoked from a subdirectory:
+
+```sh
+skillset codex enable obra --project
+skillset codex list
+skillset codex list --project --verbose
+skillset codex disable obra --project
+```
+
+Project enable creates ordinary `.codex/skills/obra` links at worktree roots
+and installs a named Git `post-checkout` hook for future checkouts. Ordinary
+`git worktree add` runs the hook before returning; ordinary Orca creation with
+setup skipped uses that Git trigger too. A worktree created with `--no-checkout`
+has no link until a later checkout or repeated project enable. Independent
+clones remain independent, and submodules have their own registration. Locked
+and detached worktrees are included; a linked worktree of a bare repository
+is supported, while invocation in the bare directory itself is refused.
+
+Project scope requires Git 2.54 or newer for native config-based hooks. The hook
+environment must supply Git, Python 3 and `skillset` through `PATH`; standard
+PATH precedence selects the installation. The invoking environment's `HOME`
+determines collection targets. Registration binds neither an executable nor a
+home directory; changing homes or sharing one clone between users is outside
+the intended workflow. Explicit global/local scope retains its existing
+dependencies. This project scope is currently available only for Codex.
+
+The clone's shared Git directory contains `project-skillsets.json` (version 1
+and a sorted names list) and local config keys `hook.skillset-project.command`
+and `hook.skillset-project.event`. They are machine-local clone metadata,
+not committed project configuration. Traditional hook files, other named hooks
+and `core.hooksPath` remain under their existing owners. No persistent launcher,
+global project index, watcher or Orca setup script is installed.
+
+Generated absolute links are uncommitted runtime state. Skillset does not edit
+ignore files. To hide only this generated entry, find the clone-local exclude
+file and add an operator-owned rule such as `/.codex/skills/obra`:
+
+```sh
+git rev-parse --git-path info/exclude
+```
+
+Keep exclusions narrow so hand-authored skills remain visible. Enable accepts
+pre-existing canonical links without recording their origin; project disable
+removes every matching root link, including one enabled locally beforehand and
+even a tracked canonical link. Do not commit these generated links. Unrelated
+files, directories and different-target links are preserved during disable;
+enable refuses collisions. Containers remain real directories and are retained.
+
+Local disable removes the physical link without unregistering the collection;
+a later branch checkout or repeated project enable recreates it. To keep a
+local link after project disable, enable it locally again afterward.
+
+### Project inspection and recovery
+
+`skillset codex list --project --verbose` is read-only: it lists registered
+names and checks sources, effective hook configuration and all worktree links.
+Missing or invalid sources remain visible, with diagnostics on stderr and
+exit 1. It does not repair links or registration. An unscoped list shows an
+overview without checking every worktree or hook; use the project filter for
+full health inspection.
+
+Known errors such as collisions or missing worktrees are refused before
+mutation. Ordinary later failures retain registration and completed changes;
+repeat the command after fixing the reported cause. Repeat enable repairs
+missing links and missing owned hook keys. Repeat disable finishes cleanup
+and removes the name from registration last; when the last name is removed,
+the registration file and owned hook keys are removed. Failed last-name disable
+can leave registration with its hook absent; repeat disable to finish or enable
+to restore it. With other names still registered, a checkout can recreate the
+name until its failed disable is retried successfully. No rollback journal or
+link-origin ledger is maintained.
+
+Ordinary hook failures warn on stderr and return success to Git, so creation
+can finish without skills. Another hook's failure still determines Git's
+result. Repair missing executables, Python/Git dependencies or PATH/HOME,
+then checkout again or repeat project enable. Restore or deliberately remove
+conflicting reserved hook settings before retrying; externally changed commands
+and inherited/worktree settings that disable the hook are diagnosed and never
+overwritten. Malformed registration is refused unchanged; restore a valid
+names-only file before retrying. Disable can clean canonical dangling links
+even after their source is gone, without initializing a missing managed runtime.
+
+Before renaming or removing a registered collection, disable it in every known
+clone. Project registrations and local links are not globally indexed or added
+to collection lifecycle blockers. An externally removed/renamed source remains
+registered and is diagnosed; hooks skip that invalid source while reconciling
+other valid names. Registration is never silently renamed or repaired.
+
+`git worktree move` and clone relocation use current Git discovery and need no
+skillset path update. `git worktree remove` removes links with its checkout;
+Git may require cleaning untracked links first. A manually moved, missing or
+inaccessible registered worktree refuses explicit reconciliation. Restore it or
+use Git's `worktree repair`, `unlock`, `remove` or `prune` as appropriate before
+retrying. Skillset never implicitly prunes or unlocks worktrees.
 
 ### Disable
 
@@ -390,29 +489,30 @@ Disable a canonical global link:
 skillset codex disable personal
 ```
 
-Use `--local` to disable the corresponding link in the current project instead.
+Use `--local` to disable the corresponding link in the exact current directory.
 `disable` removes only the expected absolute target; it refuses a missing or
 unrelated entry.
 
 ### List
 
-List every skillset Codex can discover from the global and current-project
-locations:
+List global links, enclosing clone registrations and exact-directory local links:
 
 ```text
 $ skillset codex list
 [g] always-on
 [g] personal [m]
+[p] obra
 [l] obra
 ```
 
-`[g]` identifies a global link and `[l]` a local link. They are cyan and green,
-respectively, on a color-enabled terminal. A skillset enabled in both locations
-appears twice. There is no `*` marker: all listed skillsets are available to
-Codex.
+The groups appear in `[g]` global, `[p]` project, `[l]` local order, with names
+sorted within each. `[p]` records desired registration; `[l]` records a physical
+canonical link in the exact current directory, so one name can appear in both.
+Global and local markers are cyan and green on a color-enabled terminal. There
+is no `*` marker. Invalid registered sources carry an invalid annotation.
 
-Use `-g`/`--global` or `-l`/`--local` to inspect one location only; the scope
-marker is then omitted because it would be redundant:
+Use `-g`/`--global`, `-l`/`--local` or `--project` to inspect one scope; its
+scope marker is omitted:
 
 ```sh
 skillset codex list --global

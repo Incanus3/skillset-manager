@@ -18,6 +18,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
@@ -57,6 +58,2178 @@ class SkillsetTests(unittest.TestCase):
         if extra:
             environment.update(extra)
         return environment
+
+    def git_environment(self, extra=None):
+        env = self.environment(extra={
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_AUTHOR_NAME": "Skillset Test",
+            "GIT_AUTHOR_EMAIL": "test@example.invalid",
+            "GIT_COMMITTER_NAME": "Skillset Test",
+            "GIT_COMMITTER_EMAIL": "test@example.invalid",
+            "PATH": str(SKILLSET.parent) + os.pathsep + os.environ.get("PATH", ""),
+        })
+        if extra:
+            env.update(extra)
+        return env
+
+    def git(self, cwd, *args, check=True, extra=None):
+        if shutil.which("git") is None:
+            self.skipTest("Git is unavailable")
+        result = subprocess.run(
+            ["git", "-C", str(cwd), *args], env=self.git_environment(extra),
+            text=True, capture_output=True, check=False, timeout=10,
+        )
+        if check:
+            self.assertEqual(result.returncode, 0, result.stderr)
+        return result
+
+    def new_repository(self, name="repo"):
+        path = self.sandbox / name
+        path.mkdir()
+        self.git(path, "init", "-q")
+        (path / "seed").write_text("seed\n")
+        self.git(path, "add", "seed")
+        self.git(path, "commit", "-qm", "seed")
+        return path
+
+    def project_operation(self, operation, name, cwd, *options):
+        return self.run_cli_in_process(
+            "codex", operation, name, "--project", *options, cwd=cwd,
+            extra_environment=self.git_environment(),
+        )
+
+    def test_project_compatibility_checkout_and_no_checkout_creation(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        enabled = self.run_cli("codex", "enable", "default", "--project", cwd=repo,
+                               extra_environment=self.git_environment())
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        ordinary = self.sandbox / "ordinary"
+        self.git(repo, "worktree", "add", "--detach", str(ordinary))
+        self.assertTrue((ordinary / ".codex/skills/default").is_symlink())
+        prepared = self.sandbox / "prepared"
+        self.git(repo, "worktree", "add", "--detach", "--no-checkout", str(prepared))
+        self.assertFalse(os.path.lexists(prepared / ".codex/skills/default"))
+        self.git(prepared, "checkout", "--detach", "HEAD")
+        self.assertTrue((prepared / ".codex/skills/default").is_symlink())
+        repair = self.sandbox / "repair"
+        self.git(repo, "worktree", "add", "--detach", "--no-checkout", str(repair))
+        self.assertFalse(os.path.lexists(repair / ".codex/skills/default"))
+        repeated = self.project_operation("enable", "default", repo)
+        self.assertEqual(repeated.returncode, 0, repeated.stderr)
+        self.assertTrue((repair / ".codex/skills/default").is_symlink())
+
+    def test_project_compatibility_locked_detached_and_bare_linked_worktrees(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        source = self.new_repository("source")
+        bare = self.sandbox / "bare.git"
+        self.git(source, "clone", "--bare", str(source), str(bare))
+        linked = self.sandbox / "linked"
+        self.git(bare, "worktree", "add", "--detach", str(linked))
+        self.git(bare, "worktree", "lock", "--reason", "operator lock", str(linked))
+        locked = bare / "worktrees/linked/locked"
+        before = locked.read_bytes()
+        result = self.project_operation("enable", "default", linked)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        future = self.sandbox / "future"
+        self.git(bare, "worktree", "add", "--detach", str(future))
+        for path in (linked, future):
+            self.assertTrue((path / ".codex/skills/default").is_symlink())
+            self.assertEqual(self.git(path, "symbolic-ref", "-q", "HEAD", check=False).returncode, 1)
+        self.assertFalse((bare / ".codex").exists())
+        self.assertFalse((source / ".codex").exists())
+        cleared = self.project_operation("disable", "default", linked)
+        self.assertEqual(cleared.returncode, 0, cleared.stderr)
+        self.assertEqual(locked.read_bytes(), before)
+        self.assertFalse((bare / "project-skillsets.json").exists())
+
+    def test_project_compatibility_submodule_registration_is_independent(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        parent = self.new_repository("parent")
+        source = self.new_repository("module-source")
+        self.git(parent, "-c", "protocol.file.allow=always", "submodule", "add", str(source), "module")
+        self.git(parent, "commit", "-qm", "add module")
+        module = parent / "module"
+        enabled = self.project_operation("enable", "default", module)
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        sibling = self.sandbox / "module-linked"
+        self.git(module, "worktree", "add", "--detach", str(sibling))
+        self.assertTrue((sibling / ".codex/skills/default").is_symlink())
+        self.assertTrue((module / ".codex/skills/default").is_symlink())
+        for unrelated in (parent, source):
+            self.assertFalse((unrelated / ".codex").exists())
+            self.assertFalse((unrelated / ".git/project-skillsets.json").exists())
+        listed = self.run_cli_in_process("codex", "list", "--project", cwd=sibling,
+                                         extra_environment=self.git_environment())
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertEqual(listed.stdout, "default\n")
+        disabled = self.project_operation("disable", "default", sibling)
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        self.assertFalse((parent / ".git/modules/module/project-skillsets.json").exists())
+
+    def test_project_compatibility_worktree_move_remove_and_clone_relocation(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        enabled = self.project_operation("enable", "default", repo)
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        original = self.sandbox / "original"
+        moved = self.sandbox / "moved"
+        self.git(repo, "worktree", "add", "--detach", str(original))
+        self.git(repo, "worktree", "move", str(original), str(moved))
+        self.assertFalse(original.exists())
+        self.assertTrue((moved / ".codex/skills/default").is_symlink())
+        listed = self.run_cli_in_process("codex", "list", "--project", cwd=moved,
+                                         extra_environment=self.git_environment())
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        # The generated links are untracked fixture content; force is intentional.
+        self.git(repo, "worktree", "remove", "--force", str(moved))
+        self.assertFalse(moved.exists())
+        self.assertNotIn(str(moved), self.git(repo, "worktree", "list", "--porcelain").stdout)
+        command = self.git(repo, "config", "--local", "--get", "hook.skillset-project.command").stdout
+        registry = (repo / ".git/project-skillsets.json").read_bytes()
+        self.assertNotIn(str(self.sandbox), command)
+        relocated = self.sandbox / "relocated-clone"
+        repo.rename(relocated)
+        future = self.sandbox / "after-relocation"
+        self.git(relocated, "worktree", "add", "--detach", str(future))
+        self.assertTrue((future / ".codex/skills/default").is_symlink())
+        self.assertEqual((relocated / ".git/project-skillsets.json").read_bytes(), registry)
+        self.assertEqual(self.git(relocated, "config", "--local", "--get", "hook.skillset-project.command").stdout, command)
+        disabled = self.project_operation("disable", "default", future)
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        for root in (relocated, future):
+            self.assertFalse(os.path.lexists(root / ".codex/skills/default"))
+
+    def test_project_compatibility_manual_move_and_missing_inventory_require_git_repair(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                repo = self.new_repository(f"repo-{missing}")
+                sibling = self.sandbox / f"linked-{missing}"
+                self.git(repo, "worktree", "add", "--detach", str(sibling))
+                self.git(repo, "worktree", "lock", "--reason", "keep inventory", str(sibling))
+                self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+                relocated = self.sandbox / f"manual-{missing}"
+                sibling.rename(relocated)
+                if missing:
+                    shutil.rmtree(relocated)
+                inventory = self.filesystem_snapshot(repo / ".git/worktrees")
+                registry = (repo / ".git/project-skillsets.json").read_bytes()
+                config = (repo / ".git/config").read_bytes()
+                for operation, name in (("enable", "personal"), ("disable", "default")):
+                    result = self.project_operation(operation, name, repo)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("cannot inspect registered worktree", result.stderr)
+                    self.assertIn(str(sibling), result.stderr)
+                    self.assertEqual(self.filesystem_snapshot(repo / ".git/worktrees"), inventory)
+                    self.assertEqual((repo / ".git/project-skillsets.json").read_bytes(), registry)
+                    self.assertEqual((repo / ".git/config").read_bytes(), config)
+                    self.assertTrue((repo / ".codex/skills/default").is_symlink())
+                    self.assertFalse(os.path.lexists(repo / ".codex/skills/personal"))
+                if not missing:
+                    self.git(repo, "worktree", "repair", str(relocated))
+                    repaired = self.project_operation("disable", "default", repo)
+                    self.assertEqual(repaired.returncode, 0, repaired.stderr)
+                    self.assertTrue((repo / f".git/worktrees/linked-{missing}/locked").exists())
+
+    def test_project_compatibility_traditional_hook_and_hooks_path_keep_arguments_and_files(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        for custom in (False, True):
+            with self.subTest(custom=custom):
+                repo = self.new_repository(f"repo-{custom}")
+                hooks = repo / ("custom-hooks" if custom else ".git/hooks")
+                hooks.mkdir(exist_ok=True)
+                log = self.sandbox / f"hook-{custom}.json"
+                hook = hooks / "post-checkout"
+                hook.write_text(
+                    f"#!{sys.executable}\nimport json,os,sys\nfrom pathlib import Path\n"
+                    f"Path({str(log)!r}).write_text(json.dumps([os.getcwd(), sys.argv[1:], "
+                    "Path('.codex/skills/default').is_symlink()]))\n")
+                hook.chmod(0o755)
+                unused = repo / ".git/hooks/post-checkout"
+                if custom:
+                    unused.write_text("#!/bin/sh\nexit 29\n")
+                    self.git(repo, "config", "--local", "core.hooksPath", str(hooks))
+                before = {path: path.read_bytes() for path in (hook, unused)}
+                enabled = self.project_operation("enable", "default", repo)
+                self.assertEqual(enabled.returncode, 0, enabled.stderr)
+                sibling = self.sandbox / f"linked-{custom}"
+                self.git(repo, "worktree", "add", "--detach", str(sibling))
+                head = self.git(repo, "rev-parse", "HEAD").stdout.strip()
+                self.assertEqual(json.loads(log.read_text()), [str(sibling), ["0" * 40, head, "1"], True])
+                disabled = self.project_operation("disable", "default", repo)
+                self.assertEqual(disabled.returncode, 0, disabled.stderr)
+                for path, contents in before.items():
+                    self.assertEqual(path.read_bytes(), contents)
+                configured = self.git(repo, "config", "--local", "--get", "core.hooksPath", check=False)
+                self.assertEqual(configured.stdout.strip(), str(hooks) if custom else "")
+
+    def test_project_compatibility_gitbutler_hook_restore_and_remove_lifecycle(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        # Reproduce the inspected managed marker, branch detection, user chaining,
+        # restoration and self-removal; no GitButler process or live hook is used.
+        managed = textwrap.dedent("""\
+            #!/bin/sh
+            # GITBUTLER_MANAGED_HOOK_V1
+            HOOKS_DIR=$(dirname "$0")
+            if [ "$3" = 1 ]; then
+                NEW_BRANCH=$(git symbolic-ref --short HEAD 2>/dev/null)
+                PREV_BRANCH=$(git name-rev --name-only "$1" 2>/dev/null | sed 's|^remotes/||')
+                if echo "$PREV_BRANCH" | grep -q 'gitbutler/workspace'; then
+                    if [ "$NEW_BRANCH" != 'gitbutler/workspace' ]; then
+                        if [ -x "$HOOKS_DIR/post-checkout-user" ]; then
+                            "$HOOKS_DIR/post-checkout-user" "$@"
+                            mv "$HOOKS_DIR/post-checkout-user" "$HOOKS_DIR/post-checkout"
+                        elif grep -q GITBUTLER_MANAGED_HOOK_V1 "$HOOKS_DIR/post-checkout"; then
+                            rm "$HOOKS_DIR/post-checkout"
+                        fi
+                        exit 0
+                    fi
+                fi
+            fi
+            if [ -x "$HOOKS_DIR/post-checkout-user" ]; then
+                exec "$HOOKS_DIR/post-checkout-user" "$@"
+            fi
+            exit 0
+        """)
+        for restore in (False, True):
+            with self.subTest(restore=restore):
+                repo = self.new_repository(f"repo-{restore}")
+                seed = self.git(repo, "rev-parse", "HEAD").stdout.strip()
+                self.git(repo, "checkout", "-qb", "gitbutler/workspace")
+                self.git(repo, "commit", "--allow-empty", "-qm", "workspace")
+                hook = repo / ".git/hooks/post-checkout"
+                hook.write_text(managed)
+                hook.chmod(0o755)
+                log = self.sandbox / f"user-{restore}.json"
+                user = hook.with_name("post-checkout-user")
+                if restore:
+                    user.write_text(f"#!{sys.executable}\nimport json,sys\nfrom pathlib import Path\n"
+                                    f"Path({str(log)!r}).write_text(json.dumps(sys.argv[1:]))\n")
+                    user.chmod(0o755)
+                    user_bytes = user.read_bytes()
+                enabled = self.project_operation("enable", "default", repo)
+                self.assertEqual(enabled.returncode, 0, enabled.stderr)
+                owned = self.git(repo, "config", "--local", "--get-regexp", r"^hook\.skillset-project\.").stdout
+                old = self.git(repo, "rev-parse", "HEAD").stdout.strip()
+                (repo / ".codex/skills/default").unlink()
+                self.git(repo, "checkout", "--detach", seed)
+                self.assertTrue((repo / ".codex/skills/default").is_symlink())
+                if restore:
+                    self.assertEqual(hook.read_bytes(), user_bytes)
+                    self.assertFalse(user.exists())
+                    self.assertEqual(json.loads(log.read_text()), [old, seed, "1"])
+                else:
+                    self.assertFalse(hook.exists())
+                sibling = self.sandbox / f"after-{restore}"
+                self.git(repo, "worktree", "add", "--detach", str(sibling))
+                self.assertTrue((sibling / ".codex/skills/default").is_symlink())
+                self.assertEqual(self.git(repo, "config", "--local", "--get-regexp", r"^hook\.skillset-project\.").stdout, owned)
+                self.git(repo, "config", "--local", "hook.other.command", "other() { return 7; }; other")
+                self.git(repo, "config", "--local", "hook.other.event", "post-checkout")
+                (sibling / ".codex/skills/default").unlink()
+                failed = self.git(sibling, "hook", "run", "post-checkout", "--", old, seed, "1", check=False)
+                self.assertEqual(failed.returncode, 7, failed.stderr)
+                self.assertTrue((sibling / ".codex/skills/default").is_symlink())
+
+    def test_project_compatibility_real_hook_isolates_invoking_root_and_preserves_runtime(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
+        (self.root / ".skillset.lock").write_text("existing lock\n")
+        (self.root / "operator-metadata").write_text("preserve\n")
+        repo = self.new_repository()
+        independent = self.sandbox / "independent"
+        self.git(repo, "clone", str(repo), str(independent))
+        independent_before = self.filesystem_snapshot(independent)
+        runtime = self.filesystem_snapshot(self.root)
+        ignore = [repo / ".gitignore", repo / ".git/info/exclude", self.home / ".gitignore"]
+        ignore[0].write_text("operator-ignore\n")
+        ignore[2].write_text("global-ignore\n")
+        self.git(repo, "config", "--local", "core.excludesFile", str(ignore[2]))
+        ignored_before = {path: path.read_bytes() for path in ignore}
+        enabled = self.project_operation("enable", "personal", repo)
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        sibling = self.sandbox / "linked"
+        # Log the real Git hook environment independently of the named hook.
+        log = self.sandbox / "git-environment.json"
+        traditional = repo / ".git/hooks/post-checkout"
+        traditional.write_text(f"#!{sys.executable}\nimport json,os\nfrom pathlib import Path\n"
+                               f"Path({str(log)!r}).write_text(json.dumps("
+                               "{k:v for k,v in os.environ.items() if k.startswith('GIT_')}))\n")
+        traditional.chmod(0o755)
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        (repo / ".codex/skills/personal").unlink()
+        (sibling / ".codex/skills/personal").unlink()
+        admin = self.git(sibling, "rev-parse", "--absolute-git-dir").stdout.strip()
+        self.git(sibling, f"--git-dir={admin}", f"--work-tree={sibling}", "checkout", "--detach", "HEAD")
+        exported = json.loads(log.read_text())
+        self.assertEqual(exported.get("GIT_DIR"), admin)
+        # Git normalizes the explicitly supplied worktree to the hook's cwd.
+        self.assertEqual(exported.get("GIT_WORK_TREE"), ".")
+        self.assertTrue((sibling / ".codex/skills/personal").is_symlink())
+        self.assertFalse(os.path.lexists(repo / ".codex/skills/personal"))
+        self.assertEqual(self.filesystem_snapshot(independent), independent_before)
+        self.assertEqual(self.filesystem_snapshot(self.root), runtime)
+        for path, contents in ignored_before.items():
+            self.assertEqual(path.read_bytes(), contents)
+        removed = self.run_cli_in_process("remove", "personal", "--yes", cwd=independent)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        registry = (repo / ".git/project-skillsets.json").read_bytes()
+        listed = self.run_cli_in_process("codex", "list", "--project", cwd=repo,
+                                         extra_environment=self.git_environment())
+        self.assertEqual(listed.returncode, 1, listed.stderr)
+        self.assertIn("personal [invalid:", listed.stdout)
+        self.assertEqual((repo / ".git/project-skillsets.json").read_bytes(), registry)
+        disabled = self.project_operation("disable", "personal", repo)
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        self.assertFalse(os.path.lexists(sibling / ".codex/skills/personal"))
+        self.assertFalse((repo / ".git/project-skillsets.json").exists())
+        for path, contents in ignored_before.items():
+            self.assertEqual(path.read_bytes(), contents)
+
+    def test_project_compatibility_disable_removes_tracked_canonical_local_link(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        local = self.run_cli_in_process("codex", "enable", "default", "--local", cwd=repo)
+        self.assertEqual(local.returncode, 0, local.stderr)
+        link = repo / ".codex/skills/default"
+        self.git(repo, "add", ".codex/skills/default")
+        self.git(repo, "commit", "-qm", "tracked canonical fixture")
+        enabled = self.project_operation("enable", "default", repo)
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        disabled = self.project_operation("disable", "default", repo)
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        self.assertFalse(os.path.lexists(link))
+        self.assertIn(" D .codex/skills/default", self.git(repo, "status", "--porcelain").stdout)
+
+    def test_codex_project_inspection_combined_listing_orders_global_project_local_and_keeps_registration(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        self.assertEqual(self.run_cli_in_process("codex", "enable", "default").returncode, 0)
+        self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        listed = self.run_cli_in_process("codex", "list", cwd=repo, extra_environment=self.git_environment())
+        self.assertEqual(listed.stdout, "[g] default\n[p] default\n[l] default\n")
+        self.assertEqual(self.run_cli_in_process("codex", "disable", "default", "--local", cwd=repo, extra_environment=self.git_environment()).returncode, 0)
+        overview = self.run_cli_in_process("codex", "list", cwd=repo, extra_environment=self.git_environment())
+        self.assertEqual(overview.stdout, "[g] default\n[p] default\n")
+        self.assertEqual(overview.returncode, 0, overview.stderr)
+        checked = self.run_cli_in_process("codex", "list", "--project", cwd=repo, extra_environment=self.git_environment())
+        self.assertEqual(checked.stdout, "default\n")
+        self.assertEqual(checked.returncode, 1)
+        self.assertIn("project link is missing", checked.stderr)
+
+    def test_codex_project_inspection_invalid_sources_remain_visible_and_removable(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        for name in ("missing-metadata", "missing-source", "missing-skills", "manual"):
+            if name == "manual":
+                self.make_manual_set(self.root, name)
+            else:
+                self.make_set(self.root, name)
+        repo = self.new_repository()
+        for name in ("manual", "missing-source", "missing-skills", "missing-metadata"):
+            self.assertEqual(self.project_operation("enable", name, repo).returncode, 0)
+        (self.root / "skillsets/missing-metadata/.skill-lock.json").unlink()
+        shutil.rmtree(self.root / "skillsets/missing-source")
+        shutil.rmtree(self.root / "skillsets/missing-skills/skills")
+        before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo))
+        for verbose in (False, True):
+            with self.subTest(verbose=verbose):
+                result = self.run_cli_in_process("codex", "list", "--project", *(["-v"] if verbose else []), cwd=repo, extra_environment=self.git_environment())
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("manual [m]", result.stdout)
+                self.assertNotIn("*", result.stdout)
+                for name in ("missing-metadata", "missing-source", "missing-skills"):
+                    self.assertIn(name, result.stdout)
+                    self.assertIn(name, result.stderr)
+                self.assertEqual(result.stdout.count("[invalid:"), 3)
+                if verbose:
+                    self.assertNotIn("|  [invalid:", result.stdout)
+                self.assertLess(result.stdout.index("manual"), result.stdout.index("missing-metadata"))
+                self.assertNotIn("project link is missing", result.stderr)
+        self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo)), before)
+        for name in ("missing-source", "missing-metadata", "missing-skills", "manual"):
+            result = self.project_operation("disable", name, repo)
+            self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_codex_project_inspection_checks_every_projection_and_hook_read_only(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        siblings = []
+        for name in ("missing", "collision", "unavailable"):
+            sibling = self.sandbox / name
+            self.git(repo, "worktree", "add", "--detach", str(sibling))
+            siblings.append(sibling)
+        self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        (siblings[0] / ".codex/skills/default").unlink()
+        collision = siblings[1] / ".codex/skills/default"
+        collision.unlink()
+        collision.mkdir()
+        shutil.rmtree(siblings[2])
+        self.git(repo, "config", "--local", "--unset-all", "hook.skillset-project.event")
+        before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo), self.filesystem_snapshot(siblings[0]), self.filesystem_snapshot(siblings[1]))
+        result = self.run_cli_in_process("codex", "list", "--project", cwd=repo, extra_environment=self.git_environment())
+        self.assertEqual(result.stdout, "default\n")
+        self.assertEqual(result.returncode, 1)
+        for message in ("project link is missing", "Codex skillset entry already exists", "cannot inspect registered worktree", "project hook is incomplete"):
+            self.assertIn(message, result.stderr)
+        self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo), self.filesystem_snapshot(siblings[0]), self.filesystem_snapshot(siblings[1])), before)
+
+    def test_codex_project_inspection_unregistered_clone_ignores_stale_worktree(self):
+        self.require_native_hooks()
+        repo = self.new_repository()
+        sibling = self.sandbox / "missing"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        shutil.rmtree(sibling)
+        before = self.filesystem_snapshot(repo)
+        for options in ((), ("--verbose",)):
+            result = self.run_cli_in_process(
+                "codex", "list", "--project", *options, cwd=repo,
+                extra_environment=self.git_environment(),
+            )
+            self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "", ""))
+        self.assertEqual(self.filesystem_snapshot(repo), before)
+        self.assertFalse(self.root.exists())
+        self.git(repo, "config", "--local", "hook.skillset-project.command", "operator command")
+        orphan = self.run_cli_in_process(
+            "codex", "list", "--project", cwd=repo,
+            extra_environment=self.git_environment(),
+        )
+        self.assertEqual(orphan.returncode, 1)
+        self.assertIn("project hook configuration conflicts", orphan.stderr)
+        self.assertNotIn("cannot inspect registered worktree", orphan.stderr)
+
+    def test_codex_project_inspection_empty_orphan_and_malformed_state(self):
+        self.require_native_hooks()
+        repo = self.new_repository()
+        before = self.filesystem_snapshot(repo)
+        for options in ((), ("--verbose",)):
+            empty = self.run_cli_in_process("codex", "list", "--project", *options, cwd=repo, extra_environment=self.git_environment())
+            self.assertEqual((empty.returncode, empty.stdout, empty.stderr), (0, "", ""))
+        self.assertFalse(self.root.exists())
+        self.assertEqual(self.filesystem_snapshot(repo), before)
+        self.git(repo, "config", "--local", "hook.skillset-project.command", "operator command")
+        orphan = self.run_cli_in_process("codex", "list", "--project", cwd=repo, extra_environment=self.git_environment())
+        self.assertEqual(orphan.returncode, 1)
+        self.assertIn("project hook configuration conflicts", orphan.stderr)
+        self.make_managed_layout(self.home)
+        self.assertEqual(self.run_cli_in_process("codex", "enable", "default").returncode, 0)
+        registry = repo / ".git/project-skillsets.json"
+        registry.write_text("broken json")
+        local = self.run_cli_in_process("codex", "enable", "default", "--local", cwd=repo, extra_environment=self.git_environment())
+        self.assertEqual(local.returncode, 0)
+        before = self.filesystem_snapshot(repo)
+        for options in ((), ("--project",)):
+            result = self.run_cli_in_process("codex", "list", *options, cwd=repo, extra_environment=self.git_environment())
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("invalid project registration", result.stderr)
+            self.assertEqual(result.stdout, "" if options else "[g] default\n[l] default\n")
+        self.assertEqual(self.filesystem_snapshot(repo), before)
+
+    def test_codex_project_inspection_overview_subdirectory_clones_and_no_git_scopes(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.assertEqual(self.run_cli_in_process("codex", "enable", "default").returncode, 0)
+        self.assertEqual(self.run_cli_in_process("codex", "disable", "default").returncode, 0)
+        repo = self.new_repository()
+        self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        subdir = repo / "src"
+        subdir.mkdir()
+        self.assertEqual(self.run_cli_in_process("codex", "list", cwd=subdir, extra_environment=self.git_environment()).stdout, "[p] default\n")
+        clone = self.sandbox / "independent"
+        self.git(repo, "clone", "-q", str(repo), str(clone))
+        self.assertEqual(self.run_cli_in_process("codex", "list", cwd=clone, extra_environment=self.git_environment()).stdout, "")
+        with mock.patch("skillset.project.discover", side_effect=AssertionError("explicit scope must not discover Git")):
+            for scope in ("--global", "--local"):
+                result = self.run_cli_in_process("codex", "list", scope, cwd=repo, extra_environment=self.git_environment())
+                self.assertEqual(result.returncode, 0, result.stderr)
+        for cwd in (self.home, repo, repo / ".git"):
+            result = self.run_cli_in_process("codex", "list", cwd=cwd, extra_environment=self.git_environment({"PATH": "/missing-git"}))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("[p]", result.stdout)
+        self.assertEqual(self.run_cli_in_process("codex", "list", cwd=repo / ".git", extra_environment=self.git_environment()).returncode, 0)
+
+    def test_codex_project_inspection_hook_disabled_conflicts_and_inventory_annotations(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        self.write_skill(self.root / "skillsets/default/skills", "alpha", "name: alpha")
+        self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        healthy = self.run_cli_in_process("codex", "list", "--project", "-v", cwd=repo, extra_environment=self.git_environment())
+        self.assertEqual(healthy.returncode, 0, healthy.stderr)
+        self.assertIn("[invalid: missing description]", healthy.stdout)
+        self.git(repo, "config", "--local", "hook.skillset-project.enabled", "false")
+        disabled = self.run_cli_in_process("codex", "list", "--project", cwd=repo, extra_environment=self.git_environment())
+        self.assertEqual(disabled.returncode, 1)
+        self.assertIn("project hook is disabled", disabled.stderr)
+        overview = self.run_cli_in_process("codex", "list", cwd=repo, extra_environment=self.git_environment())
+        self.assertEqual(overview.returncode, 0, overview.stderr)
+        self.assertEqual(overview.stdout, "[p] default\n[l] default\n")
+        self.git(repo, "config", "--local", "hook.skillset-project.command", "external command")
+        conflict = self.run_cli_in_process("codex", "list", "--project", cwd=repo, extra_environment=self.git_environment())
+        self.assertEqual(conflict.returncode, 1)
+        self.assertIn("project hook configuration conflicts", conflict.stderr)
+
+    def test_codex_project_inspection_scope_usage_and_tty_rendering(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        self.assertEqual(self.run_cli_in_process("codex", "enable", "default").returncode, 0)
+        self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo))
+        for scope in ("--global", "--local", "-g", "-l"):
+            result = self.run_cli_in_process("codex", "list", "--project", scope, cwd=repo, extra_environment=self.git_environment())
+            self.assertEqual(result.returncode, 2)
+        self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo)), before)
+        help_result = self.run_cli_in_process("codex", "list", "--help")
+        self.assertIn("--project", help_result.stdout)
+        tty_environment = self.git_environment()
+        tty_environment.pop("NO_COLOR", None)
+        tty_environment["TERM"] = "xterm-256color"
+        for verbose in (False, True):
+            result = self.run_cli_tty("codex", "list", *(["-v"] if verbose else []), cwd=repo, terminal_columns=23, extra_environment=tty_environment)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("\x1b[36m[g]\x1b[0m", result.stdout)
+            self.assertIn("\x1b[32m[l]\x1b[0m", result.stdout)
+            self.assertIn("[p] default", result.stdout)
+            self.assertNotIn("*", result.stdout)
+            if verbose:
+                lines = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout).splitlines()
+                self.assertLessEqual(len(lines[1]), 23)
+
+    def test_codex_project_inspection_overview_keeps_present_invalid_registered_sources(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
+        repo = self.new_repository()
+        self.assertEqual(self.run_cli_in_process("codex", "enable", "default").returncode, 0)
+        for name in ("default", "personal"):
+            self.assertEqual(self.project_operation("enable", name, repo).returncode, 0)
+        source = self.root / "skillsets/personal"
+        for invalid in ("missing-lock", "invalid-lock", "missing-skills"):
+            with self.subTest(invalid=invalid):
+                if invalid == "missing-lock":
+                    (source / ".skill-lock.json").unlink()
+                elif invalid == "invalid-lock":
+                    (source / ".skill-lock.json").write_text("not JSON")
+                else:
+                    shutil.rmtree(source / "skills")
+                before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo))
+                for verbose in (False, True):
+                    result = self.run_cli_in_process("codex", "list", *(["-v"] if verbose else []),
+                                                     cwd=repo, extra_environment=self.git_environment())
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("[p] default", result.stdout)
+                    self.assertIn("[p] personal", result.stdout)
+                    self.assertEqual(result.stdout.count("[invalid:"), 1)
+                    self.assertLess(result.stdout.index("[p] default"), result.stdout.index("[p] personal"))
+                    self.assertNotIn("[g]", result.stdout)
+                    self.assertNotIn("[l]", result.stdout)
+                    self.assertIn(str(source), result.stderr)
+                    if verbose:
+                        self.assertIn("SKILLS", result.stdout)
+                for scope in ("--global", "--local"):
+                    refused = self.run_cli_in_process("codex", "list", scope, cwd=repo,
+                                                      extra_environment=self.git_environment())
+                    self.assertEqual(refused.returncode, 1, refused.stderr)
+                    self.assertEqual(refused.stdout, "")
+                self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo)), before)
+                shutil.rmtree(source)
+                self.make_set(self.root, "personal")
+        for name in ("personal", "default"):
+            self.assertEqual(self.project_operation("disable", name, repo).returncode, 0)
+        (source / ".skill-lock.json").unlink()
+        before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo))
+        for verbose in (False, True):
+            refused = self.run_cli_in_process("codex", "list", *(["-v"] if verbose else []),
+                                              cwd=repo, extra_environment=self.git_environment())
+            self.assertEqual(refused.returncode, 1, refused.stderr)
+            self.assertEqual(refused.stdout, "")
+            self.assertIn(str(source), refused.stderr)
+        self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo)), before)
+
+    def test_codex_project_inspection_removed_inactive_source_overview_and_unavailable_root(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "a-removed")
+        repo = self.new_repository()
+        self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        self.assertEqual(self.project_operation("enable", "a-removed", repo).returncode, 0)
+        self.assertFalse((self.root / ".skillset.lock").exists())
+        shutil.rmtree(self.root / "skillsets/a-removed")
+        before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo))
+        for verbose in (False, True):
+            result = self.run_cli_in_process("codex", "list", *(["-v"] if verbose else []), cwd=repo, extra_environment=self.git_environment())
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("[p] a-removed", result.stdout)
+            self.assertIn("[invalid:", result.stdout)
+            self.assertLess(result.stdout.index("[p] a-removed"), result.stdout.index("[p] default"))
+        self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo)), before)
+        shutil.rmtree(self.root)
+        before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo))
+        result = self.run_cli_in_process("codex", "list", "--project", cwd=repo, extra_environment=self.git_environment())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("a-removed [invalid:", result.stdout)
+        self.assertIn("default [invalid:", result.stdout)
+        self.assertNotIn("project link is missing", result.stderr)
+        self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo)), before)
+        self.assertEqual(self.project_operation("disable", "a-removed", repo).returncode, 0)
+        self.assertEqual(self.project_operation("disable", "default", repo).returncode, 0)
+        self.assertFalse(self.root.exists())
+
+    def test_codex_project_inspection_unreadable_registration_and_safe_paths(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository("repo with\nnewline")
+        self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        registry = repo / ".git/project-skillsets.json"
+        read_text = Path.read_text
+        def refuse_registration(path, *args, **kwargs):
+            if path == registry:
+                raise PermissionError("registration is unreadable")
+            return read_text(path, *args, **kwargs)
+        before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo))
+        with mock.patch.object(Path, "read_text", refuse_registration):
+            for options in ((), ("--project",)):
+                result = self.run_cli_in_process("codex", "list", *options, cwd=repo, extra_environment=self.git_environment())
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("invalid project registration", result.stderr)
+                self.assertIn("registration is unreadable", result.stderr)
+                self.assertIn("repo with\\x0anewline", result.stderr)
+                self.assertEqual(result.stdout, "" if options else "[l] default\n")
+        self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo)), before)
+        (repo / ".codex/skills/default").unlink()
+        before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo))
+        result = self.run_cli_in_process("codex", "list", "--project", cwd=repo, extra_environment=self.git_environment())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("repo with\\x0anewline", result.stderr)
+        self.assertNotIn("repo with\nnewline", result.stderr)
+        self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo)), before)
+
+    def test_codex_project_inspection_discovery_preserves_relative_git_environment(self):
+        self.require_native_hooks()
+        from skillset.project import discover
+
+        repo = self.new_repository()
+        sibling = self.sandbox / "linked"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        subdir = repo / "src"
+        subdir.mkdir()
+        environment = self.git_environment({"GIT_DIR": "../.git", "GIT_WORK_TREE": ".."})
+        with mock.patch.dict(os.environ, environment, clear=True):
+            context = discover(subdir)
+        self.assertEqual(context.current_root, repo)
+        self.assertEqual(context.worktrees, tuple(sorted((repo, sibling))))
+
+    def test_codex_project_inspection_relative_git_environment_reads_healthy_and_disabled_hooks(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        sibling = self.sandbox / "linked"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        subdir = repo / "src"
+        subdir.mkdir()
+        environment = self.git_environment({"GIT_DIR": "../.git", "GIT_WORK_TREE": ".."})
+        before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo), self.filesystem_snapshot(sibling))
+        normal = self.run_cli_in_process("codex", "list", "--project", cwd=subdir, extra_environment=self.git_environment())
+        self.assertEqual((normal.returncode, normal.stdout, normal.stderr), (0, "default\n", ""))
+        healthy = self.run_cli_in_process("codex", "list", "--project", cwd=subdir, extra_environment=environment)
+        self.assertEqual((healthy.returncode, healthy.stdout, healthy.stderr), (0, "default\n", ""))
+        self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo), self.filesystem_snapshot(sibling)), before)
+        disabled_environment = dict(environment, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="hook.skillset-project.enabled", GIT_CONFIG_VALUE_0="false")
+        disabled = self.run_cli_in_process("codex", "list", "--project", cwd=subdir, extra_environment=disabled_environment)
+        self.assertEqual(disabled.returncode, 1)
+        self.assertEqual(disabled.stdout, "default\n")
+        self.assertIn("project hook is disabled", disabled.stderr)
+        self.assertNotIn(str(sibling), disabled.stderr)
+        self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo), self.filesystem_snapshot(sibling)), before)
+
+    def test_codex_project_inspection_hook_read_failure_keeps_rows_and_other_diagnostics(self):
+        self.require_native_hooks()
+        from skillset import project
+
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        sibling = self.sandbox / "linked"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        for worktree in (repo, sibling):
+            (worktree / ".codex/skills/default").unlink()
+        original_git = project._git
+        for invalid_source in (False, True):
+            if invalid_source:
+                (self.root / "skillsets/default/.skill-lock.json").unlink()
+            for hook_only in (False, True):
+                with self.subTest(invalid_source=invalid_source, hook_only=hook_only):
+                    environment_reads = 0
+                    def fail_health_read(cwd, *arguments, **kwargs):
+                        nonlocal environment_reads
+                        if arguments == ("rev-parse", "--local-env-vars"):
+                            environment_reads += 1
+                            if not hook_only or environment_reads == 2:
+                                raise OperationalError("ordinary Git read failed")
+                        return original_git(cwd, *arguments, **kwargs)
+                    before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo), self.filesystem_snapshot(sibling))
+                    with mock.patch.object(project, "_git", fail_health_read):
+                        result = self.run_cli_in_process("codex", "list", "--project", cwd=repo, extra_environment=self.git_environment())
+                    self.assertEqual(result.returncode, 1)
+                    if invalid_source:
+                        self.assertIn("default [invalid:", result.stdout)
+                        self.assertIn("invalid project source", result.stderr)
+                    else:
+                        self.assertEqual(result.stdout, "default\n")
+                    self.assertIn("ordinary Git read failed", result.stderr)
+                    self.assertIn("cannot inspect project hook", result.stderr)
+                    self.assertIn("project link is missing", result.stderr)
+                    if hook_only:
+                        self.assertIn(str(sibling / ".codex/skills/default"), result.stderr)
+                    self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo), self.filesystem_snapshot(sibling)), before)
+
+    def test_codex_project_operation_relative_git_environment_enable_and_disable_from_subdirectory(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        sibling = self.sandbox / "linked"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        subdir = repo / "src"
+        subdir.mkdir()
+        environment = self.git_environment({"GIT_DIR": "../.git", "GIT_WORK_TREE": ".."})
+        enabled = self.run_cli_in_process("codex", "enable", "default", "--project", cwd=subdir, extra_environment=environment)
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        self.assertEqual(enabled.stdout, "")
+        disabled_environment = dict(environment, GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="hook.skillset-project.enabled", GIT_CONFIG_VALUE_0="false")
+        before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo), self.filesystem_snapshot(sibling))
+        refused = self.run_cli_in_process("codex", "enable", "default", "--project", cwd=subdir, extra_environment=disabled_environment)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("project hook is disabled", refused.stderr)
+        self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo), self.filesystem_snapshot(sibling)), before)
+        self.assertFalse((subdir / ".codex").exists())
+        for worktree in (repo, sibling):
+            self.assertTrue((worktree / ".codex/skills/default").is_symlink())
+        healthy = self.run_cli_in_process("codex", "list", "--project", cwd=subdir, extra_environment=environment)
+        self.assertEqual((healthy.returncode, healthy.stdout, healthy.stderr), (0, "default\n", ""))
+        disabled = self.run_cli_in_process("codex", "disable", "default", "--project", cwd=subdir, extra_environment=environment)
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        self.assertEqual(disabled.stdout, "")
+        for worktree in (repo, sibling):
+            self.assertFalse(os.path.lexists(worktree / ".codex/skills/default"))
+        self.assertFalse((repo / ".git/project-skillsets.json").exists())
+        self.assertEqual(self.git(repo, "config", "--get-regexp", "^hook\\.skillset-project\\.", check=False).returncode, 1)
+
+    def test_codex_project_operation_enable_from_subdirectory_and_disable_matching_links(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        sibling = self.sandbox / "linked"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        subdir = repo / "src"
+        subdir.mkdir()
+        local = self.run_cli_in_process("codex", "enable", "default", "--local", cwd=repo)
+        self.assertEqual(local.returncode, 0, local.stderr)
+        enabled = self.project_operation("enable", "default", subdir)
+        self.assertEqual(enabled.returncode, 0, enabled.stderr)
+        self.assertEqual(enabled.stdout, "")
+        for checkout in (repo, sibling):
+            self.assertTrue((checkout / ".codex/skills/default").is_symlink())
+        self.assertFalse((subdir / ".codex").exists())
+        disabled = self.project_operation("disable", "default", sibling)
+        self.assertEqual(disabled.returncode, 0, disabled.stderr)
+        self.assertEqual(disabled.stdout, "")
+        for checkout in (repo, sibling):
+            self.assertFalse(os.path.lexists(checkout / ".codex/skills/default"))
+            self.assertTrue((checkout / ".codex/skills").is_dir())
+        common = Path(self.git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir").stdout.strip())
+        self.assertFalse((common / "project-skillsets.json").exists())
+
+    def test_codex_project_operation_collision_in_last_worktree_prevents_all_mutation(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
+        for registered in (False, True):
+            with self.subTest(registered=registered):
+                repo = self.new_repository(f"a-repo-{registered}")
+                sibling = self.sandbox / f"z-linked-{registered}"
+                self.git(repo, "worktree", "add", "--detach", str(sibling))
+                if registered:
+                    result = self.project_operation("enable", "default", repo)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                (sibling / ".codex/skills").mkdir(parents=True, exist_ok=True)
+                collision = sibling / ".codex/skills/personal"
+                collision.write_text("operator data")
+                config = (repo / ".git/config").read_bytes()
+                registry = repo / ".git/project-skillsets.json"
+                before = registry.read_bytes() if registered else None
+                result = self.project_operation("enable", "personal", repo)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(str(collision), result.stderr)
+                self.assertEqual((repo / ".git/config").read_bytes(), config)
+                self.assertEqual(collision.read_text(), "operator data")
+                self.assertFalse(os.path.lexists(repo / ".codex/skills/personal"))
+                if registered:
+                    self.assertEqual(registry.read_bytes(), before)
+                else:
+                    self.assertFalse(registry.exists())
+                    self.assertFalse((repo / ".codex").exists())
+
+    def test_codex_project_operation_multiple_names_repair_and_external_conflict(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
+        repo = self.new_repository()
+        sibling = self.sandbox / "linked"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        for name in ("personal", "default"):
+            result = self.project_operation("enable", name, repo)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        registry = repo / ".git/project-skillsets.json"
+        self.assertEqual(json.loads(registry.read_text()), {"version": 1, "names": ["default", "personal"]})
+        (sibling / ".codex/skills/personal").unlink()
+        self.git(repo, "config", "--local", "--unset-all", "hook.skillset-project.event")
+        result = self.project_operation("enable", "default", sibling)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((sibling / ".codex/skills/personal").is_symlink())
+        self.assertEqual(self.git(repo, "config", "--local", "--get", "hook.skillset-project.event").stdout, "post-checkout\n")
+        self.git(repo, "config", "--local", "hook.skillset-project.command", "operator command")
+        before = registry.read_bytes()
+        config = (repo / ".git/config").read_bytes()
+        for operation in ("enable", "disable"):
+            result = self.project_operation(operation, "default", repo)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertIn("configuration conflicts", result.stderr)
+            self.assertEqual(registry.read_bytes(), before)
+            self.assertEqual((repo / ".git/config").read_bytes(), config)
+            self.assertTrue((repo / ".codex/skills/default").is_symlink())
+
+    def test_codex_project_operation_invalid_git_source_and_config_are_noncreating(self):
+        self.require_native_hooks()
+        repo = self.new_repository()
+        for cwd in (self.home, repo):
+            result = self.project_operation("enable", "default", cwd)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertFalse(self.root.exists())
+            self.assertFalse((cwd / ".codex").exists())
+            self.assertFalse((repo / ".git/project-skillsets.json").exists())
+        self.make_managed_layout(self.home)
+        result = self.project_operation("enable", "absent", repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertFalse((self.root / ".skillset.lock").exists())
+        self.git(repo, "config", "--local", "hook.skillset-project.command", "external")
+        config = (repo / ".git/config").read_bytes()
+        result = self.project_operation("enable", "default", repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual((repo / ".git/config").read_bytes(), config)
+        self.assertFalse((self.root / ".skillset.lock").exists())
+        self.assertFalse((repo / ".codex").exists())
+
+    def test_codex_project_operation_missing_or_foreign_worktree_refuses_enable_and_disable(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
+        for foreign in (False, True):
+            with self.subTest(foreign=foreign):
+                repo = self.new_repository(f"repo-{foreign}")
+                sibling = self.sandbox / f"linked-{foreign}"
+                self.git(repo, "worktree", "add", "--detach", str(sibling))
+                self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+                shutil.rmtree(sibling)
+                if foreign:
+                    self.new_repository(sibling.name)
+                registry = repo / ".git/project-skillsets.json"
+                before = registry.read_bytes()
+                config = (repo / ".git/config").read_bytes()
+                for operation, name in (("enable", "personal"), ("disable", "default")):
+                    result = self.project_operation(operation, name, repo)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn("cannot inspect registered worktree", result.stderr)
+                    self.assertIn(str(sibling), result.stderr)
+                    self.assertEqual(registry.read_bytes(), before)
+                    self.assertEqual((repo / ".git/config").read_bytes(), config)
+                self.assertTrue((repo / ".codex/skills/default").is_symlink())
+                self.assertFalse(os.path.lexists(repo / ".codex/skills/personal"))
+
+    def test_codex_project_operation_bare_linked_repo_and_independent_clone(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        source = self.new_repository()
+        bare = self.sandbox / "bare.git"
+        self.git(source, "clone", "--bare", str(source), str(bare))
+        sibling = self.sandbox / "linked"
+        self.git(bare, "worktree", "add", "--detach", str(sibling))
+        clone = self.sandbox / "clone"
+        self.git(source, "clone", str(source), str(clone))
+        refused = self.project_operation("enable", "default", bare)
+        self.assertEqual(refused.returncode, 1, refused.stderr)
+        result = self.project_operation("enable", "default", sibling)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((sibling / ".codex/skills/default").is_symlink())
+        self.assertFalse((bare / ".codex").exists())
+        for unrelated in (source, clone):
+            self.assertFalse((unrelated / ".codex").exists())
+            self.assertFalse((unrelated / ".git/project-skillsets.json").exists())
+        result = self.project_operation("disable", "default", sibling)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((bare / "project-skillsets.json").exists())
+
+    def test_codex_project_operation_disable_without_runtime_preserves_unrelated_and_nested_local(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        sibling = self.sandbox / "linked"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        nested = repo / "src"
+        nested.mkdir()
+        self.assertEqual(self.run_cli_in_process("codex", "enable", "default", "--local", cwd=nested).returncode, 0)
+        self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        link = sibling / ".codex/skills/default"
+        link.unlink()
+        link.symlink_to("relative/operator-owned")
+        shutil.rmtree(self.root)
+        result = self.project_operation("disable", "default", nested)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(self.root.exists())
+        self.assertFalse(os.path.lexists(repo / ".codex/skills/default"))
+        self.assertEqual(os.readlink(link), "relative/operator-owned")
+        self.assertTrue((nested / ".codex/skills/default").is_symlink())
+        self.assertFalse((repo / ".git/project-skillsets.json").exists())
+
+    def test_codex_project_operation_absent_name_cannot_remove_local_link(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        self.assertEqual(self.run_cli_in_process("codex", "enable", "default", "--local", cwd=repo).returncode, 0)
+        result = self.project_operation("disable", "default", repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("skillset is not project-enabled", result.stderr)
+        self.assertTrue((repo / ".codex/skills/default").is_symlink())
+
+    def test_codex_project_operation_scope_conflicts_are_usage_errors_before_mutation(self):
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        config = (repo / ".git/config").read_bytes()
+        for operation in ("enable", "disable"):
+            for flag in ("-g", "--global", "-l", "--local"):
+                with self.subTest(operation=operation, flag=flag):
+                    result = self.project_operation(operation, "default", repo, flag)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("not allowed with argument", result.stderr)
+                    self.assertEqual((repo / ".git/config").read_bytes(), config)
+                    self.assertFalse((self.root / ".skillset.lock").exists())
+                    self.assertFalse((repo / ".codex").exists())
+                    self.assertFalse((repo / ".git/project-skillsets.json").exists())
+
+    def test_codex_project_operation_preserves_ignore_hooks_and_runtime_metadata(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        paths = (repo / ".git/info/exclude", repo / ".git/hooks/post-checkout",
+                 self.root / "skillsets/default/.skill-lock.json")
+        paths[1].write_text("#!/bin/sh\nexit 0\n")
+        paths[1].chmod(0o755)
+        (repo / ".gitignore").write_text("operator-ignore\n")
+        hooks = repo / "custom-hooks"
+        hooks.mkdir()
+        self.git(repo, "config", "--local", "core.hooksPath", str(hooks))
+        before = {path: path.read_bytes() for path in (*paths, repo / ".gitignore")}
+        for operation in ("enable", "disable"):
+            result = self.project_operation(operation, "default", repo)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            for path, contents in before.items():
+                self.assertEqual(path.read_bytes(), contents)
+            self.assertEqual(self.git(repo, "config", "--local", "--get", "core.hooksPath").stdout.strip(), str(hooks))
+
+    def test_codex_project_operation_preflights_registered_sources_and_containers(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
+        repo = self.new_repository()
+        sibling = self.sandbox / "z-linked"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        self.assertEqual(self.project_operation("enable", "personal", repo).returncode, 0)
+        registry = repo / ".git/project-skillsets.json"
+        before = registry.read_bytes()
+        shutil.rmtree(self.root / "skillsets/personal")
+        result = self.project_operation("enable", "default", repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(registry.read_bytes(), before)
+        self.assertFalse(os.path.lexists(repo / ".codex/skills/default"))
+        # Removal is independent of sources, but refuses invalid containers
+        # across the inventory before removing keys or an earlier link.
+        shutil.rmtree(sibling / ".codex")
+        (sibling / ".codex").write_text("operator container")
+        config = (repo / ".git/config").read_bytes()
+        result = self.project_operation("disable", "personal", repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("real directory", result.stderr)
+        self.assertTrue((repo / ".codex/skills/personal").is_symlink())
+        self.assertEqual(registry.read_bytes(), before)
+        self.assertEqual((repo / ".git/config").read_bytes(), config)
+
+    def test_codex_project_operation_registration_replace_failure_has_no_config_or_links(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        before = (repo / ".git/config").read_bytes()
+        with mock.patch("skillset.project.os.replace", side_effect=OSError("replace denied")):
+            result = self.project_operation("enable", "default", repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("replace denied", result.stderr)
+        self.assertFalse((repo / ".git/project-skillsets.json").exists())
+        self.assertEqual(list((repo / ".git").glob(".project-skillsets.json.*")), [])
+        self.assertEqual((repo / ".git/config").read_bytes(), before)
+        self.assertFalse((repo / ".codex").exists())
+        retry = self.project_operation("enable", "default", repo)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+
+    def test_codex_project_operation_config_failure_retains_intent_and_repairs_in_order(self):
+        self.require_native_hooks()
+        from skillset import project
+
+        self.make_managed_layout(self.home)
+        original_git = project._git
+        for failed_key in ("command", "event"):
+            with self.subTest(failed_key=failed_key):
+                repo = self.new_repository(failed_key)
+
+                def fail_setting(cwd, *arguments, **kwargs):
+                    if arguments[:3] == ("config", "--local", "hook.skillset-project." + failed_key):
+                        raise OperationalError("config write denied")
+                    return original_git(cwd, *arguments, **kwargs)
+
+                with mock.patch("skillset.project._git", side_effect=fail_setting):
+                    result = self.project_operation("enable", "default", repo)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("config write denied", result.stderr)
+                self.assertEqual(json.loads((repo / ".git/project-skillsets.json").read_text()), {"version": 1, "names": ["default"]})
+                self.assertFalse((repo / ".codex").exists())
+                command = self.git(repo, "config", "--local", "--get", "hook.skillset-project.command", check=False)
+                self.assertEqual(command.returncode, 1 if failed_key == "command" else 0)
+                self.assertEqual(self.git(repo, "config", "--local", "--get", "hook.skillset-project.event", check=False).returncode, 1)
+                retry = self.project_operation("enable", "default", repo)
+                self.assertEqual(retry.returncode, 0, retry.stderr)
+                self.assertTrue((repo / ".codex/skills/default").is_symlink())
+
+    def test_codex_project_operation_link_failures_report_every_path_and_repair_all_names(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
+        repo = self.new_repository("a-repo")
+        sibling = self.sandbox / "z-linked"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        self.assertEqual(self.project_operation("enable", "personal", repo).returncode, 0)
+        original_symlink = os.symlink
+
+        def fail_default(target, link, *args, **kwargs):
+            if Path(link).name == "default":
+                raise OSError("link denied\n\x1b[31m")
+            return original_symlink(target, link, *args, **kwargs)
+
+        with mock.patch("skillset.codex.os.symlink", side_effect=fail_default):
+            result = self.project_operation("enable", "default", repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(result.stdout, "")
+        self.assertNotIn("\x1b", result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 2)
+        for worktree in (repo, sibling):
+            self.assertIn(str(worktree / ".codex/skills/default"), result.stderr)
+            self.assertTrue((worktree / ".codex/skills/personal").is_symlink())
+            self.assertFalse(os.path.lexists(worktree / ".codex/skills/default"))
+        self.assertTrue(all(line.startswith("skillset: ") for line in result.stderr.splitlines()))
+        self.assertEqual(json.loads((repo / ".git/project-skillsets.json").read_text()), {"version": 1, "names": ["default", "personal"]})
+        retry = self.project_operation("enable", "default", sibling)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        for worktree in (repo, sibling):
+            self.assertTrue((worktree / ".codex/skills/default").is_symlink())
+
+    def test_codex_project_operation_readlink_failure_retains_registration_and_retries(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
+        original_readlink = os.readlink
+        for multiple in (False, True):
+            with self.subTest(multiple=multiple):
+                repo = self.new_repository("a-readlink-" + str(multiple))
+                siblings = tuple(self.sandbox / (prefix + "-readlink-" + str(multiple)) for prefix in ("b", "z"))
+                for sibling in siblings:
+                    self.git(repo, "worktree", "add", "--detach", str(sibling))
+                names = ("default", "personal") if multiple else ("default",)
+                for name in names:
+                    self.assertEqual(self.project_operation("enable", name, repo).returncode, 0)
+                registry = repo / ".git/project-skillsets.json"
+                registration = registry.read_bytes()
+                config = (repo / ".git/config").read_bytes()
+                failed = siblings[0] / ".codex/skills/default"
+                def refuse_readlink(path, *args, **kwargs):
+                    if Path(path) == failed:
+                        raise PermissionError("link inspection denied")
+                    return original_readlink(path, *args, **kwargs)
+                with mock.patch("os.readlink", side_effect=refuse_readlink):
+                    result = self.project_operation("disable", "default", repo)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn(str(failed), result.stderr)
+                self.assertIn("link inspection denied", result.stderr)
+                self.assertEqual(registry.read_bytes(), registration)
+                self.assertTrue(failed.is_symlink())
+                for worktree in (repo, siblings[1]):
+                    self.assertFalse(os.path.lexists(worktree / ".codex/skills/default"))
+                if multiple:
+                    self.assertEqual((repo / ".git/config").read_bytes(), config)
+                    for worktree in (repo, *siblings):
+                        self.assertTrue((worktree / ".codex/skills/personal").is_symlink())
+                else:
+                    self.assertEqual(self.git(repo, "config", "--get", "hook.skillset-project.event", check=False).returncode, 1)
+                retry = self.project_operation("disable", "default", repo)
+                self.assertEqual(retry.returncode, 0, retry.stderr)
+                for worktree in (repo, *siblings):
+                    self.assertFalse(os.path.lexists(worktree / ".codex/skills/default"))
+                if multiple:
+                    self.assertEqual(json.loads(registry.read_text())["names"], ["personal"])
+                else:
+                    self.assertFalse(registry.exists())
+
+    def test_codex_project_operation_container_inspection_failure_is_not_absence(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
+        original_lstat = Path.lstat
+        for multiple in (False, True):
+            for container, error in ((".codex", PermissionError("container access denied")),
+                                     (".codex/skills", OSError("container read failed"))):
+                with self.subTest(multiple=multiple, container=container):
+                    repo = self.new_repository("container-" + str(multiple) + "-" + container.replace("/", "-"))
+                    for name in (("default", "personal") if multiple else ("default",)):
+                        self.assertEqual(self.project_operation("enable", name, repo).returncode, 0)
+                    failed = repo / container
+                    before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo))
+                    def refuse_lstat(path, *args, **kwargs):
+                        if Path(path) == failed:
+                            raise error
+                        return original_lstat(path, *args, **kwargs)
+                    with mock.patch.object(Path, "lstat", autospec=True, side_effect=refuse_lstat):
+                        result = self.project_operation("disable", "default", repo)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(str(failed), result.stderr)
+                    self.assertIn(str(error), result.stderr)
+                    self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo)), before)
+                    retry = self.project_operation("disable", "default", repo)
+                    self.assertEqual(retry.returncode, 0, retry.stderr)
+                    self.assertFalse(os.path.lexists(repo / ".codex/skills/default"))
+
+    def test_codex_projection_removal_inspection_error_continues_other_names(self):
+        self.require_native_hooks()
+        from skillset import codex
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
+        repo = self.new_repository()
+        for name in ("default", "personal"):
+            self.assertEqual(self.project_operation("enable", name, repo).returncode, 0)
+        failed = repo / ".codex/skills/default"
+        original_readlink = os.readlink
+        def refuse_readlink(path, *args, **kwargs):
+            if Path(path) == failed:
+                raise OSError("link read failed")
+            return original_readlink(path, *args, **kwargs)
+        with mock.patch("os.readlink", side_effect=refuse_readlink):
+            errors = codex.reconcile_at(self.root, ("default", "personal"), repo, removing=True)
+        self.assertEqual(len(errors), 1)
+        self.assertIn(str(failed), errors[0])
+        self.assertIn("link read failed", errors[0])
+        self.assertTrue(failed.is_symlink())
+        self.assertFalse(os.path.lexists(repo / ".codex/skills/personal"))
+        self.assertEqual(codex.reconcile_at(self.root, ("default", "personal"), repo, removing=True), ())
+        self.assertFalse(os.path.lexists(failed))
+
+    def test_codex_project_operation_last_name_unlink_failure_retains_registration_with_hook_absent(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository("a-repo")
+        sibling = self.sandbox / "z-linked"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        registry = repo / ".git/project-skillsets.json"
+        before = registry.read_bytes()
+        original_unlink = Path.unlink
+
+        def fail_link(path, *args, **kwargs):
+            if path == sibling / ".codex/skills/default":
+                raise OSError("unlink denied")
+            return original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", fail_link):
+            result = self.project_operation("disable", "default", repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(str(sibling / ".codex/skills/default"), result.stderr)
+        self.assertEqual(registry.read_bytes(), before)
+        self.assertFalse(os.path.lexists(repo / ".codex/skills/default"))
+        self.assertTrue((sibling / ".codex/skills/default").is_symlink())
+        for key in ("event", "command"):
+            self.assertEqual(self.git(repo, "config", "--local", "--get", "hook.skillset-project." + key, check=False).returncode, 1)
+        # Both supported recovery choices operate on the retained intent.
+        repaired = self.project_operation("enable", "default", repo)
+        self.assertEqual(repaired.returncode, 0, repaired.stderr)
+        self.assertTrue((repo / ".codex/skills/default").is_symlink())
+        with mock.patch.object(Path, "unlink", fail_link):
+            result = self.project_operation("disable", "default", repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        retry = self.project_operation("disable", "default", sibling)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertFalse(registry.exists())
+        self.assertFalse(os.path.lexists(sibling / ".codex/skills/default"))
+
+    def test_codex_project_operation_unlink_failures_continue_with_another_name_and_checkout_recreates(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
+        repo = self.new_repository("a-repo")
+        second = self.sandbox / "b-linked"
+        third = self.sandbox / "z-linked"
+        for worktree in (second, third):
+            self.git(repo, "worktree", "add", "--detach", str(worktree))
+        for name in ("default", "personal"):
+            self.assertEqual(self.project_operation("enable", name, repo).returncode, 0)
+        registry = repo / ".git/project-skillsets.json"
+        before = registry.read_bytes()
+        config = (repo / ".git/config").read_bytes()
+        original_unlink = Path.unlink
+
+        def fail_link(path, *args, **kwargs):
+            if path in (second / ".codex/skills/default", third / ".codex/skills/default"):
+                raise OSError("unlink denied")
+            return original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", fail_link):
+            result = self.project_operation("disable", "default", repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()), 2)
+        for worktree in (second, third):
+            self.assertIn(str(worktree / ".codex/skills/default"), result.stderr)
+        self.assertFalse(os.path.lexists(repo / ".codex/skills/default"))
+        self.assertEqual(registry.read_bytes(), before)
+        self.assertEqual((repo / ".git/config").read_bytes(), config)
+        self.git(repo, "checkout", "--detach", "HEAD")
+        self.assertTrue((repo / ".codex/skills/default").is_symlink())
+        retry = self.project_operation("disable", "default", repo)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(registry.read_text()), {"version": 1, "names": ["personal"]})
+        for worktree in (repo, second, third):
+            self.assertFalse(os.path.lexists(worktree / ".codex/skills/default"))
+            self.assertTrue((worktree / ".codex/skills/personal").is_symlink())
+
+    def test_codex_project_operation_final_registration_removal_failure_is_recoverable(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        registry = repo / ".git/project-skillsets.json"
+        before = registry.read_bytes()
+        original_unlink = Path.unlink
+
+        def fail_registry(path, *args, **kwargs):
+            if path == registry:
+                raise OSError("registration removal denied")
+            return original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", fail_registry):
+            result = self.project_operation("disable", "default", repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("registration removal denied", result.stderr)
+        self.assertEqual(registry.read_bytes(), before)
+        self.assertFalse(os.path.lexists(repo / ".codex/skills/default"))
+        self.assertEqual(self.git(repo, "config", "--local", "--get", "hook.skillset-project.event", check=False).returncode, 1)
+        retry = self.project_operation("disable", "default", repo)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertFalse(registry.exists())
+
+    def test_codex_project_operation_hook_removal_stops_invocation_before_link_cleanup(self):
+        self.require_native_hooks()
+        from skillset import project
+
+        self.make_managed_layout(self.home)
+        original_git = project._git
+        for failed_key in ("event", "command"):
+            with self.subTest(failed_key=failed_key):
+                repo = self.new_repository(failed_key)
+                self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+                registry = repo / ".git/project-skillsets.json"
+                before = registry.read_bytes()
+
+                def fail_removal(cwd, *arguments, **kwargs):
+                    if arguments == ("config", "--local", "--unset-all", "hook.skillset-project." + failed_key):
+                        raise OperationalError("config removal denied")
+                    return original_git(cwd, *arguments, **kwargs)
+
+                with mock.patch("skillset.project._git", side_effect=fail_removal):
+                    result = self.project_operation("disable", "default", repo)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("config removal denied", result.stderr)
+                self.assertEqual(registry.read_bytes(), before)
+                self.assertTrue((repo / ".codex/skills/default").is_symlink())
+                event = self.git(repo, "config", "--local", "--get", "hook.skillset-project.event", check=False)
+                self.assertEqual(event.returncode, 0 if failed_key == "event" else 1)
+                self.assertEqual(self.git(repo, "config", "--local", "--get", "hook.skillset-project.command").returncode, 0)
+                retry = self.project_operation("disable", "default", repo)
+                self.assertEqual(retry.returncode, 0, retry.stderr)
+                self.assertFalse(registry.exists())
+
+    def test_codex_project_operation_remaining_registration_replace_failure_retains_names_and_hook(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
+        repo = self.new_repository()
+        for name in ("default", "personal"):
+            self.assertEqual(self.project_operation("enable", name, repo).returncode, 0)
+        registry = repo / ".git/project-skillsets.json"
+        before = registry.read_bytes()
+        config = (repo / ".git/config").read_bytes()
+        with mock.patch("skillset.project.os.replace", side_effect=OSError("replacement denied")):
+            result = self.project_operation("disable", "default", repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("replacement denied", result.stderr)
+        self.assertEqual(registry.read_bytes(), before)
+        self.assertEqual((repo / ".git/config").read_bytes(), config)
+        self.assertFalse(os.path.lexists(repo / ".codex/skills/default"))
+        self.assertTrue((repo / ".codex/skills/personal").is_symlink())
+        self.assertEqual(list((repo / ".git").glob(".project-skillsets.json.*")), [])
+        self.git(repo, "checkout", "--detach", "HEAD")
+        self.assertTrue((repo / ".codex/skills/default").is_symlink())
+        retry = self.project_operation("disable", "default", repo)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(registry.read_text()), {"version": 1, "names": ["personal"]})
+
+    def test_codex_project_operation_container_failure_continues_to_later_worktree(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository("a-repo")
+        sibling = self.sandbox / "z-linked"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        original_mkdir = Path.mkdir
+
+        def fail_container(path, *args, **kwargs):
+            if path == repo / ".codex":
+                raise OSError("container denied")
+            return original_mkdir(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "mkdir", fail_container):
+            result = self.project_operation("enable", "default", repo)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(str(repo / ".codex"), result.stderr)
+        self.assertFalse((repo / ".codex").exists())
+        self.assertTrue((sibling / ".codex/skills/default").is_symlink())
+        self.assertEqual(json.loads((repo / ".git/project-skillsets.json").read_text()), {"version": 1, "names": ["default"]})
+        retry = self.project_operation("enable", "default", repo)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertTrue((repo / ".codex/skills/default").is_symlink())
+
+    def test_codex_project_operation_reuses_existing_lock_without_changing_runtime(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        lock = self.root / ".skillset.lock"
+        lock.write_text("existing advisory lock\n")
+        repo = self.new_repository()
+        snapshot = self.filesystem_snapshot(self.root)
+        inode = lock.stat().st_ino
+        for operation in ("enable", "disable"):
+            result = self.project_operation(operation, "default", repo)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(lock.read_text(), "existing advisory lock\n")
+            self.assertEqual(lock.stat().st_ino, inode)
+        self.assertEqual(self.filesystem_snapshot(self.root), snapshot)
+
+    def test_codex_project_operation_keyboard_interrupt_retains_ordered_recovery_state(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        with mock.patch("skillset.project.install_hook", side_effect=KeyboardInterrupt):
+            result = self.project_operation("enable", "default", repo)
+        self.assertEqual(result.returncode, 130, result.stderr)
+        self.assertEqual(result.stderr, "skillset: interrupted\n")
+        registry = repo / ".git/project-skillsets.json"
+        self.assertEqual(json.loads(registry.read_text()), {"version": 1, "names": ["default"]})
+        self.assertFalse((repo / ".codex").exists())
+        self.assertEqual(self.git(repo, "config", "--local", "--get", "hook.skillset-project.command", check=False).returncode, 1)
+        self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        with mock.patch("skillset.codex.reconcile_at", side_effect=KeyboardInterrupt):
+            result = self.project_operation("disable", "default", repo)
+        self.assertEqual(result.returncode, 130, result.stderr)
+        self.assertTrue(registry.exists())
+        self.assertTrue((repo / ".codex/skills/default").is_symlink())
+        for key in ("event", "command"):
+            self.assertEqual(self.git(repo, "config", "--local", "--get", "hook.skillset-project." + key, check=False).returncode, 1)
+        retry = self.project_operation("disable", "default", repo)
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertFalse(registry.exists())
+
+    def test_codex_project_operation_real_sigint_after_registration_recovers(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repo = self.new_repository()
+        marker = self.sandbox / "install-boundary"
+        registry = repo / ".git/project-skillsets.json"
+        script = textwrap.dedent("""\
+            import signal
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, sys.argv[1])
+            from skillset import cli, project
+            marker = Path(sys.argv[2])
+            def wait_before_install(context, *, cwd=None):
+                marker.write_text('ready')
+                signal.pause()
+            project.install_hook = wait_before_install
+            sys.argv = ['skillset', 'codex', 'enable', 'default', '--project']
+            sys.exit(cli.main())
+        """)
+        process = subprocess.Popen(
+            [sys.executable, "-c", script, str(LIBRARY_ROOT), str(marker)],
+            cwd=repo, env=self.git_environment(), text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            deadline = time.monotonic() + 5
+            while not (registry.exists() and marker.exists()):
+                if process.poll() is not None or time.monotonic() >= deadline:
+                    self.fail("child did not reach registration boundary")
+                time.sleep(0.01)
+            process.send_signal(signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 130, stderr)
+            self.assertEqual(stdout, "")
+            self.assertEqual(stderr, "skillset: interrupted\n")
+            self.assertEqual(json.loads(registry.read_text()), {"version": 1, "names": ["default"]})
+            self.assertFalse((repo / ".codex").exists())
+        finally:
+            if process.poll() is None:
+                process.kill()
+            process.communicate(timeout=5)
+        retry = self.run_cli("codex", "enable", "default", "--project", cwd=repo,
+                             extra_environment=self.git_environment())
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertTrue((repo / ".codex/skills/default").is_symlink())
+        removed = self.project_operation("disable", "default", repo)
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertFalse(registry.exists())
+
+    @contextlib.contextmanager
+    def git_version(self, version, extra=None):
+        run = subprocess.run
+
+        def run_with_version(command, *args, **kwargs):
+            if command == ["git", "--version"]:
+                return subprocess.CompletedProcess(command, 0, version.encode(), b"")
+            return run(command, *args, **kwargs)
+
+        with mock.patch.dict(os.environ, self.git_environment(extra), clear=True):
+            with mock.patch("subprocess.run", side_effect=run_with_version):
+                yield
+
+    def require_native_hooks(self):
+        result = self.git(self.home, "--version")
+        version = re.search(r"git version (\d+)\.(\d+)", result.stdout)
+        if not version or tuple(map(int, version.groups())) < (2, 54):
+            self.skipTest("native config hooks require Git 2.54 or newer")
+
+    def register_project_hook(self, repository, names=("default",)):
+        from skillset import project
+        with mock.patch.dict(os.environ, self.git_environment(), clear=True):
+            context = project.discover(repository)
+            project.write_names(context.common_dir, names)
+            project.install_hook(context)
+        return context
+
+    def test_project_hook_invalid_flag_is_noncreating_and_hidden(self):
+        before = self.filesystem_snapshot(self.home)
+        result = self.run_cli("_project-hook", "old", "new", "invalid",
+                              extra_environment=self.git_environment())
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+        for args in (("--help",), ("codex", "--help"),
+                     ("completions", "bash"), ("completions", "zsh"),
+                     ("completions", "fish")):
+            result = self.run_cli(*args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("_project-hook", result.stdout)
+
+    def test_project_hook_malformed_arguments_are_noncreating(self):
+        before = self.filesystem_snapshot(self.home)
+        for args in (("old", "new"), ("old", "new", "1", "extra"),
+                     ("old", "new", "1", "--local")):
+            result = self.run_cli("_project-hook", *args)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(self.filesystem_snapshot(self.home), before)
+
+    def test_project_hook_file_checkout_is_quiet_non_git_noop(self):
+        before = self.filesystem_snapshot(self.home)
+        result = self.run_cli("_project-hook", "old", "new", "0",
+                              extra_environment={"PATH": str(Path(sys.executable).parent)})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((result.stdout, result.stderr), ("", ""))
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+
+    def test_project_hook_missing_registration_is_quiet_noncreating(self):
+        repository = self.new_repository()
+        before = self.filesystem_snapshot(self.home)
+        with self.git_version("git version 2.54.0"):
+            result = self.run_cli_in_process("_project-hook", "old", "new", "1",
+                                            cwd=repository,
+                                            extra_environment=self.git_environment())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((result.stdout, result.stderr), ("", ""))
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+        self.assertFalse((repository / ".codex").exists())
+
+    def test_project_hook_reconciles_valid_sources_despite_missing_or_invalid_source(self):
+        from skillset import project
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "broken")
+        (self.root / "skillsets" / "broken" / ".skill-lock.json").unlink()
+        repository = self.new_repository()
+        sibling = self.sandbox / "sibling"
+        self.git(repository, "worktree", "add", "-qb", "sibling", str(sibling))
+        with self.git_version("git version 2.54.0"):
+            context = project.discover(repository)
+            project.write_names(context.common_dir, ("absent", "broken", "default"))
+            state = (context.common_dir / project.REGISTRATION_NAME).read_bytes()
+            config = (context.common_dir / "config").read_bytes()
+            result = self.run_cli_in_process("_project-hook", "old", "new", "1",
+                                            cwd=repository,
+                                            extra_environment=self.git_environment())
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("absent", result.stderr)
+        self.assertIn("broken", result.stderr)
+        self.assertEqual(os.readlink(repository / ".codex/skills/default"),
+                         str(self.root / "skillsets/default/skills"))
+        self.assertFalse(os.path.lexists(repository / ".codex/skills/absent"))
+        self.assertFalse(os.path.lexists(repository / ".codex/skills/broken"))
+        self.assertFalse((sibling / ".codex").exists())
+        self.assertEqual((context.common_dir / project.REGISTRATION_NAME).read_bytes(), state)
+        self.assertEqual((context.common_dir / "config").read_bytes(), config)
+        self.assertFalse((self.root / ".skillset.lock").exists())
+
+    def test_project_hook_malformed_registration_preserved(self):
+        repository = self.new_repository()
+        state = repository / ".git/project-skillsets.json"
+        state.write_text('{"version":1,"names":[]}')
+        before = self.filesystem_snapshot(self.home)
+        with self.git_version("git version 2.54.0"):
+            result = self.run_cli_in_process("_project-hook", "old", "new", "1",
+                                            cwd=repository,
+                                            extra_environment=self.git_environment())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(str(state), result.stderr)
+        self.assertEqual(state.read_text(), '{"version":1,"names":[]}')
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+        self.assertFalse((repository / ".codex").exists())
+
+    def test_project_hook_native_worktree_add_links_before_return(self):
+        from skillset import project
+        self.require_native_hooks()
+        self.home = self.new_home("home ' $dollar; semi")
+        self.root = self.home / ".agents"
+        self.make_managed_layout(self.home)
+        repository = self.new_repository("repo ' $dollar; semi")
+        context = self.register_project_hook(repository)
+        state = (context.common_dir / project.REGISTRATION_NAME).read_bytes()
+        worktree = self.sandbox / "linked ' $dollar; semi"
+        self.git(repository, "worktree", "add", "-qb", "linked", str(worktree))
+        self.assertEqual(os.readlink(worktree / ".codex/skills/default"),
+                         str(self.root / "skillsets/default/skills"))
+        self.assertEqual((context.common_dir / project.REGISTRATION_NAME).read_bytes(), state)
+        self.assertFalse((repository / ".codex").exists())
+        self.assertEqual(sorted(p.name for p in self.sandbox.iterdir()),
+                         sorted([self.home.name, "home", repository.name, worktree.name]))
+
+    def test_project_hook_native_forwards_arguments_home_and_path_precedence(self):
+        self.require_native_hooks()
+        repository = self.new_repository()
+        self.register_project_hook(repository)
+        record = self.sandbox / "record.json"
+        first = self.sandbox / "first ' $dollar; bin"
+        second = self.sandbox / "second ' $dollar; bin"
+        for directory, label in ((first, "first"), (second, "second")):
+            directory.mkdir()
+            executable = directory / "skillset"
+            executable.write_text(
+                f"#!{sys.executable}\nimport json,os,sys\n"
+                f"open({str(record)!r}, 'w').write(json.dumps("
+                f"[{label!r}, os.environ['HOME'], sys.argv[1:]]))\n")
+            executable.chmod(0o755)
+        args = ("old ' $value; touch artifact", "new ' $value; other", "1")
+        for paths, label in (((first, second), "first"), ((second, first), "second")):
+            env = {"PATH": os.pathsep.join(map(str, paths)) + os.pathsep + os.environ["PATH"]}
+            self.git(repository, "hook", "run", "post-checkout", "--", *args, extra=env)
+            self.assertEqual(json.loads(record.read_text()),
+                             [label, str(self.home), ["_project-hook", *args]])
+            self.assertFalse((repository / "artifact").exists())
+
+    def test_project_hook_native_missing_executable_warns_without_failing_git(self):
+        self.require_native_hooks()
+        repository = self.new_repository()
+        self.register_project_hook(repository)
+        tools = self.sandbox / "only-git"
+        tools.mkdir()
+        (tools / "git").symlink_to(shutil.which("git"))
+        result = self.git(repository, "checkout", "-qb", "next",
+                          extra={"PATH": str(tools)})
+        self.assertIn("skillset: project hook failed", result.stderr)
+        self.assertFalse((repository / ".codex").exists())
+
+    def test_project_hook_native_collision_warns_and_other_hook_status_survives(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repository = self.new_repository()
+        self.register_project_hook(repository)
+        destination = repository / ".codex/skills/default"
+        destination.mkdir(parents=True)
+        before = self.filesystem_snapshot(destination)
+        result = self.git(repository, "checkout", "-qb", "next")
+        self.assertIn("entry already exists", result.stderr)
+        self.assertIn("project hook failed", result.stderr)
+        self.assertEqual(self.filesystem_snapshot(destination), before)
+        self.git(repository, "config", "--local", "hook.other.command",
+                 "other_hook() { return 7; }; other_hook")
+        self.git(repository, "config", "--local", "hook.other.event", "post-checkout")
+        result = self.git(repository, "hook", "run", "post-checkout", "--",
+                          "old", "new", "1", check=False)
+        self.assertEqual(result.returncode, 7, result.stderr)
+
+    def test_project_hook_native_file_checkout_does_not_project(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repository = self.new_repository()
+        self.register_project_hook(repository)
+        (repository / "seed").write_text("changed")
+        self.git(repository, "checkout", "--", "seed")
+        self.assertFalse((repository / ".codex").exists())
+
+    def test_project_hook_native_source_errors_continue_and_registration_stays_unchanged(self):
+        from skillset import project
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        repository = self.new_repository()
+        context = self.register_project_hook(repository, ("absent", "default"))
+        state = (context.common_dir / project.REGISTRATION_NAME).read_bytes()
+        result = self.git(repository, "checkout", "-qb", "next")
+        self.assertIn("absent", result.stderr)
+        self.assertIn("project hook failed", result.stderr)
+        self.assertEqual(os.readlink(repository / ".codex/skills/default"),
+                         str(self.root / "skillsets/default/skills"))
+        self.assertFalse(os.path.lexists(repository / ".codex/skills/absent"))
+        self.assertEqual((context.common_dir / project.REGISTRATION_NAME).read_bytes(), state)
+
+    def test_project_hook_native_malformed_registration_warns_without_mutation(self):
+        from skillset import project
+        self.require_native_hooks()
+        repository = self.new_repository()
+        context = self.register_project_hook(repository)
+        state = context.common_dir / project.REGISTRATION_NAME
+        state.write_text("not json")
+        before = self.filesystem_snapshot(self.home)
+        result = self.git(repository, "checkout", "-qb", "next")
+        self.assertIn("invalid project registration", result.stderr)
+        self.assertIn("project hook failed", result.stderr)
+        self.assertEqual(state.read_text(), "not json")
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+        self.assertFalse((repository / ".codex").exists())
+
+    def test_project_hook_lock_dispatch_reads_existing_lock_without_changing_home(self):
+        from skillset import project
+        self.make_managed_layout(self.home)
+        lock = self.root / ".skillset.lock"
+        lock.write_text("existing lock metadata")
+        repository = self.new_repository()
+        before = self.filesystem_snapshot(self.home)
+        with self.git_version("git version 2.54.0"):
+            context = project.discover(repository)
+            project.write_names(context.common_dir, ("default",))
+            result = self.run_cli_in_process("_project-hook", "old", "new", "1",
+                                            cwd=repository,
+                                            extra_environment=self.git_environment())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.filesystem_snapshot(self.home), before)
+        self.assertTrue((repository / ".codex/skills/default").is_symlink())
+
+    def test_project_hook_config_owned_recovery_and_remove_preserve_unrelated_settings(self):
+        from skillset import project
+        self.require_native_hooks()
+        repository = self.new_repository()
+        self.git(repository, "config", "--local", "core.hooksPath", "custom hooks")
+        self.git(repository, "config", "--local", "hook.other.command", "true")
+        self.git(repository, "config", "--local", "hook.other.event", "post-checkout")
+        with self.git_version("git version 2.54.0"):
+            context = project.discover(repository)
+            self.assertEqual(project.hook_config_errors(context, registered=False, enabling=True), ())
+            self.assertEqual(project.hook_config_errors(context, registered=True, enabling=True), ())
+            self.assertFalse(project.hook_is_complete(context))
+            for absent in ("command", "event", None):
+                project.install_hook(context)
+                if absent:
+                    self.git(repository, "config", "--local", "--unset-all", "hook.skillset-project." + absent)
+                before = (context.common_dir / "config").read_bytes()
+                self.assertEqual(project.hook_config_errors(context, registered=True, enabling=True), ())
+                self.assertEqual(project.hook_is_complete(context), absent is None)
+                self.assertTrue(project.hook_config_errors(context, registered=False, enabling=True))
+                self.assertEqual((context.common_dir / "config").read_bytes(), before)
+            project.remove_hook(context)
+            project.remove_hook(context)
+        self.assertEqual(self.git(repository, "config", "--get", "core.hooksPath").stdout, "custom hooks\n")
+        self.assertEqual(self.git(repository, "config", "--get", "hook.other.command").stdout, "true\n")
+        self.assertEqual(self.git(repository, "config", "--get", "hook.other.event").stdout, "post-checkout\n")
+
+    def test_project_hook_config_conflict_matrix_preserves_exact_bytes(self):
+        from skillset import project
+        self.require_native_hooks()
+        cases = (("duplicate-command", "command", "owned", True),
+                 ("duplicate-event", "event", "post-checkout", True),
+                 ("extra-key", "unknown", "value", False),
+                 ("changed-command", "command", "true", False),
+                 ("changed-event", "event", "pre-commit", False))
+        for label, key, value, append in cases:
+            with self.subTest(label=label), self.git_version("git version 2.54.0"):
+                repository = self.new_repository(label)
+                context = project.discover(repository)
+                project.install_hook(context)
+                if value == "owned":
+                    value = self.git(repository, "config", "--get", "hook.skillset-project.command").stdout.rstrip("\n")
+                args = ("--add",) if append else ()
+                self.git(repository, "config", "--local", *args, "hook.skillset-project." + key, value)
+                before = (context.common_dir / "config").read_bytes()
+                for enabling in (False, True):
+                    errors = project.hook_config_errors(context, registered=True, enabling=enabling)
+                    self.assertTrue(errors)
+                    self.assertIn("hook.skillset-project." + key, "\n".join(errors))
+                self.assertEqual((context.common_dir / "config").read_bytes(), before)
+
+    def test_project_hook_config_inherited_and_included_owned_keys_conflict(self):
+        from skillset import project
+        self.require_native_hooks()
+        repository = self.new_repository()
+        inherited = self.sandbox / "inherited config"
+        self.git(repository, "config", "--file", str(inherited),
+                 "hook.skillset-project.command", project.HOOK_COMMAND)
+        self.git(repository, "config", "--file", str(inherited),
+                 "hook.skillset-project.event", "post-checkout")
+        inherited_before = inherited.read_bytes()
+        with self.git_version("git version 2.54.0", {"GIT_CONFIG_GLOBAL": str(inherited)}):
+            context = project.discover(repository)
+            before = (context.common_dir / "config").read_bytes()
+            self.assertTrue(project.hook_config_errors(context, registered=True, enabling=True))
+            self.assertEqual((context.common_dir / "config").read_bytes(), before)
+            self.assertEqual(inherited.read_bytes(), inherited_before)
+        self.git(repository, "config", "--local", "include.path", str(inherited))
+        with self.git_version("git version 2.54.0"):
+            self.assertTrue(project.hook_config_errors(context, registered=True, enabling=False))
+
+    def test_project_hook_config_checks_other_worktree_scope_and_disabled_controls(self):
+        from skillset import project
+        self.require_native_hooks()
+        repository = self.new_repository()
+        sibling = self.sandbox / "sibling"
+        self.git(repository, "worktree", "add", "-qb", "sibling", str(sibling))
+        self.git(repository, "config", "--local", "extensions.worktreeConfig", "true")
+        with self.git_version("git version 2.54.0"):
+            context = project.discover(repository)
+            project.install_hook(context)
+            self.git(sibling, "config", "--worktree", "hook.skillset-project.event", "post-checkout")
+            config = Path(self.git(sibling, "rev-parse", "--git-path", "config.worktree").stdout.strip())
+            before = config.read_bytes()
+            self.assertTrue(project.hook_config_errors(context, registered=True, enabling=False))
+            self.assertEqual(config.read_bytes(), before)
+            self.git(sibling, "config", "--worktree", "--unset-all", "hook.skillset-project.event")
+            self.git(sibling, "config", "--worktree", "hook.skillset-project.enabled", "false")
+            self.assertTrue(project.hook_config_errors(context, registered=True, enabling=True))
+            self.assertEqual(project.hook_config_errors(context, registered=True, enabling=False), ())
+            project.remove_hook(context)
+        self.assertEqual(self.git(sibling, "config", "--worktree", "--get", "hook.skillset-project.enabled").stdout, "false\n")
+
+    def test_project_hook_config_named_disable_local_global_and_command_scopes(self):
+        from skillset import project
+        self.require_native_hooks()
+        for scope in ("local", "global", "command"):
+            with self.subTest(scope=scope):
+                repository = self.new_repository(scope)
+                inherited = self.sandbox / (scope + "-config")
+                inherited.write_text('[hook "skillset-project"]\n enabled = false\n')
+                extra = {}
+                if scope == "global":
+                    extra["GIT_CONFIG_GLOBAL"] = str(inherited)
+                elif scope == "command":
+                    extra.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="hook.skillset-project.enabled", GIT_CONFIG_VALUE_0="false")
+                else:
+                    self.git(repository, "config", "--local", "hook.skillset-project.enabled", "false")
+                with self.git_version("git version 2.54.0", extra):
+                    context = project.discover(repository)
+                    project.install_hook(context)
+                    before = (context.common_dir / "config").read_bytes()
+                    environment_before = os.environ.copy()
+                    self.assertTrue(project.hook_config_errors(context, registered=True, enabling=True))
+                    self.assertEqual(project.hook_config_errors(context, registered=True, enabling=False), ())
+                    self.assertFalse(project.hook_is_complete(context))
+                    self.assertEqual((context.common_dir / "config").read_bytes(), before)
+                    self.assertEqual(os.environ, environment_before)
+                    project.remove_hook(context)
+                self.assertEqual(inherited.read_text(), '[hook "skillset-project"]\n enabled = false\n')
+
+    def test_project_hook_config_worktree_only_and_command_scope_owned_values_conflict(self):
+        from skillset import project
+        self.require_native_hooks()
+        repository = self.new_repository()
+        self.git(repository, "config", "--local", "extensions.worktreeConfig", "true")
+        self.git(repository, "config", "--worktree", "hook.skillset-project.command", project.HOOK_COMMAND)
+        self.git(repository, "config", "--worktree", "hook.skillset-project.event", "post-checkout")
+        config = repository / ".git/config.worktree"
+        before = config.read_bytes()
+        with self.git_version("git version 2.54.0"):
+            context = project.discover(repository)
+            self.assertTrue(project.hook_config_errors(context, registered=True, enabling=False))
+        self.assertEqual(config.read_bytes(), before)
+        self.git(repository, "config", "--worktree", "--remove-section", "hook.skillset-project")
+        extra = {"GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "hook.skillset-project.command",
+                 "GIT_CONFIG_VALUE_0": project.HOOK_COMMAND,
+                 "GIT_CONFIG_KEY_1": "hook.skillset-project.event", "GIT_CONFIG_VALUE_1": "post-checkout"}
+        with self.git_version("git version 2.54.0", extra):
+            environment_before = os.environ.copy()
+            self.assertTrue(project.hook_config_errors(context, registered=True, enabling=True))
+            self.assertEqual(os.environ, environment_before)
+
+    def test_project_hook_config_orphan_control_conflicts_and_effective_enabled_wins(self):
+        from skillset import project
+        self.require_native_hooks()
+        repository = self.new_repository()
+        inherited = self.sandbox / "control config"
+        inherited.write_text('[hook "skillset-project"]\n enabled = false\n')
+        with self.git_version("git version 2.54.0", {"GIT_CONFIG_GLOBAL": str(inherited)}):
+            context = project.discover(repository)
+            self.assertTrue(project.hook_config_errors(context, registered=False, enabling=False))
+            project.install_hook(context)
+            self.git(repository, "config", "--local", "hook.skillset-project.enabled", "true")
+            self.assertEqual(project.hook_config_errors(context, registered=True, enabling=True), ())
+            self.assertTrue(project.hook_is_complete(context))
+
+    def test_codex_project_operation_first_enable_refuses_effective_event_disable(self):
+        result = self.git(self.home, "--version")
+        version = re.search(r"git version (\d+)\.(\d+)", result.stdout)
+        if not version or tuple(map(int, version.groups())) < (2, 55):
+            self.skipTest("event-wide hook controls require Git 2.55 or newer")
+        self.make_managed_layout(self.home)
+        for scope in ("local", "global", "command", "worktree"):
+            with self.subTest(scope=scope):
+                repo = self.new_repository("a-" + scope)
+                sibling = self.sandbox / ("z-" + scope)
+                self.git(repo, "worktree", "add", "--detach", str(sibling))
+                inherited = self.sandbox / (scope + "-event-config")
+                inherited.write_text('[hook "post-checkout"]\n enabled = false\n')
+                extra = {}
+                if scope == "global":
+                    extra["GIT_CONFIG_GLOBAL"] = str(inherited)
+                elif scope == "command":
+                    extra.update(GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="hook.post-checkout.enabled", GIT_CONFIG_VALUE_0="false")
+                elif scope == "worktree":
+                    self.git(repo, "config", "--local", "extensions.worktreeConfig", "true")
+                    self.git(sibling, "config", "--worktree", "hook.post-checkout.enabled", "false")
+                else:
+                    self.git(repo, "config", "--local", "hook.post-checkout.enabled", "false")
+                self.assertEqual(self.run_cli_in_process("codex", "enable", "default", "--local", cwd=repo).returncode, 0)
+                before = tuple(self.filesystem_snapshot(path) for path in (self.home, repo, sibling, inherited))
+                result = self.run_cli_in_process("codex", "enable", "default", "--project", cwd=repo,
+                                                 extra_environment=self.git_environment(extra))
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertIn("project hook is disabled: hook.post-checkout.enabled", result.stderr)
+                self.assertFalse((repo / ".git/project-skillsets.json").exists())
+                self.assertEqual(tuple(self.filesystem_snapshot(path) for path in (self.home, repo, sibling, inherited)), before)
+
+    def test_project_hook_config_first_enable_event_control_version_boundary(self):
+        from skillset import project
+        repo = self.new_repository()
+        self.git(repo, "config", "--local", "hook.post-checkout.enabled", "false")
+        before = self.filesystem_snapshot(repo)
+        for version, disabled in (("git version 2.54.0", False), ("git version 2.55.0", True)):
+            with self.subTest(version=version), self.git_version(version):
+                context = project.discover(repo)
+                errors = project.hook_config_errors(context, registered=False, enabling=True)
+                self.assertEqual(bool(errors), disabled)
+                if disabled:
+                    self.assertIn("hook.post-checkout.enabled", "\n".join(errors))
+                self.assertEqual(self.filesystem_snapshot(repo), before)
+
+    def test_project_hook_config_event_disable_when_supported(self):
+        from skillset import project
+        self.require_native_hooks()
+        repository = self.new_repository()
+        context = self.register_project_hook(repository)
+        self.git(repository, "config", "--local", "hook.post-checkout.enabled", "false")
+        listing = self.git(repository, "hook", "list", "--show-scope", "post-checkout")
+        if "event-disabled" not in listing.stdout:
+            self.skipTest("installed Git does not support event-wide disabling")
+        before = (context.common_dir / "config").read_bytes()
+        with mock.patch.dict(os.environ, self.git_environment(), clear=True):
+            self.assertTrue(project.hook_config_errors(context, registered=True, enabling=True))
+            self.assertEqual(project.hook_config_errors(context, registered=True, enabling=False), ())
+            self.assertFalse(project.hook_is_complete(context))
+            self.assertEqual((context.common_dir / "config").read_bytes(), before)
+            project.remove_hook(context)
+        self.assertEqual(self.git(repository, "config", "--get", "hook.post-checkout.enabled").stdout, "false\n")
+
+    def test_project_state_registration_round_trip_and_schema_refusal(self):
+        from skillset import project
+        common = self.sandbox / "metadata"
+        common.mkdir()
+        self.assertIsNone(project.read_names(common))
+        project.write_names(common, ("default", "personal"))
+        state = common / "project-skillsets.json"
+        self.assertEqual(json.loads(state.read_text()),
+                         {"version": 1, "names": ["default", "personal"]})
+        self.assertEqual(project.read_names(common), ("default", "personal"))
+        for value in (
+            {"version": True, "names": ["default"]},
+            {"version": 2, "names": ["default"]},
+            {"version": 1, "names": []},
+            {"version": 1, "names": ["default", "default"]},
+            {"version": 1, "names": ["personal", "default"]},
+            {"version": 1, "names": ["../default"]},
+            {"version": 1, "names": ["default"], "home": "/tmp"},
+        ):
+            with self.subTest(value=value):
+                state.write_text(json.dumps(value))
+                before = state.read_bytes()
+                with self.assertRaises(OperationalError):
+                    project.read_names(common)
+                self.assertEqual(state.read_bytes(), before)
+
+    def test_project_state_registration_invalid_data_and_file_shapes(self):
+        from skillset import project
+        common = self.sandbox / "metadata"
+        common.mkdir()
+        state = common / "project-skillsets.json"
+        for contents in (
+            b"[]", b"null", b"{", b"\xff",
+            b'{"version": 1, "names": "default"}',
+            b'{"version": 1, "names": [3]}',
+            b'{"version": "1", "names": ["default"]}',
+            b'{"version": 1, "names": ["UPPER"]}',
+        ):
+            with self.subTest(contents=contents):
+                state.write_bytes(contents)
+                with self.assertRaisesRegex(OperationalError, str(state)):
+                    project.read_names(common)
+                self.assertEqual(state.read_bytes(), contents)
+        target = common / "elsewhere"
+        target.write_text('{"version": 1, "names": ["default"]}')
+        state.unlink()
+        state.symlink_to(target)
+        with self.assertRaisesRegex(OperationalError, "regular file"):
+            project.read_names(common)
+        self.assertTrue(state.is_symlink())
+        state.unlink()
+        state.mkdir()
+        with self.assertRaisesRegex(OperationalError, "regular file"):
+            project.read_names(common)
+        self.assertTrue(state.is_dir())
+
+    def test_project_state_registration_replace_failure_cleans_staging(self):
+        from skillset import project
+        common = self.sandbox / "metadata"
+        common.mkdir()
+        project.write_names(common, ("default",))
+        state = common / "project-skillsets.json"
+        before = state.read_bytes()
+        with mock.patch("skillset.project.os.replace", side_effect=OSError("disk error")):
+            with self.assertRaisesRegex(OperationalError, "disk error"):
+                project.write_names(common, ("default", "personal"))
+        self.assertEqual(state.read_bytes(), before)
+        self.assertEqual(list(common.iterdir()), [state])
+        project.write_names(common, ())
+        self.assertIsNone(project.read_names(common))
+        self.assertEqual(list(common.iterdir()), [])
+        project.write_names(common, ())
+
+    def test_project_state_registration_read_error_is_not_absence(self):
+        from skillset import project
+        common = self.sandbox / "metadata"
+        common.mkdir()
+        project.write_names(common, ("default",))
+        with mock.patch.object(Path, "read_text", side_effect=PermissionError("unreadable")):
+            with self.assertRaisesRegex(OperationalError, "unreadable"):
+                project.read_names(common)
+
+    def test_project_state_git_version_floor_and_suffixes(self):
+        from skillset import project
+        repo = self.new_repository()
+        for version in ("git version 2.53.9\n", "git version unknown\n"):
+            with self.subTest(version=version), self.git_version(version):
+                with self.assertRaisesRegex(OperationalError, "Git 2.54 or newer"):
+                    project.discover(repo)
+        for version in (
+            "git version 2.54.0\n", "git version 2.54.0.rc1\n",
+            "git version 2.54.0.windows.1\n", "git version 3.0.0\n",
+        ):
+            with self.subTest(version=version), self.git_version(version):
+                found = project.discover(repo)
+                self.assertEqual(found.common_dir, repo / ".git")
+                self.assertEqual(found.current_root, repo)
+                self.assertEqual(found.worktrees, (repo,))
+
+    def test_project_state_optional_discovery_without_git_or_repository(self):
+        from skillset import project
+        with self.git_version("git version 2.54.0"):
+            self.assertIsNone(project.discover(self.home, required=False))
+            with self.assertRaisesRegex(OperationalError, "requires a Git worktree"):
+                project.discover(self.home)
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError("git")):
+            self.assertIsNone(project.discover(self.home, required=False))
+            with self.assertRaisesRegex(OperationalError, "Git"):
+                project.discover(self.home)
+        self.assertFalse(self.root.exists())
+
+    def test_project_state_optional_discovery_skips_inventory_and_version(self):
+        from skillset import project
+        repo = self.new_repository()
+        sibling = self.sandbox / "missing"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        shutil.rmtree(sibling)
+        run = subprocess.run
+
+        def discovery_only(command, *args, **kwargs):
+            if "--version" in command or "worktree" in command:
+                raise AssertionError("overview must not check version or inventory")
+            return run(command, *args, **kwargs)
+
+        with mock.patch.dict(os.environ, self.git_environment(), clear=True):
+            with mock.patch("subprocess.run", side_effect=discovery_only):
+                found = project.discover(repo, required=False)
+        self.assertEqual(found.common_dir, repo / ".git")
+        self.assertEqual(found.current_root, repo)
+        self.assertEqual(found.worktrees, ())
+
+    def test_project_state_subdirectory_detached_locked_and_linked_worktrees(self):
+        self.require_native_hooks()
+        from skillset import project
+        repo = self.new_repository()
+        sibling = self.sandbox / "a-linked"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        self.git(repo, "worktree", "lock", str(sibling), "--reason", "keep")
+        nested = sibling / "nested"
+        nested.mkdir()
+        self.git(repo, "checkout", "--detach", "-q")
+        with mock.patch.dict(os.environ, self.git_environment(), clear=True):
+            found = project.discover(nested)
+        self.assertEqual(found.common_dir, repo / ".git")
+        self.assertEqual(found.current_root, sibling)
+        self.assertEqual(found.worktrees, (sibling, repo))
+        self.assertIn("locked keep", self.git(repo, "worktree", "list", "--porcelain").stdout)
+
+    def test_project_state_bare_root_refused_and_linked_worktree_supported(self):
+        self.require_native_hooks()
+        from skillset import project
+        repo = self.new_repository()
+        bare = self.sandbox / "bare.git"
+        self.git(self.sandbox, "clone", "--bare", str(repo), str(bare))
+        linked = self.sandbox / "bare-linked"
+        self.git(bare, "worktree", "add", "--detach", str(linked))
+        with mock.patch.dict(os.environ, self.git_environment(), clear=True):
+            self.assertIsNone(project.discover(bare, required=False))
+            with self.assertRaisesRegex(OperationalError, "requires a Git worktree"):
+                project.discover(bare)
+            found = project.discover(linked)
+        self.assertEqual(found.common_dir, bare)
+        self.assertEqual(found.current_root, linked)
+        self.assertEqual(found.worktrees, (linked,))
+
+    def test_project_state_independent_clone_and_submodule_identity(self):
+        self.require_native_hooks()
+        from skillset import project
+        repo = self.new_repository()
+        clone = self.sandbox / "clone"
+        self.git(self.sandbox, "clone", str(repo), str(clone))
+        self.git(repo, "-c", "protocol.file.allow=always", "submodule", "add", str(clone), "module")
+        module = repo / "module"
+        linked_module = self.sandbox / "submodule-linked"
+        self.git(module, "worktree", "add", "--detach", str(linked_module))
+        with mock.patch.dict(os.environ, self.git_environment(), clear=True):
+            original = project.discover(repo)
+            independent = project.discover(clone)
+            submodule = project.discover(module)
+            linked_submodule = project.discover(linked_module)
+        self.assertEqual(original.common_dir, repo / ".git")
+        self.assertEqual(independent.common_dir, clone / ".git")
+        self.assertEqual(independent.worktrees, (clone,))
+        self.assertEqual(submodule.common_dir, repo / ".git" / "modules" / "module")
+        self.assertEqual(submodule.current_root, module)
+        self.assertEqual(submodule.worktrees, (module, linked_module))
+        self.assertEqual(linked_submodule.common_dir, repo / ".git" / "modules" / "module")
+        self.assertEqual(linked_submodule.current_root, linked_module)
+        self.assertEqual(linked_submodule.worktrees, (module, linked_module))
+
+    def test_project_state_nul_inventory_preserves_spaces_and_newlines(self):
+        self.require_native_hooks()
+        from skillset import project
+        repo = self.new_repository("repo with space\nand newline")
+        sibling = self.sandbox / "a linked\nworktree "
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        with mock.patch.dict(os.environ, self.git_environment(), clear=True):
+            found = project.discover(sibling)
+        self.assertEqual(found.common_dir, repo / ".git")
+        self.assertEqual(found.current_root, sibling)
+        self.assertEqual(found.worktrees, (sibling, repo))
+
+    def test_project_state_missing_worktree_is_not_pruned(self):
+        self.require_native_hooks()
+        from skillset import project
+        repo = self.new_repository()
+        sibling = self.sandbox / "missing"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        shutil.rmtree(sibling)
+        before = self.git(repo, "worktree", "list", "--porcelain", "-z").stdout
+        with mock.patch.dict(os.environ, self.git_environment(), clear=True):
+            with self.assertRaisesRegex(OperationalError, "cannot inspect registered worktree") as error:
+                project.discover(repo)
+            self.assertIn(str(sibling), str(error.exception))
+            found = project.discover(repo, inventory=False)
+        self.assertEqual(found.worktrees, ())
+        self.assertEqual(self.git(repo, "worktree", "list", "--porcelain", "-z").stdout, before)
+
+    def test_project_state_mismatched_worktree_identity_is_refused(self):
+        self.require_native_hooks()
+        from skillset import project
+        repo = self.new_repository()
+        sibling = self.sandbox / "sibling"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        shutil.rmtree(sibling)
+        self.new_repository("sibling")
+        with mock.patch.dict(os.environ, self.git_environment(), clear=True):
+            with self.assertRaisesRegex(OperationalError, "cannot inspect registered worktree") as error:
+                project.discover(repo)
+        self.assertIn(str(sibling), str(error.exception))
+        self.assertIn("common directory", str(error.exception))
+        self.assertTrue((sibling / ".git").is_dir())
+
+    def test_project_state_sibling_inspection_clears_only_child_git_environment(self):
+        self.require_native_hooks()
+        from skillset import project
+        repo = self.new_repository()
+        sibling = self.sandbox / "sibling"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        extra = {"GIT_DIR": str(repo / ".git"), "GIT_WORK_TREE": str(repo)}
+        with mock.patch.dict(os.environ, self.git_environment(extra), clear=True):
+            before = os.environ.copy()
+            found = project.discover(repo)
+            self.assertEqual(os.environ.copy(), before)
+        self.assertEqual(found.current_root, repo)
+        self.assertEqual(found.common_dir, repo / ".git")
+        self.assertEqual(found.worktrees, (repo, sibling))
 
     def run_cli(
         self,
@@ -861,6 +3034,29 @@ printf 'augment-skills-list-local:%s\n' "${COMPREPLY[*]}"'''
             ],
         )
 
+        project_cases = {}
+        for command in ("enable", "disable", "list"):
+            for words in (("--p",), ("default", "--p")) if command != "list" else (("--p",),):
+                project_cases[("codex", command, *words)] = ["--project"]
+            for scope in ("--project", "--global", "--local", "-g", "-l"):
+                for words in ((scope, "--"), ("default", scope, "--")) if command != "list" else ((scope, "--"),):
+                    project_cases[("codex", command, *words)] = ["--help", "--verbose"] if command == "list" else ["--help"]
+            if command != "list":
+                project_cases[("codex", command, "--project", "d")] = ["default", "demo"]
+                project_cases[("codex", command, "--", "--p")] = []
+                project_cases[("codex", command, "--project", "--", "d")] = ["default", "demo"]
+        for harness in ("claude", "augment"):
+            for command in ("enable", "disable", "list"):
+                project_cases[(harness, command, "--p")] = []
+        project_cases[("_project",)] = []
+        commands = ['source "$1"']
+        for words in project_cases:
+            commands.append('COMP_WORDS=(skillset ' + ' '.join(words) + '); COMP_CWORD=' + str(len(words)) + '; _skillset_completion')
+            commands.append('printf "[%s]\\n" "${COMPREPLY[*]}"')
+        checked = subprocess.run([bash, "-c", "\n".join(commands), "bash", str(script)], env=environment, text=True, capture_output=True, check=False)
+        self.assertEqual(checked.returncode, 0, checked.stderr)
+        self.assertEqual(checked.stdout.splitlines(), ["[" + " ".join(expected) + "]" for expected in project_cases.values()])
+
     def test_fish_completion_is_contextual_and_uses_managed_names(self):
         fish = shutil.which("fish")
         if fish is None:
@@ -879,9 +3075,9 @@ printf 'augment-skills-list-local:%s\n' "${COMPREPLY[*]}"'''
             "skillset remove ": ("-h", "--help", "--yes"),
             "skillset list ": ("-h", "--help", "-v", "--verbose"),
             "skillset codex ": ("-h", "--help"),
-            "skillset codex enable ": ("-h", "--help", "-g", "--global", "-l", "--local"),
-            "skillset codex disable ": ("-h", "--help", "-g", "--global", "-l", "--local"),
-            "skillset codex list ": ("-h", "--help", "-v", "--verbose", "-g", "--global", "-l", "--local"),
+            "skillset codex enable ": ("-h", "--help", "-g", "--global", "-l", "--local", "--project"),
+            "skillset codex disable ": ("-h", "--help", "-g", "--global", "-l", "--local", "--project"),
+            "skillset codex list ": ("-h", "--help", "-v", "--verbose", "-g", "--global", "-l", "--local", "--project"),
             "skillset claude ": ("-h", "--help"),
             "skillset claude enable ": ("-h", "--help", "-g", "--global", "-l", "--local"),
             "skillset claude disable ": ("-h", "--help", "-g", "--global", "-l", "--local"),
@@ -941,6 +3137,22 @@ end'''
                 for commandline, output in zip(commandlines, outputs, strict=True)
             }
 
+        project_cases = {}
+        for command in ("enable", "disable", "list"):
+            project_cases[f"skillset codex {command} --p"] = ["--project"]
+            if command != "list":
+                project_cases[f"skillset codex {command} default --p"] = ["--project"]
+                project_cases[f"skillset codex {command} --project d"] = ["default", "demo"]
+                project_cases[f"skillset codex {command} -- --p"] = []
+                project_cases[f"skillset codex {command} --project -- d"] = ["default", "demo"]
+            for scope in ("--project", "--global", "--local", "-g", "-l"):
+                project_cases[f"skillset codex {command} {scope} --"] = ["--help", "--verbose"] if command == "list" else ["--help"]
+                if command != "list":
+                    project_cases[f"skillset codex {command} default {scope} --"] = ["--help"]
+        for harness in ("claude", "augment"):
+            for command in ("enable", "disable", "list"):
+                project_cases[f"skillset {harness} {command} --p"] = ["--help"]
+        project_cases["skillset _project"] = []
         static_commandlines = (
             "skillset sh", "skillset use d", "skillset create --from d",
             "skillset rename default n", "skillset skills l", "skillset codex ",
@@ -953,6 +3165,7 @@ end'''
             "skillset augment skills l", "skillset augment skills list --v",
             "skillset augment skills list ",
             *completion_option_cases,
+            *project_cases,
         )
         static_candidates = batch_candidates(static_commandlines, stub_environment)
         real_candidates = batch_candidates(
@@ -1002,6 +3215,10 @@ end'''
             set(static_candidates["skillset augment skills list "]),
             {"-h", "--help", "-v", "--verbose", "-g", "--global", "-l", "--local"},
         )
+
+        for commandline, expected in project_cases.items():
+            with self.subTest(commandline=commandline):
+                self.assertEqual(static_candidates[commandline], expected)
 
         for commandline, options in completion_option_cases.items():
             with self.subTest(commandline=commandline):
@@ -1267,6 +3484,27 @@ _skillset'''
             ),
             ("skillset augment skills list -- --v", "\x07", None),
         )
+        project_cases = []
+        for command in ("enable", "disable", "list"):
+            project_cases.append((f"skillset codex {command} --p", "--project", "--project"))
+            if command != "list":
+                project_cases.extend((
+                    (f"skillset codex {command} default --p", "--project", "--project"),
+                    (f"skillset codex {command} --project d", "default", "default"),
+                    (f"skillset codex {command} -- --p", "\x07", None),
+                    (f"skillset codex {command} --project -- d", "default", "default"),
+                ))
+            for scope in ("--project", "--global", "--local", "-g", "-l"):
+                for alternative in ("--p", "--g", "--l"):
+                    project_cases.append((f"skillset codex {command} {scope} {alternative}", "\x07", None))
+                if command != "list":
+                    project_cases.append((f"skillset codex {command} default {scope} --p", "\x07", None))
+        for harness in ("claude", "augment"):
+            for command in ("enable", "disable", "list"):
+                project_cases.append((f"skillset {harness} {command} --p", "\x07", None))
+        project_cases.append(("skillset _project", "\x07", None))
+        cases += tuple(project_cases)
+
         real_cases = (
             ("skillset augment enable --local d", "default", "default"),
         )
@@ -1284,6 +3522,10 @@ _skillset'''
                 output = outputs[commandline]
                 if candidate is None:
                     self.assertNotIn("--verbose", output)
+                    if commandline.startswith("skillset codex "):
+                        for option in ("--project", "--global", "--local"):
+                            if option not in commandline:
+                                self.assertNotIn(option, output)
                 else:
                     self.assertIn(candidate, output)
                 if commandline in {
@@ -2363,6 +4605,157 @@ _skillset'''
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "alpha\n* middle\nzeta\n")
         self.assertEqual(result.stderr, "")
+
+    def test_codex_projection_preserves_then_removes_preexisting_canonical_link(self):
+        from skillset import codex
+        self.make_managed_layout(self.home)
+        worktree = self.sandbox / "checkout"
+        (worktree / ".codex" / "skills").mkdir(parents=True)
+        link = worktree / ".codex" / "skills" / "default"
+        target = str(self.root / "skillsets" / "default" / "skills")
+        link.symlink_to(target + "/")
+        codex.preflight_at(self.root, ("default",), worktree)
+        self.assertEqual(codex.reconcile_at(self.root, ("default",), worktree), ())
+        self.assertEqual(os.readlink(link), target + "/")
+        self.assertEqual(codex.reconcile_at(
+            self.root, ("default",), worktree, removing=True), ())
+        self.assertFalse(os.path.lexists(link))
+        self.assertTrue(link.parent.is_dir())
+
+    def test_codex_projection_preflight_and_removal_do_not_create_containers(self):
+        from skillset import codex
+        worktree = self.sandbox / "checkout"
+        worktree.mkdir()
+        for partial in (False, True):
+            with self.subTest(partial=partial):
+                if partial:
+                    (worktree / ".codex").mkdir()
+                before = self.filesystem_snapshot(worktree)
+                self.assertIsNone(codex.skills_directory_at(worktree))
+                codex.preflight_at(self.root, ("default",), worktree)
+                codex.preflight_at(self.root, ("default",), worktree, removing=True)
+                self.assertEqual(codex.reconcile_at(
+                    self.root, ("default",), worktree, removing=True), ())
+                self.assertEqual(self.filesystem_snapshot(worktree), before)
+        self.assertEqual(codex.reconcile_at(self.root, ("default",), worktree), ())
+        self.assertEqual(os.readlink(worktree / ".codex" / "skills" / "default"),
+                         str(self.root / "skillsets" / "default" / "skills"))
+        self.assertFalse(self.root.exists())
+
+    def test_codex_projection_preserves_unrelated_entries(self):
+        from skillset import codex
+        target = str(self.root / "skillsets" / "default" / "skills")
+        for kind in ("relative", "different", "directory", "file"):
+            with self.subTest(kind=kind):
+                worktree = self.sandbox / kind
+                skills = worktree / ".codex" / "skills"
+                skills.mkdir(parents=True)
+                link = skills / "default"
+                if kind == "relative":
+                    link.symlink_to(os.path.relpath(target, skills))
+                elif kind == "different":
+                    link.symlink_to(self.sandbox / "other")
+                elif kind == "directory":
+                    link.mkdir()
+                else:
+                    link.write_text("unrelated")
+                before = self.filesystem_snapshot(worktree)
+                self.assertFalse(codex.canonical_link_at(self.root, "default", worktree))
+                with self.assertRaisesRegex(OperationalError, "entry already exists"):
+                    codex.preflight_at(self.root, ("default",), worktree)
+                errors = codex.reconcile_at(self.root, ("default",), worktree)
+                self.assertEqual(len(errors), 1)
+                self.assertIn(str(link), errors[0])
+                codex.preflight_at(self.root, ("default",), worktree, removing=True)
+                self.assertEqual(codex.reconcile_at(
+                    self.root, ("default",), worktree, removing=True), ())
+                self.assertEqual(self.filesystem_snapshot(worktree), before)
+
+    def test_codex_projection_refuses_nonreal_containers(self):
+        from skillset import codex
+        for level in (".codex", "skills"):
+            for kind in ("symlink", "file"):
+                with self.subTest(level=level, kind=kind):
+                    worktree = self.sandbox / (level + kind)
+                    worktree.mkdir()
+                    container = worktree / ".codex"
+                    if level == "skills":
+                        container.mkdir()
+                        container /= "skills"
+                    if kind == "symlink":
+                        target = self.sandbox / (level + "target")
+                        target.mkdir(exist_ok=True)
+                        container.symlink_to(target)
+                    else:
+                        container.write_text("unrelated")
+                    before = self.filesystem_snapshot(self.sandbox)
+                    for removing in (False, True):
+                        with self.assertRaisesRegex(OperationalError, "real directory"):
+                            codex.preflight_at(self.root, ("default",), worktree,
+                                               removing=removing)
+                        errors = codex.reconcile_at(self.root, ("default",), worktree,
+                                                    removing=removing)
+                        self.assertEqual(len(errors), 1)
+                        self.assertIn(str(container), errors[0])
+                    self.assertEqual(self.filesystem_snapshot(self.sandbox), before)
+
+    def test_codex_projection_removes_normalized_dangling_link_only_at_root(self):
+        from skillset import codex
+        worktree = self.sandbox / "checkout"
+        nested = worktree / "nested"
+        target = str(self.root / "skillsets" / "default" / "skills")
+        for directory in (worktree, nested):
+            skills = directory / ".codex" / "skills"
+            skills.mkdir(parents=True)
+            (skills / "default").symlink_to(target + "/../skills//")
+        self.assertFalse(self.root.exists())
+        self.assertTrue(codex.canonical_link_at(self.root, "default", worktree))
+        codex.preflight_at(self.root, ("default",), worktree, removing=True)
+        self.assertEqual(codex.reconcile_at(
+            self.root, ("default",), worktree, removing=True), ())
+        self.assertFalse(os.path.lexists(worktree / ".codex" / "skills" / "default"))
+        self.assertEqual(os.readlink(nested / ".codex" / "skills" / "default"),
+                         target + "/../skills//")
+        self.assertTrue((worktree / ".codex" / "skills").is_dir())
+
+    def test_codex_projection_continues_after_ordinary_link_errors(self):
+        from skillset import codex
+        worktree = self.sandbox / "checkout"
+        skills = worktree / ".codex" / "skills"
+        skills.mkdir(parents=True)
+        failed = skills / "default"
+        successful = skills / "personal"
+        symlink = os.symlink
+
+        def create(target, link):
+            if link == failed:
+                raise OSError("disk error")
+            return symlink(target, link)
+
+        with mock.patch("skillset.codex.os.symlink", side_effect=create):
+            errors = codex.reconcile_at(self.root, ("default", "personal"), worktree)
+        self.assertEqual(len(errors), 1)
+        self.assertIn(str(failed), errors[0])
+        self.assertIn("disk error", errors[0])
+        self.assertFalse(os.path.lexists(failed))
+        self.assertEqual(os.readlink(successful),
+                         str(self.root / "skillsets" / "personal" / "skills"))
+        failed.symlink_to(self.root / "skillsets" / "default" / "skills")
+        unlink = Path.unlink
+
+        def remove(link, *args, **kwargs):
+            if link == failed:
+                raise OSError("disk error")
+            return unlink(link, *args, **kwargs)
+
+        with mock.patch("pathlib.Path.unlink", new=remove):
+            errors = codex.reconcile_at(self.root, ("default", "personal"), worktree,
+                                        removing=True)
+        self.assertEqual(len(errors), 1)
+        self.assertIn(str(failed), errors[0])
+        self.assertIn("disk error", errors[0])
+        self.assertTrue(failed.is_symlink())
+        self.assertFalse(os.path.lexists(successful))
 
     def test_codex_enable_disable_and_list_manage_only_canonical_links(self):
         self.initialize()

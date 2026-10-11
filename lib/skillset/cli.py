@@ -70,6 +70,7 @@ def parser():
         dest="codex_scope",
         product="Codex",
         directory=".codex",
+        project_help="manage Codex skills across this clone's worktrees",
     )
     codex_disable_parser = codex_commands.add_parser(
         "disable", help="disable a skillset for Codex"
@@ -80,6 +81,7 @@ def parser():
         dest="codex_scope",
         product="Codex",
         directory=".codex",
+        project_help="manage Codex skills across this clone's worktrees",
     )
     codex_list_parser = codex_commands.add_parser(
         "list", help="list Codex-enabled skillsets"
@@ -91,6 +93,7 @@ def parser():
         product="Codex",
         directory=".codex",
         default="all",
+        project_help="inspect Codex skills across this clone's worktrees",
     )
     claude_parser = commands.add_parser(
         "claude", help="manage Claude Code-enabled skillsets"
@@ -202,6 +205,13 @@ def parser():
         "skills", help="run managed upstream skills", add_help=False
     )
     skills_parser.add_argument("arguments", nargs=argparse.REMAINDER)
+    # No help pseudo-action is registered, and an explicit metavar keeps the
+    # hidden command out of argparse's generated public choice list.
+    commands.metavar = "{" + ",".join(commands.choices) + "}"
+    hook_parser = commands.add_parser("_project-hook")
+    hook_parser.add_argument("old")
+    hook_parser.add_argument("new")
+    hook_parser.add_argument("flag")
     return command_parser
 
 
@@ -214,6 +224,7 @@ def add_scope_options(
     default="global",
     global_help=None,
     local_help=None,
+    project_help=None,
 ):
     scope = command_parser.add_mutually_exclusive_group()
     if global_help is None:
@@ -240,11 +251,21 @@ def add_scope_options(
         const="local",
         help=local_help,
     )
+    if project_help is not None:
+        scope.add_argument(
+            "--project", dest=dest, action="store_const", const="project",
+            help=project_help,
+        )
     command_parser.set_defaults(**{dest: default})
 
 
 def dispatch_locked_command(root, arguments, home_lock, lock_file, command_parser):
-    if arguments.command == "init":
+    if arguments.command == "_project-hook":
+        from .project import run_hook
+
+        errors = run_hook(root, arguments.old, arguments.new, arguments.flag)
+        return report_command_errors(arguments.command, errors)
+    elif arguments.command == "init":
         from .operations import init
 
         init(root, arguments.name)
@@ -274,11 +295,14 @@ def dispatch_locked_command(root, arguments, home_lock, lock_file, command_parse
         from . import codex
 
         if arguments.codex_command == "enable":
-            codex.enable(root, arguments.name, arguments.codex_scope)
+            errors = codex.enable(root, arguments.name, arguments.codex_scope)
+            return report_command_errors(arguments.command, errors)
         elif arguments.codex_command == "disable":
-            codex.disable(root, arguments.name, arguments.codex_scope)
+            errors = codex.disable(root, arguments.name, arguments.codex_scope)
+            return report_command_errors(arguments.command, errors)
         elif arguments.codex_command == "list":
-            codex.list_enabled(root, arguments.verbose, arguments.codex_scope)
+            errors = codex.list_enabled(root, arguments.verbose, arguments.codex_scope)
+            return report_command_errors(arguments.command, errors)
         else:
             raise OperationalError(
                 f"unsupported Codex command: {arguments.codex_command}"
@@ -373,17 +397,30 @@ def run_managed_command(root, arguments, command_parser):
             from .doctor import doctor
 
             return doctor(root, fix=arguments.fix)
-        if augment_discovery:
+        project_scope = (
+            arguments.command == "codex" and (
+                arguments.codex_scope == "project" or (
+                    arguments.codex_command == "list" and arguments.codex_scope == "all"
+                )
+            )
+        )
+        if augment_discovery or project_scope or arguments.command == "_project-hook":
             with discovery_operation_lock(root) as lock_file:
-                dispatch_locked_command(
+                status = dispatch_locked_command(
                     root, arguments, home_lock, lock_file, command_parser
                 )
-            return 0
+            return 0 if status is None else status
         with operation_lock(root, create=not inspection) as lock_file:
-            dispatch_locked_command(
+            status = dispatch_locked_command(
                 root, arguments, home_lock, lock_file, command_parser
             )
-    return 0
+    return 0 if status is None else status
+
+
+def report_command_errors(command, errors):
+    for error in errors or ():
+        print(format_command_error(command, error), file=sys.stderr)
+    return 1 if errors else 0
 
 
 def format_command_error(command, error, unexpected=False):

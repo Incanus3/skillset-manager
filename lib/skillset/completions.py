@@ -27,7 +27,7 @@ _skillset_positional_count() {{
                 if [[ "${{COMP_WORDS[index+1]}}" == = ]]; then skip=2; else skip=1; fi
                 ;;
             --from=*) ;;
-            -h|--help|--manual|--use|--yes|-v|--verbose|--fix|-g|--global|-l|--local) ;;
+            -h|--help|--manual|--use|--yes|-v|--verbose|--fix|-g|--global|-l|--local|--project) ;;
             -*) ;;
             *) ((count++)) ;;
         esac
@@ -39,6 +39,17 @@ _skillset_after_option_terminator() {{
     local index
     for ((index = 2; index < COMP_CWORD; index++)); do
         [[ "${{COMP_WORDS[index]}}" == -- ]] && return 0
+    done
+    return 1
+}}
+
+_skillset_has_scope() {{
+    local index
+    for ((index = 3; index < COMP_CWORD; index++)); do
+        case "${{COMP_WORDS[index]}}" in
+            --) break ;;
+            -g|--global|-l|--local|--project) return 0 ;;
+        esac
     done
     return 1
 }}
@@ -101,14 +112,24 @@ _skillset_completion() {{
                 case "${{COMP_WORDS[2]}}" in
                     enable|disable)
                         if (( ! after_terminator )); then
-                            candidates='-h --help -g --global -l --local'
+                            candidates='-h --help'
+                            if ! _skillset_has_scope; then
+                                candidates+=' -g --global -l --local'
+                                if [[ "$subcommand" == codex ]]; then candidates+=' --project'; fi
+                            fi
                         fi
                         if (( position == 1 )); then
                             candidates+=" $(_skillset_names)"
                         fi
                         ;;
                     list)
-                        if (( ! after_terminator )); then candidates='-h --help -v --verbose -g --global -l --local'; fi
+                        if (( ! after_terminator )); then
+                            candidates='-h --help -v --verbose'
+                            if ! _skillset_has_scope; then
+                                candidates+=' -g --global -l --local'
+                                if [[ "$subcommand" == codex ]]; then candidates+=' --project'; fi
+                            fi
+                        fi
                         ;;
                     skills)
                         if [[ "$subcommand" == augment ]]; then
@@ -227,16 +248,22 @@ _skillset() {
                         return
                     fi
                     if [[ "${words[2]}" == enable || "${words[2]}" == disable ]]; then
+                        local -a words=("${words[@]:1}")
+                        local CURRENT=$((CURRENT - 1))
                         _arguments -S \
                             '(-h --help)'{-h,--help}'[show help]' \
-                            '(-g --global -l --local)'{-g,--global}'[manage global Codex skills]' \
-                            '(-g --global -l --local)'{-l,--local}'[manage local Codex skills]' \
+                            '(-g --global -l --local --project)'{-g,--global}'[manage global Codex skills]' \
+                            '(-g --global -l --local --project)'{-l,--local}'[manage local Codex skills]' \
+                            '(-g --global -l --local --project)--project[manage Codex skills across this clone]' \
                             '1:name:->skillsets' && return 0
                     elif [[ "${words[2]}" == list ]]; then
+                        local -a words=("${words[@]:1}")
+                        local CURRENT=$((CURRENT - 1))
                         _arguments -S \
                             '(-h --help)'{-h,--help}'[show help]' \
-                            '(-g --global -l --local)'{-g,--global}'[list global Codex skills]' \
-                            '(-g --global -l --local)'{-l,--local}'[list local Codex skills]' \
+                            '(-g --global -l --local --project)'{-g,--global}'[list global Codex skills]' \
+                            '(-g --global -l --local --project)'{-l,--local}'[list local Codex skills]' \
+                            '(-g --global -l --local --project)--project[inspect Codex skills across this clone]' \
                             '(-v --verbose)'{-v,--verbose}'[show skill inventory]' && return 0
                     fi
                     ;;
@@ -416,6 +443,17 @@ function __skillset_using_codex_command
     test (count $tokens) -ge 3; and test $tokens[3] = $argv[1]
 end
 
+function __skillset_codex_scope_available
+    set -l tokens (commandline -xpc)
+    for token in $tokens[4..-1]
+        switch $token
+            case -- -g --global -l --local --project
+                return 1
+        end
+    end
+    return 0
+end
+
 function __skillset_using_claude_command
     set -l tokens (commandline -xpc)
     test (count $tokens) -ge 3; and test $tokens[3] = $argv[1]
@@ -451,7 +489,7 @@ function __skillset_positional_count
                 set after_options true
             case -f --from
                 set skip true
-            case '--from=*' -h --help --manual --use --yes -v --verbose --fix -g --global -l --local '-*'
+            case '--from=*' -h --help --manual --use --yes -v --verbose --fix -g --global -l --local --project '-*'
             case '*'
                 set count (math $count + 1)
         end
@@ -501,20 +539,26 @@ complete -c skillset -n '__skillset_using_command list; and __skillset_at_empty_
 complete -c skillset -n '__skillset_using_command codex; and __skillset_at_position 0' -a 'enable disable list'
 complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command enable; and __skillset_at_position 1' -a '(__skillset_names)'
 complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command disable; and __skillset_at_position 1' -a '(__skillset_names)'
-complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command enable' -s g -l global -d 'Manage global Codex skills'
-complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command enable' -s l -l local -d 'Manage local Codex skills'
-complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command enable; and __skillset_at_empty_token' -a '-g --global' -d 'Manage global Codex skills'
-complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command enable; and __skillset_at_empty_token' -a '-l --local' -d 'Manage local Codex skills'
-complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command disable' -s g -l global -d 'Manage global Codex skills'
-complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command disable' -s l -l local -d 'Manage local Codex skills'
-complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command disable; and __skillset_at_empty_token' -a '-g --global' -d 'Manage global Codex skills'
-complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command disable; and __skillset_at_empty_token' -a '-l --local' -d 'Manage local Codex skills'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command enable; and __skillset_codex_scope_available' -s g -l global -d 'Manage global Codex skills'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command enable; and __skillset_codex_scope_available' -s l -l local -d 'Manage local Codex skills'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command enable; and __skillset_at_empty_token; and __skillset_codex_scope_available' -a '-g --global' -d 'Manage global Codex skills'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command enable; and __skillset_at_empty_token; and __skillset_codex_scope_available' -a '-l --local' -d 'Manage local Codex skills'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command disable; and __skillset_codex_scope_available' -s g -l global -d 'Manage global Codex skills'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command disable; and __skillset_codex_scope_available' -s l -l local -d 'Manage local Codex skills'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command disable; and __skillset_at_empty_token; and __skillset_codex_scope_available' -a '-g --global' -d 'Manage global Codex skills'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command disable; and __skillset_at_empty_token; and __skillset_codex_scope_available' -a '-l --local' -d 'Manage local Codex skills'
 complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command list' -s v -l verbose -d 'Show skill inventory'
-complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command list' -s g -l global -d 'List global Codex skills'
-complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command list' -s l -l local -d 'List local Codex skills'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command list; and __skillset_codex_scope_available' -s g -l global -d 'List global Codex skills'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command list; and __skillset_codex_scope_available' -s l -l local -d 'List local Codex skills'
 complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command list; and __skillset_at_empty_token' -a '-v --verbose' -d 'Show skill inventory'
-complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command list; and __skillset_at_empty_token' -a '-g --global' -d 'List global Codex skills'
-complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command list; and __skillset_at_empty_token' -a '-l --local' -d 'List local Codex skills'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command list; and __skillset_at_empty_token; and __skillset_codex_scope_available' -a '-g --global' -d 'List global Codex skills'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command list; and __skillset_at_empty_token; and __skillset_codex_scope_available' -a '-l --local' -d 'List local Codex skills'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command enable; and __skillset_codex_scope_available' -l project -d 'Manage Codex skills across this clone'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command enable; and __skillset_codex_scope_available; and __skillset_at_empty_token' -a '--project' -d 'Manage Codex skills across this clone'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command disable; and __skillset_codex_scope_available' -l project -d 'Manage Codex skills across this clone'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command disable; and __skillset_codex_scope_available; and __skillset_at_empty_token' -a '--project' -d 'Manage Codex skills across this clone'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command list; and __skillset_codex_scope_available' -l project -d 'Inspect Codex skills across this clone'
+complete -c skillset -n '__skillset_using_command codex; and __skillset_using_codex_command list; and __skillset_codex_scope_available; and __skillset_at_empty_token' -a '--project' -d 'Inspect Codex skills across this clone'
 complete -c skillset -n '__skillset_using_command claude; and __skillset_at_position 0' -a 'enable disable list'
 complete -c skillset -n '__skillset_using_command claude; and __skillset_using_claude_command enable; and __skillset_at_position 1' -a '(__skillset_names)'
 complete -c skillset -n '__skillset_using_command claude; and __skillset_using_claude_command disable; and __skillset_at_position 1' -a '(__skillset_names)'
