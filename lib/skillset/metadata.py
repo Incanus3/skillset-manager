@@ -232,7 +232,9 @@ def inspect_skills(skills):
 
 def skill_entry_text(entry):
     display_name, annotation, _reason = entry
-    return display_name if annotation is None else f"{display_name} {annotation}"
+    if annotation is None:
+        return display_name
+    return f"{display_name} {annotation}" if display_name else annotation
 
 
 def verbose_skill_entries(skills):
@@ -271,7 +273,8 @@ def render_skill_entries(entries, colored):
         if reason is None:
             rendered.append(styled(display_name, CYAN, colored))
             continue
-        rendered.append(display_name + " ")
+        if display_name:
+            rendered.append(display_name + " ")
         code = YELLOW if reason == "missing description" else RED
         rendered.append(styled(annotation, code, colored))
     return "".join(rendered)
@@ -322,7 +325,7 @@ def render_verbose_list(rows, output):
             if scope_label is None:
                 left_cell = name
             else:
-                scope_color = CYAN if scope_label == "g" else GREEN
+                scope_color = {"g": CYAN, "l": GREEN}.get(scope_label, "")
                 left_cell = (
                     styled(f"[{scope_label}]", scope_color, colored) + " " + name
                 )
@@ -337,10 +340,12 @@ def render_verbose_list(rows, output):
 
 
 def list_named_sets(
-    root, names, verbose, output=None, mark_active=True
+    root, names, verbose, output=None, mark_active=True, *, sources=None
 ):
     output = sys.stdout if output is None else output
     active_name = validate_layout(root) if mark_active else None
+    if sources is not None:
+        return list_project_sources(sources, verbose, output)
     if not verbose:
         colored = color_enabled(output)
         for name in names:
@@ -360,12 +365,26 @@ def list_named_sets(
     )
 
 
-def list_scoped_sets(root, scoped_names, verbose, output=None):
+def list_project_sources(sources, verbose, output=None, *, scoped=False):
+    """Render inspected registration rows independently of managed layout health."""
+    output = sys.stdout if output is None else output
+    scope_label = "p" if scoped else None
+    if verbose:
+        render_verbose_list([_source_row(source, scope_label) for source in sources], output)
+    else:
+        _render_source_names(sources, output, scope_label=scope_label)
+
+
+def list_scoped_sets(root, scoped_names, verbose, output=None, *, sources=()):
     output = sys.stdout if output is None else output
     validate_layout(root)
     rows = []
+    source_views = {source.name: source for source in sources}
     for scope_label, names in scoped_names:
         for name in sorted(names):
+            if scope_label == "p" and name in source_views:
+                rows.append(_source_row(source_views[name], scope_label))
+                continue
             rows.append(
                 (
                     False,
@@ -380,12 +399,31 @@ def list_scoped_sets(root, scoped_names, verbose, output=None):
         return
     colored = color_enabled(output)
     for _active, name, manual, _entries, scope_label in rows:
-        scope_color = CYAN if scope_label == "g" else GREEN
+        scope_color = {"g": CYAN, "l": GREEN}.get(scope_label, "")
         scope = styled(f"[{scope_label}]", scope_color, colored)
         suffix = " [m]" if manual else ""
         if suffix and colored:
             suffix = " " + styled("[m]", YELLOW, True)
+        if scope_label == "p" and source_views[name].error is not None:
+            suffix += " " + styled(f"[invalid: {source_views[name].error}]", RED, colored)
         print(f"{scope} {name}{suffix}", file=output)
+
+
+def _source_row(source, scope_label):
+    entries = source.entries
+    if source.error is not None:
+        entries = (("", f"[invalid: {source.error}]", source.error),)
+    return False, printable_text(source.name), source.manual, entries, scope_label
+
+
+def _render_source_names(sources, output, *, scope_label=None):
+    colored = color_enabled(output)
+    for source in sources:
+        suffix = " " + styled("[m]", YELLOW, colored) if source.manual else ""
+        if source.error is not None:
+            suffix += " " + styled(f"[invalid: {source.error}]", RED, colored)
+        prefix = f"[{scope_label}] " if scope_label is not None else ""
+        print(f"{prefix}{printable_text(source.name)}{suffix}", file=output)
 
 
 def list_sets(root, verbose, output=None):
@@ -441,7 +479,7 @@ def terminal_width(output):
 
 
 def styled(value, code, enabled):
-    return f"{code}{value}{RESET}" if enabled else value
+    return f"{code}{value}{RESET}" if enabled and code else value
 
 
 def show_skill_rows(skills):
