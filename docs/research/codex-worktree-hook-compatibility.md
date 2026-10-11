@@ -253,3 +253,18 @@ The terminology review command returned exit 1 with no matches:
 ```sh
 rg -n 'Task [0-9]|milestone|phase [0-9]|bead|ticket|codex-project-enablement' lib/skillset bin README.md tests/test_skillset.py
 ```
+
+## Final review corrections and refreshed verification
+
+Final current-session review identified three ordinary serial reliability gaps. The combined correction at `71b0587` checks effective event-wide disable controls before first enable, distinguishes project destination inspection errors from absent/unrelated entries, and retains invalid registered project rows when unscoped layout validation fails. The global/local layout refusal and exit status remain; project rows provide partial read-only evidence. This clarifies and supersedes the plan's abort-before-render interpretation in favor of the binding listing specification.
+
+Each correction has failing-before/passing-after regression evidence. Fresh amended-code verification passed:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v -k codex -k project -k completion
+# 123 tests in 36.586s; OK
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -v
+# 331 tests in 77.829s; OK; no skips
+```
+
+The earlier 325-test result describes the acceptance checkpoint before these six additional regression methods. Independent scoped re-review found all three product findings addressed. A residual test-only guard correction at `5254e50` gates event-wide runtime coverage on Git 2.55; the separate 2.54/2.55 boundary test remains. A deterministic simulated-2.54 probe verified skipping before fixture mutation, and all four first-enable tests passed on installed Git 2.56. Production code is unchanged from the 331-test run. Direct verifier confirmation passed; no review findings remain. The Orca adapter evidence and unmodified service-environment gap above are unchanged; no additional live-runtime test was run.
