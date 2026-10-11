@@ -325,7 +325,7 @@ def render_verbose_list(rows, output):
             if scope_label is None:
                 left_cell = name
             else:
-                scope_color = {"g": CYAN, "l": GREEN}.get(scope_label, "")
+                scope_color = {"g": CYAN, "p": ORANGE, "p-": ORANGE, "l": GREEN}.get(scope_label, "")
                 left_cell = (
                     styled(f"[{scope_label}]", scope_color, colored) + " " + name
                 )
@@ -399,17 +399,19 @@ def list_scoped_sets(root, scoped_names, verbose, output=None, *, sources=()):
         return
     colored = color_enabled(output)
     for _active, name, manual, _entries, scope_label in rows:
-        scope_color = {"g": CYAN, "l": GREEN}.get(scope_label, "")
+        scope_color = {"g": CYAN, "p": ORANGE, "p-": ORANGE, "l": GREEN}.get(scope_label, "")
         scope = styled(f"[{scope_label}]", scope_color, colored)
         suffix = " [m]" if manual else ""
         if suffix and colored:
             suffix = " " + styled("[m]", YELLOW, True)
-        if scope_label == "p" and source_views[name].error is not None:
+        if scope_label in {"p", "p-"} and source_views[name].error is not None:
             suffix += " " + styled(f"[invalid: {source_views[name].error}]", RED, colored)
         print(f"{scope} {name}{suffix}", file=output)
 
 
 def _source_row(source, scope_label):
+    if scope_label == "p" and not source.installed:
+        scope_label = "p-"
     entries = source.entries
     if source.error is not None:
         entries = (("", f"[invalid: {source.error}]", source.error),)
@@ -422,7 +424,11 @@ def _render_source_names(sources, output, *, scope_label=None):
         suffix = " " + styled("[m]", YELLOW, colored) if source.manual else ""
         if source.error is not None:
             suffix += " " + styled(f"[invalid: {source.error}]", RED, colored)
-        prefix = f"[{scope_label}] " if scope_label is not None else ""
+        label = "p-" if scope_label == "p" and not source.installed else scope_label
+        prefix = (
+            styled(f"[{label}]", ORANGE, colored) + " "
+            if scope_label is not None else ""
+        )
         print(f"{prefix}{printable_text(source.name)}{suffix}", file=output)
 
 
@@ -445,6 +451,7 @@ CYAN = "\x1b[36m"
 YELLOW = "\x1b[33m"
 RED = "\x1b[31m"
 GREEN = "\x1b[32m"
+ORANGE = "\x1b[38;5;208m"
 
 
 def display_width(value):

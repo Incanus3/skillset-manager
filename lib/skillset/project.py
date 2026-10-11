@@ -402,6 +402,7 @@ class SourceView:
     manual: bool
     entries: tuple
     error: object
+    installed: bool = False
 
 
 @dataclass(frozen=True)
@@ -427,14 +428,19 @@ def inspect(root: Path, cwd: Path, *, full=False) -> ProjectInspection:
     sources = []
     for name in names or ():
         try:
+            installed = codex.canonical_link_at(root, name, context.current_root, strict=True)
+        except OperationalError as error:
+            installed = False
+            errors.append(str(error))
+        try:
             validate_skillsets_directory(root)
             path = validate_set(root, name)
             manual = set_mode(root, name) == "manual"
             entries = tuple(verbose_skill_entries(path / "skills"))
-            sources.append(SourceView(name, manual, entries, None))
+            sources.append(SourceView(name, manual, entries, None, installed))
         except (OperationalError, OSError) as error:
             reason = printable_text(error)
-            sources.append(SourceView(name, False, (), reason))
+            sources.append(SourceView(name, False, (), reason, installed))
             # Brief overview carries the invalid annotation. Health is explicit.
             if full:
                 errors.append(f"invalid project source {name!r}: {reason}")

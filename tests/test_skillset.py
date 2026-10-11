@@ -420,15 +420,50 @@ class SkillsetTests(unittest.TestCase):
         self.assertEqual(self.run_cli_in_process("codex", "enable", "default").returncode, 0)
         self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
         listed = self.run_cli_in_process("codex", "list", cwd=repo, extra_environment=self.git_environment())
-        self.assertEqual(listed.stdout, "[g] default\n[p] default\n[l] default\n")
+        self.assertEqual(listed.stdout, "[g] default\n[p] default\n")
+        local = self.run_cli_in_process("codex", "list", "--local", cwd=repo)
+        self.assertEqual(local.stdout, "default\n")
         self.assertEqual(self.run_cli_in_process("codex", "disable", "default", "--local", cwd=repo, extra_environment=self.git_environment()).returncode, 0)
         overview = self.run_cli_in_process("codex", "list", cwd=repo, extra_environment=self.git_environment())
-        self.assertEqual(overview.stdout, "[g] default\n[p] default\n")
+        self.assertEqual(overview.stdout, "[g] default\n[p-] default\n")
         self.assertEqual(overview.returncode, 0, overview.stderr)
         checked = self.run_cli_in_process("codex", "list", "--project", cwd=repo, extra_environment=self.git_environment())
         self.assertEqual(checked.stdout, "default\n")
         self.assertEqual(checked.returncode, 1)
         self.assertIn("project link is missing", checked.stderr)
+
+    def test_codex_project_overview_reports_worktree_presence_without_duplicate_local_rows(self):
+        self.require_native_hooks()
+        self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
+        repo = self.new_repository()
+        sibling = self.sandbox / "linked"
+        self.git(repo, "worktree", "add", "--detach", str(sibling))
+        self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        self.assertEqual(self.run_cli_in_process("codex", "enable", "personal", "--local", cwd=sibling).returncode, 0)
+        self.assertEqual(self.run_cli_in_process("codex", "disable", "default", "--local", cwd=sibling).returncode, 0)
+        subdir = sibling / "src"
+        subdir.mkdir()
+        before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo), self.filesystem_snapshot(sibling))
+        for cwd, expected in (
+            (repo, "[p] default\n"),
+            (sibling, "[p-] default\n[l] personal\n"),
+            (subdir, "[p-] default\n"),
+        ):
+            for verbose in (False, True):
+                result = self.run_cli_in_process("codex", "list", *(["-v"] if verbose else []), cwd=cwd, extra_environment=self.git_environment())
+                self.assertEqual(result.returncode, 0, result.stderr)
+                if verbose:
+                    for row in expected.splitlines():
+                        self.assertIn(row, result.stdout)
+                    self.assertNotIn("[l] default", result.stdout)
+                    self.assertEqual(result.stdout.count("default"), 1)
+                else:
+                    self.assertEqual(result.stdout, expected)
+        self.assertEqual((self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo), self.filesystem_snapshot(sibling)), before)
+        self.assertEqual(self.project_operation("disable", "default", repo).returncode, 0)
+        result = self.run_cli_in_process("codex", "list", cwd=repo, extra_environment=self.git_environment())
+        self.assertEqual(result.stdout, "")
 
     def test_codex_project_inspection_invalid_sources_remain_visible_and_removable(self):
         self.require_native_hooks()
@@ -577,7 +612,7 @@ class SkillsetTests(unittest.TestCase):
         self.assertIn("project hook is disabled", disabled.stderr)
         overview = self.run_cli_in_process("codex", "list", cwd=repo, extra_environment=self.git_environment())
         self.assertEqual(overview.returncode, 0, overview.stderr)
-        self.assertEqual(overview.stdout, "[p] default\n[l] default\n")
+        self.assertEqual(overview.stdout, "[p] default\n")
         self.git(repo, "config", "--local", "hook.skillset-project.command", "external command")
         conflict = self.run_cli_in_process("codex", "list", "--project", cwd=repo, extra_environment=self.git_environment())
         self.assertEqual(conflict.returncode, 1)
@@ -586,9 +621,11 @@ class SkillsetTests(unittest.TestCase):
     def test_codex_project_inspection_scope_usage_and_tty_rendering(self):
         self.require_native_hooks()
         self.make_managed_layout(self.home)
+        self.make_set(self.root, "personal")
         repo = self.new_repository()
         self.assertEqual(self.run_cli_in_process("codex", "enable", "default").returncode, 0)
         self.assertEqual(self.project_operation("enable", "default", repo).returncode, 0)
+        self.assertEqual(self.run_cli_in_process("codex", "enable", "personal", "--local", cwd=repo).returncode, 0)
         before = (self.filesystem_snapshot(self.home), self.filesystem_snapshot(repo))
         for scope in ("--global", "--local", "-g", "-l"):
             result = self.run_cli_in_process("codex", "list", "--project", scope, cwd=repo, extra_environment=self.git_environment())
@@ -599,16 +636,19 @@ class SkillsetTests(unittest.TestCase):
         tty_environment = self.git_environment()
         tty_environment.pop("NO_COLOR", None)
         tty_environment["TERM"] = "xterm-256color"
-        for verbose in (False, True):
-            result = self.run_cli_tty("codex", "list", *(["-v"] if verbose else []), cwd=repo, terminal_columns=23, extra_environment=tty_environment)
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("\x1b[36m[g]\x1b[0m", result.stdout)
-            self.assertIn("\x1b[32m[l]\x1b[0m", result.stdout)
-            self.assertIn("[p] default", result.stdout)
-            self.assertNotIn("*", result.stdout)
-            if verbose:
-                lines = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout).splitlines()
-                self.assertLessEqual(len(lines[1]), 23)
+        for marker in ("[p]", "[p-]"):
+            if marker == "[p-]":
+                self.assertEqual(self.run_cli_in_process("codex", "disable", "default", "--local", cwd=repo).returncode, 0)
+            for verbose in (False, True):
+                result = self.run_cli_tty("codex", "list", *(["-v"] if verbose else []), cwd=repo, terminal_columns=23, extra_environment=tty_environment)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("\x1b[36m[g]\x1b[0m", result.stdout)
+                self.assertIn("\x1b[32m[l]\x1b[0m personal", result.stdout)
+                self.assertIn(f"\x1b[38;5;208m{marker}\x1b[0m default", result.stdout)
+                self.assertNotIn("*", result.stdout)
+                if verbose:
+                    lines = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout).splitlines()
+                    self.assertLessEqual(len(lines[1]), 23)
 
     def test_codex_project_inspection_overview_keeps_present_invalid_registered_sources(self):
         self.require_native_hooks()

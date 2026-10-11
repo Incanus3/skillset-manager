@@ -238,11 +238,12 @@ def list_enabled(root, verbose, scope):
         from .project import inspect
 
         inspection = inspect(root, Path.cwd())
+        project_names = {source.name for source in inspection.sources}
         list_scoped_sets(
             root,
             (("g", enabled_names(root, "global")),
              ("p", [source.name for source in inspection.sources]),
-             ("l", local_names)),
+             ("l", [name for name in local_names if name not in project_names])),
             verbose,
             sources=inspection.sources,
         )

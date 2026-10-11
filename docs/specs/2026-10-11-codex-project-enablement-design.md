@@ -29,7 +29,7 @@ beforehand (D3).
 | D4 | Accepted | Store one shared names list for all harnesses in clone registration; use inherited HOME and PATH | Hook setup depends on the invoking environment | [Shared state](#one-registration-belongs-to-the-git-common-directory) |
 | D5 | Accepted | Keep registration until disable finishes; recover by repeating commands | A failed disable can be undone by a later checkout while registration remains | [Recovery](#partial-operations-retain-registration-for-retry) |
 | D6 | Accepted | Warn and return zero after ordinary hook failures | Failed setup can leave a worktree without skills | [Hook contract](#the-named-hook-reconciles-only-the-invoking-worktree) |
-| D7 | Accepted | Include `[p]` registration rows in unscoped list; reserve full health checking for `--project` | One collection can appear under both `[l]` and `[p]` | [Listing](#project-list-reports-registration-and-reconciliation-errors) |
+| D7 | Accepted | Summarize registration and current worktree presence with `[p]`/`[p-]`; reserve full health checking for `--project` | Overview checks current worktree links; redundant local rows are suppressed | [Listing](#project-list-reports-registration-and-reconciliation-errors) |
 | D8 | Accepted | Do not index projects globally or extend collection lifecycle blockers | Users must disable project registrations before collection rename/removal | [Source lifecycle](#source-lifecycle-and-worktree-moves) |
 | D9 | Accepted | Leave ignore rules under operator control | Generated links can appear as untracked files | [Ignored state](#generated-links-are-not-repository-content) |
 
@@ -369,11 +369,30 @@ removes an unrelated command merely to finish cleanup.
 
 ## Project list reports registration and reconciliation errors
 
-Unscoped `codex list` renders scope groups in order `[g]`, `[p]`, `[l]`,
-with names sorted within each group. `[l]` reports a canonical physical link in
-the exact current directory; `[p]` reports desired clone registration. Both
-rows may appear for the same collection. Local disable removes the `[l]` row
-but retains `[p]`; from a subdirectory `[p]` is still discovered at clone scope.
+Unscoped `codex list` renders global, project and local groups in that order,
+with names sorted within each group. Project rows use `[p]` for a registered
+name with a canonical link at the current worktree root, and `[p-]` when that
+link is absent or unrelated. Both markers are orange on a color-enabled terminal.
+Local rows use `[l]` for canonical links in the exact current directory whose
+names are not registered. Explicit `--local` retains all canonical local links.
+From a subdirectory, project presence still uses the enclosing worktree root.
+Local disable changes `[p]` to `[p-]`, retaining registration; absence alone is
+not an overview error. A subsequent branch checkout or repeated enable can
+recreate the link. No persistent worktree exclusion state is introduced.
+
+The operator approved this D7 revision on 2026-10-11 to reduce confusing
+duplicate rows. It supersedes the original presentation of separate `[p]` and
+`[l]` rows for a registered local link; registration and physical links retain
+their separate responsibilities.
+
+Revision verification: `python3 -m unittest discover -s tests -q` passed all
+333 tests on Python 3.14.8 / Git 2.56.0. Focused coverage includes local
+disable, independent linked-worktree presence, subdirectory listing, explicit
+local filtering, read-only snapshots and plain/verbose orange markers.
+Direct renderer checks cover both project markers with invalid-source fallback,
+pipes, `NO_COLOR` and `TERM=dumb`. These checks do not extend the original
+Git-version or Orca acceptance evidence.
+
 Retain manual markers and verbose inventory conventions for all groups;
 invalid registered sources remain visible with the same invalid annotations
 as project-only listing.
@@ -381,10 +400,12 @@ as project-only listing.
 Discover project registration read-only when Git is available and the current
 directory belongs to a non-bare worktree. Outside Git, in a bare directory or
 without Git, omit the project group and preserve existing listing behavior.
-This overview reads registration and source inventory; it does not inspect
-all worktrees or effective hook health. Malformed/unreadable registration is
-reported with exit 1 after rendering available global/local rows. Full project
-health inspection remains explicit through `--project`.
+This overview reads registration, source inventory and canonical-link presence
+at the invoking worktree root; it does not inspect all worktrees or effective
+hook health. Ordinary link-inspection errors are reported with exit 1.
+Malformed/unreadable registration is reported with exit 1 after rendering
+available global/local rows. Full project health inspection remains explicit
+through `--project`.
 
 `codex list --project` is read-only and does not install hooks or repair links.
 No registration and no reserved hook config produces empty stdout and exit 0.
@@ -496,8 +517,9 @@ lookup and shell forwarding need real processes.
 
 1. Existing global/local Codex behavior and scope defaults remain covered,
    including exact-directory local behavior and non-Git use. Unscoped listing
-   covers `[g]`/`[p]`/`[l]` ordering, duplicate names, local disable retaining
-   `[p]`, subdirectory discovery and operation without Git. Codex-only scope
+   covers global/project/local ordering, redundant-local suppression, local
+   disable yielding `[p-]`, worktree-root presence from subdirectories and
+   operation without Git. Codex-only scope
    conflict/usage tests and all three completion grammars cover `--project`.
 2. Real Git tests cover main and linked worktrees, subdirectory invocation,
    detached HEAD, a bare common repository with non-bare linked worktrees,

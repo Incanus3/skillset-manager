@@ -502,14 +502,25 @@ $ skillset codex list
 [g] always-on
 [g] personal [m]
 [p] obra
-[l] obra
+[p-] optional
+[l] experiment
 ```
 
-The groups appear in `[g]` global, `[p]` project, `[l]` local order, with names
-sorted within each. `[p]` records desired registration; `[l]` records a physical
-canonical link in the exact current directory, so one name can appear in both.
-Global and local markers are cyan and green on a color-enabled terminal. There
-is no `*` marker. Invalid registered sources carry an invalid annotation.
+The groups appear in global, project, local order, with names sorted within each.
+`[p]` means registered for the clone and installed at this worktree's root;
+`[p-]` means registered but without a canonical link there. Project markers use
+the worktree root even when listing from a subdirectory. `[l]` means a canonical
+link in the exact current directory whose name is not project-registered.
+Project rows suppress redundant local rows in the combined listing; explicit
+`--local` still lists all canonical links in the current directory.
+Global, project and local markers are cyan, orange and green on a color-enabled
+terminal. There is no `*` marker. Invalid registered sources carry an invalid
+annotation.
+
+Local disable changes `[p]` to `[p-]` without changing registration. The link
+stays absent until a branch checkout or repeated project enable recreates it.
+An absent link alone does not make this overview fail; `--project` retains its
+full health checks and reports missing links.
 
 Use `-g`/`--global`, `-l`/`--local` or `--project` to inspect one scope; its
 scope marker is omitted:
